@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: verifier-postgres
+    environment:
+      POSTGRES_USER: verifier
+      POSTGRES_PASSWORD: verifier
+      POSTGRES_DB: verifier
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verifier -d verifier"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  verifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: derp-verifier
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ADDR: ":8080"
+      DATABASE_URL: "postgres://verifier:verifier@postgres:5432/verifier?sslmode=disable"
+      TOKEN_PEPPER: "change-me"
+      ENABLE_CASBIN: "true"
+      DB_TIMEOUT: "2s"
+      VERIFY_RATE_LIMIT_RPS: "100"
+      VERIFY_RATE_LIMIT_BURST: "200"
+    ports:
+      - "8080:8080"
+
+  # Example derper wiring:
+  # derper:
+  #   image: tailscale/derper:latest
+  #   depends_on:
+  #     - verifier
+  #   command:
+  #     - derper
+  #     - --verify-client-url=http://verifier:8080/verify
+  #     - --verify-client-url-fail-open=false
+  #   ports:
+  #     - "3478:3478/udp"
+
+volumes:
+  postgres-data:

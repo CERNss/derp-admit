@@ -11,7 +11,13 @@ type Config struct {
 	Addr               string
 	DatabaseURL        string
 	TokenPepper        string
+	LogLevel           string
 	EnableCasbin       bool
+	OTELEnabled        bool
+	OTELServiceName    string
+	OTLPEndpoint       string
+	OTLPInsecure       bool
+	OTELSampleRatio    float64
 	DBTimeout          time.Duration
 	VerifyRateLimitRPS float64
 	VerifyRateBurst    int
@@ -23,7 +29,13 @@ func LoadFromEnv() (Config, error) {
 		Addr:               getOrDefault("ADDR", ":8080"),
 		DatabaseURL:        os.Getenv("DATABASE_URL"),
 		TokenPepper:        os.Getenv("TOKEN_PEPPER"),
+		LogLevel:           getOrDefault("LOG_LEVEL", "info"),
 		EnableCasbin:       getBool("ENABLE_CASBIN", true),
+		OTELEnabled:        getBool("OTEL_ENABLED", false),
+		OTELServiceName:    getOrDefault("OTEL_SERVICE_NAME", "derp-admit"),
+		OTLPEndpoint:       os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+		OTLPInsecure:       getBool("OTEL_EXPORTER_OTLP_INSECURE", true),
+		OTELSampleRatio:    getFloat("OTEL_TRACE_SAMPLE_RATIO", 1.0),
 		DBTimeout:          getDuration("DB_TIMEOUT", 2*time.Second),
 		VerifyRateLimitRPS: getFloat("VERIFY_RATE_LIMIT_RPS", 100),
 		VerifyRateBurst:    getInt("VERIFY_RATE_LIMIT_BURST", 200),
@@ -44,6 +56,12 @@ func LoadFromEnv() (Config, error) {
 	}
 	if cfg.DBTimeout <= 0 {
 		return Config{}, fmt.Errorf("DB_TIMEOUT must be > 0")
+	}
+	if cfg.OTELSampleRatio < 0 || cfg.OTELSampleRatio > 1 {
+		return Config{}, fmt.Errorf("OTEL_TRACE_SAMPLE_RATIO must be between 0 and 1")
+	}
+	if cfg.OTELServiceName == "" {
+		return Config{}, fmt.Errorf("OTEL_SERVICE_NAME must not be empty")
 	}
 
 	return cfg, nil

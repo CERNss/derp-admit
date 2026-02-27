@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -16,6 +15,8 @@ import (
 	"derp-admit/internel/app/derp_admit/policy"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
 
@@ -34,7 +35,7 @@ type Service struct {
 	tokenPepper string
 	dbTimeout   time.Duration
 	cache       *VerifyCache
-	logger      *slog.Logger
+	logger      *zap.Logger
 }
 
 type RegisterInput struct {
@@ -43,7 +44,7 @@ type RegisterInput struct {
 	Label   string `json:"label"`
 }
 
-func New(db *gorm.DB, policyEngine *policy.Engine, tokenPepper string, dbTimeout time.Duration, cache *VerifyCache, logger *slog.Logger) *Service {
+func New(db *gorm.DB, policyEngine *policy.Engine, tokenPepper string, dbTimeout time.Duration, cache *VerifyCache, logger *zap.Logger) *Service {
 	return &Service{
 		db:          db,
 		policy:      policyEngine,
@@ -153,9 +154,11 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (int, error) {
 }
 
 func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
+	logger := loggerWithTrace(s.logger, ctx)
+
 	_, nodeKey, err := derp.ParseRequest(body)
 	if err != nil {
-		s.logger.Warn("invalid verify request", "error", err)
+		logger.Warn("invalid verify request", zap.Error(err))
 		s.writeAudit(context.Background(), nil, "", false, DenyReasonInvalidReq)
 		return false, DenyReasonInvalidReq
 	}
@@ -175,7 +178,10 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 			s.cache.Set(nodeKey, false, DenyReasonNotRegistered, nil)
 			return false, DenyReasonNotRegistered
 		}
-		s.logger.Error("lookup device during verify", "error", err)
+		logger.Error("lookup device during verify",
+			zap.Error(err),
+			zap.String("node_key", nodeKey),
+		)
 		s.writeAudit(context.Background(), nil, nodeKey, false, DenyReasonInternal)
 		return false, DenyReasonInternal
 	}
@@ -189,7 +195,11 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 
 	var user model.User
 	if err := s.db.WithContext(dbCtx).First(&user, "id = ?", device.UserID).Error; err != nil {
-		s.logger.Error("lookup user during verify", "error", err)
+		logger.Error("lookup user during verify",
+			zap.Error(err),
+			zap.String("node_key", nodeKey),
+			zap.String("user_id", device.UserID.String()),
+		)
 		deviceID := device.ID
 		s.writeAudit(context.Background(), &deviceID, nodeKey, false, DenyReasonInternal)
 		return false, DenyReasonInternal
@@ -203,7 +213,10 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 
 	allowed, err := s.policy.EnforceConnect(nodeKey)
 	if err != nil {
-		s.logger.Error("policy enforce failed", "error", err)
+		logger.Error("policy enforce failed",
+			zap.Error(err),
+			zap.String("node_key", nodeKey),
+		)
 		deviceID := device.ID
 		s.writeAudit(context.Background(), &deviceID, nodeKey, false, DenyReasonInternal)
 		return false, DenyReasonInternal
@@ -220,7 +233,11 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 		Model(&model.Device{}).
 		Where("id = ?", device.ID).
 		Update("last_seen_at", now).Error; err != nil {
-		s.logger.Error("update last_seen_at", "error", err)
+		logger.Error("update last_seen_at",
+			zap.Error(err),
+			zap.String("node_key", nodeKey),
+			zap.String("device_id", device.ID.String()),
+		)
 		deviceID := device.ID
 		s.writeAudit(context.Background(), &deviceID, nodeKey, false, DenyReasonInternal)
 		return false, DenyReasonInternal
@@ -230,6 +247,18 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 	s.writeAudit(context.Background(), &deviceID, nodeKey, true, "")
 	s.cache.Set(nodeKey, true, "", &deviceID)
 	return true, ""
+}
+
+func loggerWithTrace(logger *zap.Logger, ctx context.Context) *zap.Logger {
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if !spanCtx.IsValid() {
+		return logger
+	}
+
+	return logger.With(
+		zap.String("trace_id", spanCtx.TraceID().String()),
+		zap.String("span_id", spanCtx.SpanID().String()),
+	)
 }
 
 func (s *Service) Ping(ctx context.Context) error {
@@ -257,6 +286,11 @@ func (s *Service) writeAudit(ctx context.Context, deviceID *uuid.UUID, nodeKey s
 		TS:       time.Now().UTC(),
 	}
 	if err := s.db.WithContext(auditCtx).Create(&entry).Error; err != nil {
-		s.logger.Error("write audit log", "error", err)
+		s.logger.Error("write audit log",
+			zap.Error(err),
+			zap.String("node_key", nodeKey),
+			zap.Bool("allowed", allowed),
+			zap.String("reason", reason),
+		)
 	}
 }

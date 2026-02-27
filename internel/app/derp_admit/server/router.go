@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"log/slog"
 	"net/http"
 	"time"
 
@@ -12,13 +11,19 @@ import (
 	"derp-admit/internel/app/derp_admit/service"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 )
 
-func NewRouter(svc *service.Service, cfg config.Config, logger *slog.Logger) *gin.Engine {
+func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.Recovery())
+	if cfg.OTELEnabled {
+		router.Use(otelgin.Middleware(cfg.OTELServiceName))
+	}
 
 	limiter := rate.NewLimiter(rate.Limit(cfg.VerifyRateLimitRPS), cfg.VerifyRateBurst)
 
@@ -45,7 +50,9 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *slog.Logger) *gi
 
 		status, err := svc.Register(c.Request.Context(), req)
 		if err != nil {
-			logger.Error("register failed", "error", err)
+			logWithTrace(logger, c.Request.Context()).Error("register failed",
+				zap.Error(err),
+			)
 			c.JSON(http.StatusInternalServerError, gin.H{"ok": false})
 			return
 		}
@@ -59,6 +66,7 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *slog.Logger) *gi
 
 	router.POST("/verify", func(c *gin.Context) {
 		if !limiter.Allow() {
+			logWithTrace(logger, c.Request.Context()).Warn("verify request rate limited")
 			resp := derp.BuildResponse(false, "rate limited")
 			c.JSON(http.StatusOK, resp)
 			return
@@ -66,6 +74,9 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *slog.Logger) *gi
 
 		var raw json.RawMessage
 		if err := c.ShouldBindJSON(&raw); err != nil {
+			logWithTrace(logger, c.Request.Context()).Warn("invalid verify json payload",
+				zap.Error(err),
+			)
 			resp := derp.BuildResponse(false, service.DenyReasonInvalidReq)
 			c.JSON(http.StatusOK, resp)
 			return
@@ -84,4 +95,16 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *slog.Logger) *gi
 	})
 
 	return router
+}
+
+func logWithTrace(logger *zap.Logger, ctx context.Context) *zap.Logger {
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if !spanCtx.IsValid() {
+		return logger
+	}
+
+	return logger.With(
+		zap.String("trace_id", spanCtx.TraceID().String()),
+		zap.String("span_id", spanCtx.SpanID().String()),
+	)
 }

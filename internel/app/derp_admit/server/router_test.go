@@ -6,8 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -23,6 +21,7 @@ import (
 	"derp-admit/internel/app/derp_admit/service"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -277,7 +276,7 @@ func newTestRouter(t *testing.T) (http.Handler, *gorm.DB) {
 		t.Fatalf("bootstrap policy: %v", err)
 	}
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger := zap.NewNop()
 	svc := service.New(gormDB, policyEngine, "test-pepper", 2*time.Second, service.NewVerifyCache(0), logger)
 	cfg := config.Config{
 		DBTimeout:          2 * time.Second,

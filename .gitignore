@@ -16,12 +16,7 @@
 # vendor/
 
 # Build binary name
-builder/*
-!builder/.gitkeep
-!builder/derp_admit/
-builder/derp_admit/*
-!builder/derp_admit/Dockerfile
-!builder/derp_admit/docker-compose.yml
+build/*
 /.build/
 # Created by .ignore support plugin (hsz.mobi)
 /.idea/

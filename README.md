@@ -43,3 +43,27 @@ To prepare for SigNoz, set:
 - `OTEL_EXPORTER_OTLP_ENDPOINT=<your-collector-host:4318>`
 
 This enables OpenTelemetry traces while logs stay in structured zap JSON.
+
+### Docker Build (Cross-Platform)
+
+Single platform (for local load, e.g. Linux amd64):
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  -f build/derp_admit/Dockerfile \
+  -t derp-admit:linux-amd64 \
+  --load \
+  .
+```
+
+Multi-platform (for registry push):
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f build/derp_admit/Dockerfile \
+  -t <your-registry>/derp-admit:<tag> \
+  --push \
+  .
+```

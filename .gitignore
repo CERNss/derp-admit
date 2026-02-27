@@ -18,6 +18,8 @@
 # Build binary name
 build/*
 !build/.gitkeep
+!build/derp_admit/
+!build/derp_admit/*
 /.build/
 # Created by .ignore support plugin (hsz.mobi)
 /.idea/

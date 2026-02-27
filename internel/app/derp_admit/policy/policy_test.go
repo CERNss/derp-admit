@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"derp-admit/internal/db"
-	"derp-admit/internal/policy"
+	"derp-admit/internel/app/derp_admit/db"
+	"derp-admit/internel/app/derp_admit/policy"
 
 	"gorm.io/gorm"
 )

@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"derp-admit/internal/derp"
-	"derp-admit/internal/model"
-	"derp-admit/internal/policy"
+	"derp-admit/internel/app/derp_admit/derp"
+	"derp-admit/internel/app/derp_admit/model"
+	"derp-admit/internel/app/derp_admit/policy"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"

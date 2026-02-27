@@ -18,8 +18,8 @@ services:
 
   verifier:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: build/derp_admit/Dockerfile
     container_name: derp-verifier
     depends_on:
       postgres:

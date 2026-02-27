@@ -8,11 +8,11 @@ import (
 	"syscall"
 	"time"
 
-	"derp-admit/internal/config"
-	"derp-admit/internal/db"
-	"derp-admit/internal/policy"
-	"derp-admit/internal/server"
-	"derp-admit/internal/service"
+	"derp-admit/config"
+	"derp-admit/internel/app/derp_admit/db"
+	"derp-admit/internel/app/derp_admit/policy"
+	"derp-admit/internel/app/derp_admit/server"
+	"derp-admit/internel/app/derp_admit/service"
 )
 
 func main() {

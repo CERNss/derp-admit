@@ -19,7 +19,7 @@
 ### Run
 
 ```bash
-go run ./cmd/derp-verifier
+go run ./cmd/derp_admit
 ```
 
 ### Verify Flow

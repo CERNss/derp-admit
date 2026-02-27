@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"time"
 
-	"derp-admit/internal/config"
-	"derp-admit/internal/derp"
-	"derp-admit/internal/service"
+	"derp-admit/config"
+	"derp-admit/internel/app/derp_admit/derp"
+	"derp-admit/internel/app/derp_admit/service"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/time/rate"

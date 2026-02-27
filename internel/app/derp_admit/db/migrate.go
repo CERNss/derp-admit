@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"derp-admit/internal/model"
+	"derp-admit/internel/app/derp_admit/model"
 
 	"gorm.io/gorm"
 )

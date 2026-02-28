@@ -17,9 +17,7 @@ services:
       retries: 10
 
   verifier:
-    build:
-      context: ../..
-      dockerfile: builder/derp_admit/Dockerfile
+    image: derp-admit:linux-amd64
     container_name: derp-verifier
     depends_on:
       postgres:

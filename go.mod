@@ -1,6 +1,6 @@
 module derp-admit
 
-go 1.25.5
+go 1.24.0
 
 require (
 	github.com/casbin/casbin/v3 v3.8.1
@@ -17,7 +17,7 @@ require (
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/driver/sqlite v1.6.0
 	gorm.io/gorm v1.31.1
-	tailscale.com v1.94.2
+	tailscale.com v1.84.3
 )
 
 require (

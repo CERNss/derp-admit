@@ -1,0 +1,14 @@
+addr: ":8080"
+log_level: "info"
+enable_casbin: true
+
+otel_enabled: false
+otel_service_name: "derp-admit"
+otel_exporter_otlp_endpoint: ""
+otel_exporter_otlp_insecure: true
+otel_trace_sample_ratio: 1.0
+
+db_timeout: "2s"
+verify_rate_limit_rps: 100
+verify_rate_limit_burst: 200
+verify_cache_ttl: "0s"

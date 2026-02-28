@@ -2,7 +2,15 @@
 
 `derp-verifier` is a sidecar service for `derper --verify-client-url`.
 
-### Required Environment Variables
+### Configuration Model
+
+Configuration is loaded in this order (later overrides earlier):
+
+1. `config/config.yaml`
+2. `.env` (or `ENV_FILE` path)
+3. real process environment variables
+
+### Required Values
 
 - `DATABASE_URL` (PostgreSQL DSN, or `sqlite://...` for local tests)
 - `TOKEN_PEPPER` (secret used by token hash: `hex(sha256(token + ":" + TOKEN_PEPPER))`)
@@ -25,6 +33,7 @@
 ### Run
 
 ```bash
+# optional: cp .env.example .env and edit values
 go run ./cmd/derp_admit
 ```
 
@@ -43,6 +52,11 @@ To prepare for SigNoz, set:
 - `OTEL_EXPORTER_OTLP_ENDPOINT=<your-collector-host:4318>`
 
 This enables OpenTelemetry traces while logs stay in structured zap JSON.
+
+With compose, the container reads:
+
+- config file: `/app/config/config.yaml`
+- env file: `../../.env` (from compose file location)
 
 ### Docker Build (Cross-Platform)
 

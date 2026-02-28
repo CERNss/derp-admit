@@ -18,6 +18,8 @@ FROM alpine:3.20
 RUN apk --no-cache add ca-certificates && \
     addgroup -S app && adduser -S -G app app
 COPY --from=build /out/derp-verifier /usr/local/bin/derp-verifier
+WORKDIR /app
+COPY config ./config
 USER app
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/derp-verifier"]

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -72,10 +74,19 @@ func main() {
 	svc := service.New(gormDB, policyEngine, cfg.TokenPepper, cfg.DBTimeout, verifyCache, logger)
 	router := server.NewRouter(svc, cfg, logger)
 
+	srv := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("starting verifier server", zap.String("addr", cfg.Addr))
-		if err := router.Run(cfg.Addr); err != nil {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
@@ -85,6 +96,11 @@ func main() {
 	select {
 	case sig := <-sigCh:
 		logger.Info("received shutdown signal", zap.String("signal", sig.String()))
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("graceful shutdown failed", zap.Error(err))
+		}
 	case err := <-errCh:
 		logger.Error("server stopped", zap.Error(err))
 		os.Exit(1)

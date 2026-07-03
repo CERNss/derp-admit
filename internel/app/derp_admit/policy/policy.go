@@ -122,9 +122,9 @@ func (e *Engine) EnforceConnect(nodeKey string) (bool, error) {
 		return true, nil
 	}
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
+	// SyncedEnforcer.Enforce is already concurrency-safe; no extra lock needed
+	// on the hot verify path. e.mu only guards check-then-write policy mutations
+	// (Bootstrap / EnsureDeviceForUser).
 	allowed, err := e.enforcer.Enforce(DeviceSubject(nodeKey), derpObject, connectAct)
 	if err != nil {
 		return false, fmt.Errorf("enforce policy: %w", err)

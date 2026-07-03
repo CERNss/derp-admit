@@ -32,10 +32,51 @@ func TestRegisterInvalidToken(t *testing.T) {
 
 	status, _ := doJSONRequest(t, router, "/register", map[string]any{
 		"token":   "invalid",
-		"nodeKey": "node-A",
+		"nodeKey": newNodeKey(t),
 	})
 	if status != http.StatusUnauthorized {
 		t.Fatalf("status=%d want=%d", status, http.StatusUnauthorized)
+	}
+}
+
+func TestRegisterRateLimited(t *testing.T) {
+	router, testDB := newTestRouter(t, func(c *config.Config) {
+		c.RegisterRateLimitRPS = 1
+		c.RegisterRateBurst = 1
+	})
+	user := createUser(t, testDB, "u-ratelimit")
+	createEnrollToken(t, testDB, user.ID, "test-pepper", "token-rl", nil, nil, 0)
+
+	// First request consumes the single burst token and succeeds.
+	status, _ := doJSONRequest(t, router, "/register", map[string]any{
+		"token":   "token-rl",
+		"nodeKey": newNodeKey(t),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("first register status=%d want=%d", status, http.StatusOK)
+	}
+
+	// Second immediate request is throttled.
+	status, _ = doJSONRequest(t, router, "/register", map[string]any{
+		"token":   "token-rl",
+		"nodeKey": newNodeKey(t),
+	})
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("second register status=%d want=%d", status, http.StatusTooManyRequests)
+	}
+}
+
+func TestRegisterInvalidNodeKey(t *testing.T) {
+	router, testDB := newTestRouter(t)
+	user := createUser(t, testDB, "u-badkey")
+	createEnrollToken(t, testDB, user.ID, "test-pepper", "token-badkey", nil, nil, 0)
+
+	status, _ := doJSONRequest(t, router, "/register", map[string]any{
+		"token":   "token-badkey",
+		"nodeKey": "not-a-real-node-key",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("status=%d want=%d", status, http.StatusBadRequest)
 	}
 }
 
@@ -49,7 +90,7 @@ func TestRegisterTokenExpiredOrRevoked(t *testing.T) {
 
 	status, _ := doJSONRequest(t, router, "/register", map[string]any{
 		"token":   "expired-token",
-		"nodeKey": "node-expired",
+		"nodeKey": newNodeKey(t),
 	})
 	if status != http.StatusForbidden {
 		t.Fatalf("expired status=%d want=%d", status, http.StatusForbidden)
@@ -59,7 +100,7 @@ func TestRegisterTokenExpiredOrRevoked(t *testing.T) {
 	createEnrollToken(t, testDB, user.ID, pepper, "revoked-token", nil, &revokedAt, 0)
 	status, _ = doJSONRequest(t, router, "/register", map[string]any{
 		"token":   "revoked-token",
-		"nodeKey": "node-revoked",
+		"nodeKey": newNodeKey(t),
 	})
 	if status != http.StatusForbidden {
 		t.Fatalf("revoked status=%d want=%d", status, http.StatusForbidden)
@@ -73,11 +114,12 @@ func TestRegisterNodeKeyConflictAcrossUsers(t *testing.T) {
 	userA := createUser(t, testDB, "u-a")
 	userB := createUser(t, testDB, "u-b")
 	createEnrollToken(t, testDB, userA.ID, pepper, "token-a", nil, nil, 0)
-	createDevice(t, testDB, userB.ID, "node-shared", "", nil)
+	sharedKey := newNodeKey(t)
+	createDevice(t, testDB, userB.ID, sharedKey, "", nil)
 
 	status, _ := doJSONRequest(t, router, "/register", map[string]any{
 		"token":   "token-a",
-		"nodeKey": "node-shared",
+		"nodeKey": sharedKey,
 	})
 	if status != http.StatusConflict {
 		t.Fatalf("status=%d want=%d", status, http.StatusConflict)
@@ -90,11 +132,11 @@ func TestRegisterMaxDevicesLimit(t *testing.T) {
 
 	user := createUser(t, testDB, "u-limit")
 	createEnrollToken(t, testDB, user.ID, pepper, "token-limit", nil, nil, 1)
-	createDevice(t, testDB, user.ID, "node-existing", "", nil)
+	createDevice(t, testDB, user.ID, newNodeKey(t), "", nil)
 
 	status, _ := doJSONRequest(t, router, "/register", map[string]any{
 		"token":   "token-limit",
-		"nodeKey": "node-new",
+		"nodeKey": newNodeKey(t),
 	})
 	if status != http.StatusForbidden {
 		t.Fatalf("status=%d want=%d", status, http.StatusForbidden)
@@ -254,7 +296,7 @@ func TestVerifyDenyDoesNotUpdateLastSeen(t *testing.T) {
 	}
 }
 
-func newTestRouter(t *testing.T) (http.Handler, *gorm.DB) {
+func newTestRouter(t *testing.T, opts ...func(*config.Config)) (http.Handler, *gorm.DB) {
 	t.Helper()
 
 	dbPath := filepath.Join(t.TempDir(), "test.db")
@@ -277,12 +319,19 @@ func newTestRouter(t *testing.T) (http.Handler, *gorm.DB) {
 	}
 
 	logger := zap.NewNop()
-	svc := service.New(gormDB, policyEngine, "test-pepper", 2*time.Second, service.NewVerifyCache(0), logger)
 	cfg := config.Config{
-		DBTimeout:          2 * time.Second,
-		VerifyRateLimitRPS: 1000,
-		VerifyRateBurst:    1000,
+		DBTimeout:            2 * time.Second,
+		VerifyRateLimitRPS:   1000,
+		VerifyRateBurst:      1000,
+		RegisterRateLimitRPS: 1000,
+		RegisterRateBurst:    1000,
+		AdminRateLimitRPS:    1000,
+		AdminRateBurst:       1000,
 	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	svc := service.New(gormDB, policyEngine, "test-pepper", 2*time.Second, service.NewVerifyCache(cfg.VerifyCacheTTL), logger)
 	router := server.NewRouter(svc, cfg, logger)
 
 	return router, gormDB

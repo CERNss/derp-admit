@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -17,15 +18,24 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// maxRequestBodyBytes caps inbound request bodies to protect the admission
+// path from large-payload memory pressure.
+const maxRequestBodyBytes = 1 << 20 // 1 MiB
+
 func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
+	// Trust no proxy headers: ClientIP is the TCP peer address, so the per-IP
+	// register limiter cannot be reset with a spoofed X-Forwarded-For.
+	_ = router.SetTrustedProxies(nil)
 	router.Use(gin.Recovery())
+	router.Use(limitRequestBody(maxRequestBodyBytes))
 	if cfg.OTELEnabled {
 		router.Use(otelgin.Middleware(cfg.OTELServiceName))
 	}
 
-	limiter := rate.NewLimiter(rate.Limit(cfg.VerifyRateLimitRPS), cfg.VerifyRateBurst)
+	verifyLimiter := rate.NewLimiter(rate.Limit(cfg.VerifyRateLimitRPS), cfg.VerifyRateBurst)
+	registerLimiter := newIPRateLimiter(cfg.RegisterRateLimitRPS, cfg.RegisterRateBurst)
 
 	router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -42,9 +52,16 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger) *gin
 	})
 
 	router.POST("/register", func(c *gin.Context) {
+		if !registerLimiter.Allow(c.ClientIP()) {
+			logWithTrace(logger, c.Request.Context()).Warn("register request rate limited",
+				zap.String("client_ip", c.ClientIP()),
+			)
+			c.JSON(http.StatusTooManyRequests, gin.H{"ok": false, "error": "rate limited"})
+			return
+		}
+
 		var req service.RegisterInput
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "invalid request"})
+		if !bindJSON(c, &req) {
 			return
 		}
 
@@ -65,7 +82,7 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger) *gin
 	})
 
 	router.POST("/verify", func(c *gin.Context) {
-		if !limiter.Allow() {
+		if !verifyLimiter.Allow() {
 			logWithTrace(logger, c.Request.Context()).Warn("verify request rate limited")
 			resp := derp.BuildResponse(false, "rate limited")
 			c.JSON(http.StatusOK, resp)
@@ -94,7 +111,39 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger) *gin
 		})
 	})
 
+	if cfg.AdminAPIKey != "" {
+		adminLimiter := rate.NewLimiter(rate.Limit(cfg.AdminRateLimitRPS), cfg.AdminRateBurst)
+		registerAdminRoutes(router, svc, cfg.AdminAPIKey, adminLimiter, logger)
+		logger.Info("admin API enabled", zap.String("prefix", "/admin"))
+	} else {
+		logger.Warn("admin API disabled: ADMIN_API_KEY not set (provision via SQL)")
+	}
+
 	return router
+}
+
+// bindJSON binds the request body and writes the error response on failure:
+// 413 when the body exceeded the request-size cap, 400 otherwise.
+func bindJSON(c *gin.Context, out any) bool {
+	if err := c.ShouldBindJSON(out); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"ok": false, "error": "request body too large"})
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "invalid request"})
+		}
+		return false
+	}
+	return true
+}
+
+func limitRequestBody(n int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, n)
+		}
+		c.Next()
+	}
 }
 
 func logWithTrace(logger *zap.Logger, ctx context.Context) *zap.Logger {

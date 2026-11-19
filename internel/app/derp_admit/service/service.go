@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -55,6 +56,12 @@ func New(db *gorm.DB, policyEngine *policy.Engine, tokenPepper string, dbTimeout
 	}
 }
 
+// Sentinel results the registration transaction maps to HTTP statuses.
+var (
+	errRegisterForbidden = errors.New("registration forbidden")
+	errRegisterConflict  = errors.New("registration conflict")
+)
+
 func (s *Service) Register(ctx context.Context, in RegisterInput) (int, error) {
 	in.Token = strings.TrimSpace(in.Token)
 	in.NodeKey = strings.TrimSpace(in.NodeKey)
@@ -64,12 +71,19 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (int, error) {
 		return http.StatusBadRequest, nil
 	}
 
+	normalizedKey, err := derp.NormalizeNodeKey(in.NodeKey)
+	if err != nil {
+		return http.StatusBadRequest, nil
+	}
+	in.NodeKey = normalizedKey
+
 	dbCtx, cancel := context.WithTimeout(ctx, s.dbTimeout)
 	defer cancel()
 
-	now := time.Now().UTC()
 	tokenHash := s.hashToken(in.Token)
 
+	// Fast-path rejection without opening a transaction; token and user
+	// state are re-validated under lock inside the transaction below.
 	var enroll model.EnrollToken
 	if err := s.db.WithContext(dbCtx).Where("token_hash = ?", tokenHash).First(&enroll).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -77,80 +91,127 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (int, error) {
 		}
 		return http.StatusInternalServerError, fmt.Errorf("lookup token: %w", err)
 	}
-
-	if enroll.RevokedAt != nil || (enroll.ExpiresAt != nil && enroll.ExpiresAt.Before(now)) {
+	if enroll.RevokedAt != nil || (enroll.ExpiresAt != nil && enroll.ExpiresAt.Before(time.Now().UTC())) {
 		return http.StatusForbidden, nil
 	}
 
-	var user model.User
-	if err := s.db.WithContext(dbCtx).First(&user, "id = ?", enroll.UserID).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return http.StatusForbidden, nil
+	// The transaction serializes concurrent registrations for the same user
+	// (MaxDevices check-then-create) and re-validates the token and user on
+	// locked rows, so an admin revoke/disable landing after the fast-path
+	// checks cannot still produce an enrolled device.
+	txErr := s.db.WithContext(dbCtx).Transaction(func(tx *gorm.DB) error {
+		lockQuery := tx
+		if tx.Dialector.Name() != "sqlite" {
+			// sqlite has no SELECT ... FOR UPDATE; its write transactions are
+			// serialized whole-database via the _txlock=immediate DSN option.
+			lockQuery = tx.Clauses(clause.Locking{Strength: "UPDATE"})
 		}
-		return http.StatusInternalServerError, fmt.Errorf("lookup user: %w", err)
-	}
-	if user.DisabledAt != nil {
-		return http.StatusForbidden, nil
-	}
 
-	var existing model.Device
-	err := s.db.WithContext(dbCtx).Where("node_key = ?", in.NodeKey).First(&existing).Error
-	switch {
-	case err == nil:
-		if existing.UserID != enroll.UserID {
-			return http.StatusConflict, nil
+		now := time.Now().UTC()
+		var token model.EnrollToken
+		if err := lockQuery.First(&token, "id = ?", enroll.ID).Error; err != nil {
+			return fmt.Errorf("lock token: %w", err)
 		}
-		updates := map[string]any{}
-		if existing.RevokedAt != nil {
-			updates["revoked_at"] = nil
+		if token.RevokedAt != nil || (token.ExpiresAt != nil && token.ExpiresAt.Before(now)) {
+			return errRegisterForbidden
 		}
-		if in.Label != "" {
-			updates["label"] = in.Label
-		}
-		if len(updates) > 0 {
-			if err := s.db.WithContext(dbCtx).Model(&model.Device{}).Where("id = ?", existing.ID).Updates(updates).Error; err != nil {
-				return http.StatusInternalServerError, fmt.Errorf("update existing device: %w", err)
+
+		var user model.User
+		if err := lockQuery.First(&user, "id = ?", token.UserID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errRegisterForbidden
 			}
+			return fmt.Errorf("lock user: %w", err)
 		}
-		if err := s.policy.EnsureDeviceForUser(in.NodeKey, enroll.UserID); err != nil {
-			return http.StatusInternalServerError, fmt.Errorf("ensure policy bindings: %w", err)
+		if user.DisabledAt != nil {
+			return errRegisterForbidden
 		}
-		s.cache.Invalidate(in.NodeKey)
-		return http.StatusOK, nil
-	case errors.Is(err, gorm.ErrRecordNotFound):
-		// continue
+
+		var existing model.Device
+		err := tx.Where("node_key = ?", in.NodeKey).First(&existing).Error
+		switch {
+		case err == nil:
+			if existing.UserID != token.UserID {
+				return errRegisterConflict
+			}
+			updates := map[string]any{}
+			if existing.RevokedAt != nil {
+				// Reactivating a revoked device re-counts against the limit.
+				if err := checkDeviceLimit(tx, token); err != nil {
+					return err
+				}
+				updates["revoked_at"] = nil
+			}
+			if in.Label != "" {
+				updates["label"] = in.Label
+			}
+			if len(updates) > 0 {
+				if err := tx.Model(&model.Device{}).Where("id = ?", existing.ID).Updates(updates).Error; err != nil {
+					return fmt.Errorf("update existing device: %w", err)
+				}
+			}
+			return nil
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			// fall through to create
+		default:
+			return fmt.Errorf("lookup device: %w", err)
+		}
+
+		if err := checkDeviceLimit(tx, token); err != nil {
+			return err
+		}
+
+		device := model.Device{
+			UserID:  token.UserID,
+			NodeKey: in.NodeKey,
+			Label:   in.Label,
+		}
+		if err := tx.Create(&device).Error; err != nil {
+			if errors.Is(err, gorm.ErrDuplicatedKey) {
+				// Lost a same-node-key race against a concurrent registration.
+				return errRegisterConflict
+			}
+			return fmt.Errorf("create device: %w", err)
+		}
+		return nil
+	})
+	switch {
+	case txErr == nil:
+	case errors.Is(txErr, errRegisterForbidden):
+		return http.StatusForbidden, nil
+	case errors.Is(txErr, errRegisterConflict):
+		return http.StatusConflict, nil
 	default:
-		return http.StatusInternalServerError, fmt.Errorf("lookup device: %w", err)
+		return http.StatusInternalServerError, txErr
 	}
 
-	if enroll.MaxDevices > 0 {
-		var count int64
-		if err := s.db.WithContext(dbCtx).
-			Model(&model.Device{}).
-			Where("user_id = ? AND revoked_at IS NULL", enroll.UserID).
-			Count(&count).Error; err != nil {
-			return http.StatusInternalServerError, fmt.Errorf("count active devices: %w", err)
-		}
-		if count >= int64(enroll.MaxDevices) {
-			return http.StatusForbidden, nil
-		}
-	}
-
-	device := model.Device{
-		UserID:  enroll.UserID,
-		NodeKey: in.NodeKey,
-		Label:   in.Label,
-	}
-	if err := s.db.WithContext(dbCtx).Create(&device).Error; err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("create device: %w", err)
-	}
-
-	if err := s.policy.EnsureDeviceForUser(in.NodeKey, enroll.UserID); err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("ensure policy bindings: %w", err)
-	}
-
+	policyErr := s.policy.EnsureDeviceForUser(in.NodeKey, enroll.UserID)
+	// The device row is committed either way, so any cached decision for this
+	// key is stale even when the policy write failed.
 	s.cache.Invalidate(in.NodeKey)
+	if policyErr != nil {
+		return http.StatusInternalServerError, fmt.Errorf("ensure policy bindings: %w", policyErr)
+	}
+
 	return http.StatusOK, nil
+}
+
+// checkDeviceLimit returns errRegisterForbidden when the token's MaxDevices
+// cap (0 = unlimited) is already reached by the user's active devices.
+func checkDeviceLimit(tx *gorm.DB, token model.EnrollToken) error {
+	if token.MaxDevices <= 0 {
+		return nil
+	}
+	var count int64
+	if err := tx.Model(&model.Device{}).
+		Where("user_id = ? AND revoked_at IS NULL", token.UserID).
+		Count(&count).Error; err != nil {
+		return fmt.Errorf("count active devices: %w", err)
+	}
+	if count >= int64(token.MaxDevices) {
+		return errRegisterForbidden
+	}
+	return nil
 }
 
 func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
@@ -168,6 +229,11 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 		return cached.Allow, cached.Reason
 	}
 
+	// Snapshot before the DB reads: if a revoke/disable/registration
+	// invalidates this key while the decision is being computed, Set drops
+	// the now-stale decision instead of caching it past the invalidation.
+	epoch := s.cache.Epoch()
+
 	dbCtx, cancel := context.WithTimeout(ctx, s.dbTimeout)
 	defer cancel()
 
@@ -175,7 +241,7 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 	if err := s.db.WithContext(dbCtx).Where("node_key = ?", nodeKey).First(&device).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			s.writeAudit(context.Background(), nil, nodeKey, false, DenyReasonNotRegistered)
-			s.cache.Set(nodeKey, false, DenyReasonNotRegistered, nil)
+			s.cache.Set(nodeKey, epoch, false, DenyReasonNotRegistered, nil)
 			return false, DenyReasonNotRegistered
 		}
 		logger.Error("lookup device during verify",
@@ -189,7 +255,7 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 	if device.RevokedAt != nil {
 		deviceID := device.ID
 		s.writeAudit(context.Background(), &deviceID, nodeKey, false, DenyReasonRevoked)
-		s.cache.Set(nodeKey, false, DenyReasonRevoked, &deviceID)
+		s.cache.Set(nodeKey, epoch, false, DenyReasonRevoked, &deviceID)
 		return false, DenyReasonRevoked
 	}
 
@@ -207,7 +273,7 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 	if user.DisabledAt != nil {
 		deviceID := device.ID
 		s.writeAudit(context.Background(), &deviceID, nodeKey, false, DenyReasonUserDisabled)
-		s.cache.Set(nodeKey, false, DenyReasonUserDisabled, &deviceID)
+		s.cache.Set(nodeKey, epoch, false, DenyReasonUserDisabled, &deviceID)
 		return false, DenyReasonUserDisabled
 	}
 
@@ -224,7 +290,7 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 	if !allowed {
 		deviceID := device.ID
 		s.writeAudit(context.Background(), &deviceID, nodeKey, false, DenyReasonPolicyDenied)
-		s.cache.Set(nodeKey, false, DenyReasonPolicyDenied, &deviceID)
+		s.cache.Set(nodeKey, epoch, false, DenyReasonPolicyDenied, &deviceID)
 		return false, DenyReasonPolicyDenied
 	}
 
@@ -233,19 +299,18 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 		Model(&model.Device{}).
 		Where("id = ?", device.ID).
 		Update("last_seen_at", now).Error; err != nil {
-		logger.Error("update last_seen_at",
+		// last_seen_at is best-effort telemetry: a write failure must not turn
+		// an otherwise-authorized client into a denial.
+		logger.Warn("update last_seen_at",
 			zap.Error(err),
 			zap.String("node_key", nodeKey),
 			zap.String("device_id", device.ID.String()),
 		)
-		deviceID := device.ID
-		s.writeAudit(context.Background(), &deviceID, nodeKey, false, DenyReasonInternal)
-		return false, DenyReasonInternal
 	}
 
 	deviceID := device.ID
 	s.writeAudit(context.Background(), &deviceID, nodeKey, true, "")
-	s.cache.Set(nodeKey, true, "", &deviceID)
+	s.cache.Set(nodeKey, epoch, true, "", &deviceID)
 	return true, ""
 }
 

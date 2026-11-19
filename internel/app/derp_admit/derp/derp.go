@@ -6,19 +6,38 @@ import (
 	"strings"
 
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
 
+// ParseRequest decodes a derper admit-callback body and returns the request
+// together with the canonical node-key string that identifies the device.
 func ParseRequest(body []byte) (tailcfg.DERPAdmitClientRequest, string, error) {
 	var req tailcfg.DERPAdmitClientRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		return req, "", fmt.Errorf("decode DERPAdmitClientRequest: %w", err)
 	}
-
-	nodeKey, err := extractNodeKey(req)
-	if err != nil {
-		return req, "", err
+	if req.NodePublic.IsZero() {
+		return req, "", fmt.Errorf("node key missing from DERP request")
 	}
-	return req, nodeKey, nil
+	return req, req.NodePublic.String(), nil
+}
+
+// NormalizeNodeKey validates a caller-supplied node key and returns it in the
+// exact canonical form ParseRequest derives from derper, so device identities
+// stored at registration match the identities seen at verify time.
+func NormalizeNodeKey(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("empty node key")
+	}
+	var k key.NodePublic
+	if err := k.UnmarshalText([]byte(raw)); err != nil {
+		return "", fmt.Errorf("invalid node key: %w", err)
+	}
+	if k.IsZero() {
+		return "", fmt.Errorf("zero node key")
+	}
+	return k.String(), nil
 }
 
 func BuildResponse(allow bool, denyReason string) map[string]any {
@@ -29,47 +48,4 @@ func BuildResponse(allow bool, denyReason string) map[string]any {
 		resp["DenyReason"] = denyReason
 	}
 	return resp
-}
-
-func extractNodeKey(req tailcfg.DERPAdmitClientRequest) (string, error) {
-	marshaled, err := json.Marshal(req)
-	if err != nil {
-		return "", fmt.Errorf("re-encode DERP request: %w", err)
-	}
-
-	var raw map[string]any
-	if err := json.Unmarshal(marshaled, &raw); err != nil {
-		return "", fmt.Errorf("re-decode DERP request: %w", err)
-	}
-
-	for _, key := range []string{"nodekey", "node_key", "nodepublic", "node_public", "publickey"} {
-		if value, ok := findStringCaseInsensitive(raw, key); ok && value != "" {
-			return value, nil
-		}
-	}
-
-	return "", fmt.Errorf("node key not found in DERP request")
-}
-
-func findStringCaseInsensitive(v any, target string) (string, bool) {
-	switch typed := v.(type) {
-	case map[string]any:
-		for k, nested := range typed {
-			if strings.EqualFold(k, target) {
-				if str, ok := nested.(string); ok {
-					return strings.TrimSpace(str), true
-				}
-			}
-			if value, ok := findStringCaseInsensitive(nested, target); ok {
-				return value, true
-			}
-		}
-	case []any:
-		for _, nested := range typed {
-			if value, ok := findStringCaseInsensitive(nested, target); ok {
-				return value, true
-			}
-		}
-	}
-	return "", false
 }

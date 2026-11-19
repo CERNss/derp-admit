@@ -1,4 +1,4 @@
-These tasks record work already shipped in commit `c565b78`. The last group is the review this retroactive change still needs.
+These tasks record work already shipped in commit `c565b78`, except 5.3, which also needed the dependency fix in `e72dfe0`. The last group is the review this retroactive change still needs.
 
 ## 1. Admin API
 
@@ -30,7 +30,7 @@ These tasks record work already shipped in commit `c565b78`. The last group is t
 
 - [x] 5.1 Add admin API, rate limit, concurrency and cache tests
 - [x] 5.2 Document the admin API and new settings in the README
-- [x] 5.3 Run build, vet and race tests on Go 1.24.0 and Go 1.27.2
+- [x] 5.3 Run build, vet and race tests on Go 1.24.0, and on Go 1.27.2 once `e72dfe0` fixed the build there
 
 ## 6. Review
 

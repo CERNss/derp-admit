@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -46,10 +47,43 @@ func adminRoutes() []adminRoute {
 	return out
 }
 
+func validateAdminRoutes(routes []adminRoute) error {
+	seen := make(map[string]struct{}, len(routes))
+	for i, r := range routes {
+		if r.MinTier < actor.TierViewer {
+			return fmt.Errorf("admin route %d (%s %s): MinTier %q must be at least viewer", i, r.Method, r.Path, r.MinTier)
+		}
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodDelete:
+			if strings.TrimSpace(r.Action) == "" || strings.TrimSpace(r.TargetType) == "" {
+				return fmt.Errorf("admin route %d (%s %s): mutating route must define Action and TargetType", i, r.Method, r.Path)
+			}
+		case http.MethodGet:
+			if strings.TrimSpace(r.Action) != "" {
+				return fmt.Errorf("admin route %d (%s %s): GET route must have empty Action", i, r.Method, r.Path)
+			}
+		}
+		key := r.Method + " " + r.Path
+		if _, dup := seen[key]; dup {
+			return fmt.Errorf("admin route %d (%s %s): duplicate method and path", i, r.Method, r.Path)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
 // registerAdminRoutes mounts the authenticated /admin API from adminRoutes().
 // It is only called when ADMIN_API_KEY is configured. The per-IP rate limiter
 // runs before authentication so keys cannot be brute-forced at line rate.
 func registerAdminRoutes(router *gin.Engine, svc *service.Service, limiter *ipRateLimiter, logger *zap.Logger, rec metrics.Recorder) {
+	mountAdminRoutes(router, svc, limiter, logger, rec, adminRoutes())
+}
+
+func mountAdminRoutes(router *gin.Engine, svc *service.Service, limiter *ipRateLimiter, logger *zap.Logger, rec metrics.Recorder, routes []adminRoute) {
+	if err := validateAdminRoutes(routes); err != nil {
+		panic(fmt.Sprintf("invalid admin route table: %v", err))
+	}
+
 	deps := adminDeps{svc: svc, logger: logger}
 	admin := router.Group(
 		"/admin",
@@ -58,7 +92,7 @@ func registerAdminRoutes(router *gin.Engine, svc *service.Service, limiter *ipRa
 		adminAuth(svc, logger),
 	)
 
-	for _, r := range adminRoutes() {
+	for _, r := range routes {
 		route := r
 		handlers := make([]gin.HandlerFunc, 0, 4)
 		if route.Action != "" {
@@ -146,18 +180,26 @@ func attachAdminOp(route adminRoute) gin.HandlerFunc {
 
 // adminAuditTail records a standalone failure admin audit row for any
 // authenticated mutating request whose handler did not commit a success audit
-// row (covering 403, bindJSON/parseUUID 400s, 404/409 and 500s).
+// row (covering 403, bindJSON/parseUUID 400s, 404/409, 500s, and panics).
 func adminAuditTail(svc *service.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		panicked := true
+		defer func() {
+			op, hasOp := actor.OpFrom(c.Request.Context())
+			if !hasOp || op.Recorded() {
+				return
+			}
+			if _, hasActor := actor.From(c.Request.Context()); !hasActor {
+				return
+			}
+			status := c.Writer.Status()
+			if panicked {
+				status = http.StatusInternalServerError
+			}
+			svc.WriteAdminAuditFailure(c.Request.Context(), status)
+		}()
 		c.Next()
-		op, hasOp := actor.OpFrom(c.Request.Context())
-		if !hasOp || op.Recorded() {
-			return
-		}
-		if _, hasActor := actor.From(c.Request.Context()); !hasActor {
-			return
-		}
-		svc.WriteAdminAuditFailure(c.Request.Context(), c.Writer.Status())
+		panicked = false
 	}
 }
 

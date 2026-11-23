@@ -78,6 +78,7 @@ func (s *Service) Mutate(ctx context.Context, eff Effect, okStatus int, fn func(
 			s.metrics.PolicyReload(false)
 			loggerWithTrace(s.logger, ctx).Error("reload policy after mutation commit", zap.Error(reloadErr))
 		} else {
+			s.sync.ClearStale()
 			s.metrics.PolicyReload(true)
 		}
 		s.cache.Purge()

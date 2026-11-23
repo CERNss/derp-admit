@@ -107,9 +107,6 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (int, error) {
 				if err := tx.Model(&model.Device{}).Where("id = ?", existing.ID).Update("label", in.Label).Error; err != nil {
 					return fmt.Errorf("update existing device: %w", err)
 				}
-				if _, err := policy.BumpVersion(tx); err != nil {
-					return err
-				}
 			}
 			return nil
 		case errors.Is(err, gorm.ErrRecordNotFound):

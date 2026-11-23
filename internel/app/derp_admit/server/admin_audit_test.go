@@ -1,12 +1,26 @@
 package server_test
 
 import (
+	"context"
+	"errors"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"derp-admit/config"
 	"derp-admit/internel/app/derp_admit/actor"
+	"derp-admit/internel/app/derp_admit/db"
 	"derp-admit/internel/app/derp_admit/model"
+	"derp-admit/internel/app/derp_admit/policy"
+	"derp-admit/internel/app/derp_admit/server"
 	"derp-admit/internel/app/derp_admit/service"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"gorm.io/gorm"
 )
 
 func TestRequireTier(t *testing.T) {
@@ -109,5 +123,372 @@ func TestAdminAuditSkipsReads(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("admin audit count=%d want=0 for GET requests", count)
+	}
+}
+
+func TestAdminAuditSuccessWritesExactlyOneRow(t *testing.T) {
+	router, gormDB := newTestRouter(t, adminKeyOpt)
+	opKey := insertAdminKey(t, gormDB, "op-audit-ok", actor.TierOperator)
+
+	var seenCount int64
+	assertOneNewSuccess := func(t *testing.T, wantAction, wantTargetType, wantTargetID string, wantStatus int) {
+		t.Helper()
+		var rows []model.AdminAuditLog
+		if err := gormDB.Order("id asc").Find(&rows).Error; err != nil {
+			t.Fatalf("query admin_audit_logs: %v", err)
+		}
+		seenCount++
+		if int64(len(rows)) != seenCount {
+			t.Fatalf("%s: total audit rows=%d want=%d", wantAction, len(rows), seenCount)
+		}
+		last := rows[len(rows)-1]
+		if last.Outcome != service.AuditOutcomeSuccess {
+			t.Fatalf("%s: outcome=%q want=%q", wantAction, last.Outcome, service.AuditOutcomeSuccess)
+		}
+		if last.Action != wantAction || last.TargetType != wantTargetType || last.TargetID != wantTargetID {
+			t.Fatalf("%s: got action=%q targetType=%q targetID=%q want %q/%q/%q",
+				wantAction, last.Action, last.TargetType, last.TargetID, wantAction, wantTargetType, wantTargetID)
+		}
+		if last.HTTPStatus == nil || *last.HTTPStatus != wantStatus {
+			t.Fatalf("%s: http_status=%v want=%d", wantAction, last.HTTPStatus, wantStatus)
+		}
+	}
+
+	// 1. POST /admin/users
+	status, body := doAdminRequest(t, router, http.MethodPost, "/admin/users", opKey, map[string]any{"username": "audit-u1"})
+	if status != http.StatusCreated {
+		t.Fatalf("create user status=%d want=%d", status, http.StatusCreated)
+	}
+	userID := body["user"].(map[string]any)["id"].(string)
+	assertOneNewSuccess(t, "user.create", "user", userID, http.StatusCreated)
+
+	// 2. POST /admin/users/:id/disable
+	if status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/users/"+userID+"/disable", opKey, nil); status != http.StatusOK {
+		t.Fatalf("disable user status=%d want=%d", status, http.StatusOK)
+	}
+	assertOneNewSuccess(t, "user.disable", "user", userID, http.StatusOK)
+
+	// 3. POST /admin/users/:id/enable
+	if status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/users/"+userID+"/enable", opKey, nil); status != http.StatusOK {
+		t.Fatalf("enable user status=%d want=%d", status, http.StatusOK)
+	}
+	assertOneNewSuccess(t, "user.enable", "user", userID, http.StatusOK)
+
+	// 4. POST /admin/tokens
+	status, body = doAdminRequest(t, router, http.MethodPost, "/admin/tokens", opKey, map[string]any{"userId": userID})
+	if status != http.StatusCreated {
+		t.Fatalf("create token status=%d want=%d", status, http.StatusCreated)
+	}
+	tokenID := body["meta"].(map[string]any)["id"].(string)
+	assertOneNewSuccess(t, "token.create", "token", tokenID, http.StatusCreated)
+
+	// 5. POST /admin/tokens/:id/revoke
+	if status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/tokens/"+tokenID+"/revoke", opKey, nil); status != http.StatusOK {
+		t.Fatalf("revoke token status=%d want=%d", status, http.StatusOK)
+	}
+	assertOneNewSuccess(t, "token.revoke", "token", tokenID, http.StatusOK)
+
+	// Seed a device directly so we can exercise the device mutation routes.
+	dev := createDevice(t, gormDB, uuid.MustParse(userID), newNodeKey(t), "dev-1", nil)
+	devID := dev.ID.String()
+
+	// 6. POST /admin/devices/:id/revoke
+	if status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/devices/"+devID+"/revoke", opKey, nil); status != http.StatusOK {
+		t.Fatalf("revoke device status=%d want=%d", status, http.StatusOK)
+	}
+	assertOneNewSuccess(t, "device.revoke", "device", devID, http.StatusOK)
+
+	// 7. POST /admin/devices/:id/enable
+	if status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/devices/"+devID+"/enable", opKey, nil); status != http.StatusOK {
+		t.Fatalf("enable device status=%d want=%d", status, http.StatusOK)
+	}
+	assertOneNewSuccess(t, "device.enable", "device", devID, http.StatusOK)
+}
+
+func TestAdminAuditRecordsFailedMutations(t *testing.T) {
+	router, gormDB := newTestRouter(t, adminKeyOpt)
+	opKey := insertAdminKey(t, gormDB, "op-audit-fail", actor.TierOperator)
+
+	// Seed one existing user directly via SQL so the conflict check starts with 0 audit rows.
+	createUser(t, gormDB, "taken-user")
+
+	cases := []struct {
+		name       string
+		path       string
+		payload    any
+		wantStatus int
+		wantAction string
+	}{
+		{
+			name:       "bad_uuid_400",
+			path:       "/admin/users/not-a-uuid/disable",
+			payload:    nil,
+			wantStatus: http.StatusBadRequest,
+			wantAction: "user.disable",
+		},
+		{
+			name:       "blank_username_400",
+			path:       "/admin/users",
+			payload:    map[string]any{"username": "   "},
+			wantStatus: http.StatusBadRequest,
+			wantAction: "user.create",
+		},
+		{
+			name:       "unknown_id_404",
+			path:       "/admin/devices/" + uuid.New().String() + "/revoke",
+			payload:    nil,
+			wantStatus: http.StatusNotFound,
+			wantAction: "device.revoke",
+		},
+		{
+			name:       "duplicate_username_409",
+			path:       "/admin/users",
+			payload:    map[string]any{"username": "taken-user"},
+			wantStatus: http.StatusConflict,
+			wantAction: "user.create",
+		},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, _ := doAdminRequest(t, router, http.MethodPost, tc.path, opKey, tc.payload)
+			if status != tc.wantStatus {
+				t.Fatalf("status=%d want=%d", status, tc.wantStatus)
+			}
+
+			var rows []model.AdminAuditLog
+			if err := gormDB.Order("id asc").Find(&rows).Error; err != nil {
+				t.Fatalf("query admin_audit_logs: %v", err)
+			}
+			if len(rows) != i+1 {
+				t.Fatalf("audit row count=%d want=%d", len(rows), i+1)
+			}
+			row := rows[len(rows)-1]
+			if row.Outcome != service.AuditOutcomeFailure {
+				t.Fatalf("outcome=%q want=%q", row.Outcome, service.AuditOutcomeFailure)
+			}
+			if row.Action != tc.wantAction {
+				t.Fatalf("action=%q want=%q", row.Action, tc.wantAction)
+			}
+			if row.HTTPStatus == nil || *row.HTTPStatus != tc.wantStatus {
+				t.Fatalf("http_status=%v want=%d", row.HTTPStatus, tc.wantStatus)
+			}
+		})
+	}
+
+	var successCount int64
+	if err := gormDB.Model(&model.AdminAuditLog{}).Where("outcome = ?", service.AuditOutcomeSuccess).Count(&successCount).Error; err != nil {
+		t.Fatalf("count success rows: %v", err)
+	}
+	if successCount != 0 {
+		t.Fatalf("success audit row count=%d want=0", successCount)
+	}
+}
+
+type flakyPolicyEngine struct {
+	inner      policy.PolicyEngine
+	failReload atomic.Bool
+}
+
+func (f *flakyPolicyEngine) Enforce(req policy.Request) (bool, error) {
+	return f.inner.Enforce(req)
+}
+
+func (f *flakyPolicyEngine) Reload(ctx context.Context) error {
+	if f.failReload.Load() {
+		return errors.New("forced policy reload failure")
+	}
+	return f.inner.Reload(ctx)
+}
+
+func TestMutateReloadFailureFailsClosed(t *testing.T) {
+	dbURL := "sqlite://" + filepath.Join(t.TempDir(), "stale.db")
+	gormDB, err := db.OpenDatabase(dbURL)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := db.ApplyMigrations(context.Background(), gormDB, dbURL); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	if err := gormDB.Transaction(func(tx *gorm.DB) error {
+		_, err := policy.SeedBuiltins(tx)
+		return err
+	}); err != nil {
+		t.Fatalf("seed builtins: %v", err)
+	}
+
+	realEngine, err := policy.NewEngine(gormDB, true)
+	if err != nil {
+		t.Fatalf("new policy engine: %v", err)
+	}
+	flaky := &flakyPolicyEngine{inner: realEngine}
+
+	cfg := config.Config{
+		AdminAPIKey:          testAdminKey,
+		DBTimeout:            2 * time.Second,
+		PolicySyncInterval:   2 * time.Second,
+		VerifyCacheTTL:       time.Minute,
+		VerifyRateLimitRPS:   1000,
+		VerifyRateBurst:      1000,
+		RegisterRateLimitRPS: 1000,
+		RegisterRateBurst:    1000,
+		AdminRateLimitRPS:    1000,
+		AdminRateBurst:       1000,
+	}
+	logger := zap.NewNop()
+	svc := service.New(
+		gormDB,
+		flaky,
+		"test-pepper",
+		cfg.DBTimeout,
+		service.NewVerifyCache(cfg.VerifyCacheTTL),
+		logger,
+		service.WithAdminAPIKey(testAdminKey),
+	)
+	router := server.NewRouter(svc, cfg, logger)
+
+	// Provision a user + device and warm the verify cache with an allow.
+	userID, token := provisionUserAndToken(t, router, "stale-check-user")
+	_ = userID
+	nodeKey := newNodeKey(t)
+	if status, _ := doJSONRequest(t, router, "/register", map[string]any{
+		"token":   token,
+		"nodeKey": nodeKey,
+	}); status != http.StatusOK {
+		t.Fatalf("register status=%d want=%d", status, http.StatusOK)
+	}
+	if _, payload := doRawRequest(t, router, "/verify", buildVerifyBody(t, nodeKey)); payload["Allow"] != true {
+		t.Fatalf("initial verify expected allow, got deny reason=%q", denyReason(payload))
+	}
+
+	checkReadyz := func() int {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		return rec.Code
+	}
+	if code := checkReadyz(); code != http.StatusOK {
+		t.Fatalf("initial /readyz=%d want=%d", code, http.StatusOK)
+	}
+
+	// Force post-commit policy reload to fail on the next EffectPolicy mutation.
+	flaky.failReload.Store(true)
+	if status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/users", testAdminKey, map[string]any{
+		"username": "triggers-reload-fail",
+	}); status != http.StatusCreated {
+		t.Fatalf("mutation with failed reload status=%d want=%d", status, http.StatusCreated)
+	}
+
+	// Instance must now fail closed: /readyz is 503 and /verify denies with internal error (audited),
+	// even for a device that was previously allowed and cached.
+	if code := checkReadyz(); code != http.StatusServiceUnavailable {
+		t.Fatalf("stale /readyz=%d want=%d", code, http.StatusServiceUnavailable)
+	}
+	_, payload := doRawRequest(t, router, "/verify", buildVerifyBody(t, nodeKey))
+	if allow, _ := payload["Allow"].(bool); allow {
+		t.Fatalf("stale verify expected deny, got allow")
+	}
+	if reason := denyReason(payload); reason != service.DenyReasonInternal {
+		t.Fatalf("stale verify reason=%q want=%q", reason, service.DenyReasonInternal)
+	}
+
+	var lastAudit model.AuditLog
+	if err := gormDB.Order("id desc").First(&lastAudit).Error; err != nil {
+		t.Fatalf("load latest verify audit: %v", err)
+	}
+	if lastAudit.Allowed || lastAudit.Reason != service.DenyReasonInternal || lastAudit.NodeKey != nodeKey {
+		t.Fatalf("unexpected stale audit row: %+v", lastAudit)
+	}
+
+	// A subsequent successful reload through Mutate clears staleness and restores both.
+	flaky.failReload.Store(false)
+	if status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/users", testAdminKey, map[string]any{
+		"username": "triggers-reload-recover",
+	}); status != http.StatusCreated {
+		t.Fatalf("recovery mutation status=%d want=%d", status, http.StatusCreated)
+	}
+
+	if code := checkReadyz(); code != http.StatusOK {
+		t.Fatalf("recovered /readyz=%d want=%d", code, http.StatusOK)
+	}
+	if _, payload := doRawRequest(t, router, "/verify", buildVerifyBody(t, nodeKey)); payload["Allow"] != true {
+		t.Fatalf("recovered verify expected allow, got deny reason=%q", denyReason(payload))
+	}
+}
+
+func TestRegisterNewDeviceBumpsVersion(t *testing.T) {
+	router, gormDB := newTestRouter(t, adminKeyOpt)
+	_, token := provisionUserAndToken(t, router, "reg-bump-user")
+
+	v0, err := policy.ReadVersion(context.Background(), gormDB)
+	if err != nil {
+		t.Fatalf("read version v0: %v", err)
+	}
+
+	if status, _ := doJSONRequest(t, router, "/register", map[string]any{
+		"token":   token,
+		"nodeKey": newNodeKey(t),
+		"label":   "laptop",
+	}); status != http.StatusOK {
+		t.Fatalf("register status=%d want=%d", status, http.StatusOK)
+	}
+
+	v1, err := policy.ReadVersion(context.Background(), gormDB)
+	if err != nil {
+		t.Fatalf("read version v1: %v", err)
+	}
+	if v1 != v0+1 {
+		t.Fatalf("version after new device=%d want=%d", v1, v0+1)
+	}
+}
+
+func TestRegisterLabelUpdateDoesNotBumpVersion(t *testing.T) {
+	router, gormDB := newTestRouter(t, adminKeyOpt)
+	_, token := provisionUserAndToken(t, router, "reg-rereg-user")
+	nodeKey := newNodeKey(t)
+
+	if status, _ := doJSONRequest(t, router, "/register", map[string]any{
+		"token":   token,
+		"nodeKey": nodeKey,
+		"label":   "initial",
+	}); status != http.StatusOK {
+		t.Fatalf("initial register status=%d want=%d", status, http.StatusOK)
+	}
+
+	vAfterCreate, err := policy.ReadVersion(context.Background(), gormDB)
+	if err != nil {
+		t.Fatalf("read version after create: %v", err)
+	}
+
+	// Re-register same active device with a new label: updates label, does not bump version.
+	if status, _ := doJSONRequest(t, router, "/register", map[string]any{
+		"token":   token,
+		"nodeKey": nodeKey,
+		"label":   "renamed",
+	}); status != http.StatusOK {
+		t.Fatalf("label update register status=%d want=%d", status, http.StatusOK)
+	}
+
+	// Re-register same active device without a label: also does not bump version.
+	if status, _ := doJSONRequest(t, router, "/register", map[string]any{
+		"token":   token,
+		"nodeKey": nodeKey,
+	}); status != http.StatusOK {
+		t.Fatalf("no-label re-register status=%d want=%d", status, http.StatusOK)
+	}
+
+	vAfterRereg, err := policy.ReadVersion(context.Background(), gormDB)
+	if err != nil {
+		t.Fatalf("read version after re-register: %v", err)
+	}
+	if vAfterRereg != vAfterCreate {
+		t.Fatalf("version bumped on re-register: got=%d want=%d", vAfterRereg, vAfterCreate)
+	}
+
+	var dev model.Device
+	if err := gormDB.Where("node_key = ?", nodeKey).First(&dev).Error; err != nil {
+		t.Fatalf("load device: %v", err)
+	}
+	if dev.Label != "renamed" {
+		t.Fatalf("device label=%q want=%q", dev.Label, "renamed")
 	}
 }

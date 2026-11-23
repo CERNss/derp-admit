@@ -163,23 +163,6 @@ func TestPolicyVersionUnchangedOnRollback(t *testing.T) {
 		t.Fatalf("read version v0: %v", err)
 	}
 
-	// Case 1: callback itself returns an error.
-	wantErr := errors.New("boom")
-	if err := svc.Mutate(context.Background(), EffectCache, http.StatusOK, func(tx *gorm.DB, ch *Change) error {
-		return wantErr
-	}); !errors.Is(err, wantErr) {
-		t.Fatalf("Mutate err=%v want %v", err, wantErr)
-	}
-
-	v1, err := policy.ReadVersion(context.Background(), gormDB)
-	if err != nil {
-		t.Fatalf("read version v1: %v", err)
-	}
-	if v1 != v0 {
-		t.Fatalf("version changed after callback error: got=%d want=%d", v1, v0)
-	}
-
-	// Case 2: BumpVersion runs inside tx, then the admin audit insert fails and rolls back.
 	forcedErr := errors.New("audit insert failed")
 	if err := gormDB.Callback().Create().Before("gorm:create").Register("test_fail_audit_version", func(tx *gorm.DB) {
 		if tx.Statement != nil && tx.Statement.Table == "admin_audit_logs" {
@@ -192,6 +175,25 @@ func TestPolicyVersionUnchangedOnRollback(t *testing.T) {
 		_ = gormDB.Callback().Create().Remove("test_fail_audit_version")
 	}()
 
+	// Case 1: Mutate with a non-EffectNone effect executes BumpVersion inside the
+	// transaction, then fails on the admin audit insert and rolls back.
+	if err := svc.Mutate(testAdminCtx("test.effect", "user", user.ID.String()), EffectCache, http.StatusOK, func(tx *gorm.DB, ch *Change) error {
+		ch.Changed = true
+		return nil
+	}); !errors.Is(err, forcedErr) {
+		t.Fatalf("Mutate err=%v want %v", err, forcedErr)
+	}
+
+	v1, err := policy.ReadVersion(context.Background(), gormDB)
+	if err != nil {
+		t.Fatalf("read version v1: %v", err)
+	}
+	if v1 != v0 {
+		t.Fatalf("version changed after post-bump audit rollback: got=%d want=%d", v1, v0)
+	}
+
+	// Case 2: real admin mutation (SetUserDisabled, EffectCache) bumps version inside
+	// tx, then fails on the admin audit insert and rolls back both the update and version.
 	if err := svc.SetUserDisabled(testAdminCtx("user.disable", "user", user.ID.String()), user.ID, true); !errors.Is(err, forcedErr) {
 		t.Fatalf("SetUserDisabled err=%v want %v", err, forcedErr)
 	}
@@ -201,7 +203,14 @@ func TestPolicyVersionUnchangedOnRollback(t *testing.T) {
 		t.Fatalf("read version v2: %v", err)
 	}
 	if v2 != v0 {
-		t.Fatalf("version changed after audit rollback: got=%d want=%d", v2, v0)
+		t.Fatalf("version changed after SetUserDisabled rollback: got=%d want=%d", v2, v0)
+	}
+	var reloaded model.User
+	if err := gormDB.First(&reloaded, "id = ?", user.ID).Error; err != nil {
+		t.Fatalf("reload user: %v", err)
+	}
+	if reloaded.DisabledAt != nil {
+		t.Fatalf("expected user.DisabledAt to remain nil after rollback")
 	}
 }
 
@@ -274,5 +283,32 @@ func TestMutateConcurrentWithVerifySQLite(t *testing.T) {
 
 	for err := range errCh {
 		t.Errorf("concurrent mutate/verify error: %v", err)
+	}
+
+	// After all mutations complete, no cached decision may contradict final DB state.
+	var finalUser model.User
+	if err := gormDB.First(&finalUser, "id = ?", user.ID).Error; err != nil {
+		t.Fatalf("load final user: %v", err)
+	}
+	var finalDevice model.Device
+	if err := gormDB.First(&finalDevice, "id = ?", device.ID).Error; err != nil {
+		t.Fatalf("load final device: %v", err)
+	}
+
+	wantAllow := true
+	wantReason := ""
+	switch {
+	case finalDevice.RevokedAt != nil:
+		wantAllow = false
+		wantReason = DenyReasonRevoked
+	case finalUser.DisabledAt != nil:
+		wantAllow = false
+		wantReason = DenyReasonUserDisabled
+	}
+
+	allow, reason := svc.Verify(context.Background(), "default", body)
+	if allow != wantAllow || reason != wantReason {
+		t.Fatalf("post-race verify=(%v, %q) contradicts final DB state (revoked=%v disabled=%v) want=(%v, %q)",
+			allow, reason, finalDevice.RevokedAt != nil, finalUser.DisabledAt != nil, wantAllow, wantReason)
 	}
 }

@@ -13,6 +13,7 @@
 # machines derp-e2e-a, derp-e2e-b, derp-e2e-c (kernel TUN, real tailscaled).
 # See e2e/README.md.
 set -euo pipefail
+trap 'echo "run.sh: command failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 PROJECT=derp-admit-e2e
@@ -301,8 +302,8 @@ for i in 0 1 2; do
   IP6S[i]=$(mip6 "${MACHINES[i]}")
   info "${MACHINES[i]}: eth0 ${IP4S[i]} ${IP6S[i]:-(no global IPv6)}"
 done
-ip4of() { local i; for i in 0 1 2; do [ "${MACHINES[i]}" = "$1" ] && echo "${IP4S[i]}"; done; }
-ip6of() { local i; for i in 0 1 2; do [ "${MACHINES[i]}" = "$1" ] && echo "${IP6S[i]}"; done; }
+ip4of() { local i; for i in 0 1 2; do if [ "${MACHINES[i]}" = "$1" ]; then echo "${IP4S[i]}"; fi; done; }
+ip6of() { local i; for i in 0 1 2; do if [ "${MACHINES[i]}" = "$1" ]; then echo "${IP6S[i]}"; fi; done; }
 
 CA_PEM=$(dc exec -T tools cat /pki/ca.crt)
 for n in "${MACHINES[@]}"; do

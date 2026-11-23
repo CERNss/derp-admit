@@ -113,7 +113,7 @@ have=$(dpkg-query -W -f="\${Version}" tailscale 2>/dev/null || true)
 if [ "$have" != "$ver" ]; then
   retry apt-get -q -o Acquire::Retries=5 update
   retry apt-get -q -o Acquire::Retries=5 install -y --no-install-recommends \
-    curl ca-certificates nftables iputils-ping iproute2 gnupg
+    curl ca-certificates jq nftables iputils-ping iproute2 gnupg
   retry curl -fsSL --retry 5 -o /usr/share/keyrings/tailscale-archive-keyring.gpg \
     https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg
   echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" \

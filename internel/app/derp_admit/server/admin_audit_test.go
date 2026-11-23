@@ -60,7 +60,7 @@ func TestAdminAuditRecordsForbidden(t *testing.T) {
 	}
 
 	var rows []model.AdminAuditLog
-	if err := gormDB.Order("id asc").Find(&rows).Error; err != nil {
+	if err := gormDB.Where("actor_name <> ?", actor.System.Name).Order("id asc").Find(&rows).Error; err != nil {
 		t.Fatalf("query admin_audit_logs: %v", err)
 	}
 	if len(rows) != 1 {
@@ -99,7 +99,7 @@ func TestAdminAuditSkipsUnauthenticated(t *testing.T) {
 	}
 
 	var count int64
-	if err := gormDB.Model(&model.AdminAuditLog{}).Count(&count).Error; err != nil {
+	if err := gormDB.Model(&model.AdminAuditLog{}).Where("actor_name <> ?", actor.System.Name).Count(&count).Error; err != nil {
 		t.Fatalf("count admin_audit_logs: %v", err)
 	}
 	if count != 0 {
@@ -118,7 +118,7 @@ func TestAdminAuditSkipsReads(t *testing.T) {
 	}
 
 	var count int64
-	if err := gormDB.Model(&model.AdminAuditLog{}).Count(&count).Error; err != nil {
+	if err := gormDB.Model(&model.AdminAuditLog{}).Where("actor_name <> ?", actor.System.Name).Count(&count).Error; err != nil {
 		t.Fatalf("count admin_audit_logs: %v", err)
 	}
 	if count != 0 {
@@ -134,7 +134,7 @@ func TestAdminAuditSuccessWritesExactlyOneRow(t *testing.T) {
 	assertOneNewSuccess := func(t *testing.T, wantAction, wantTargetType, wantTargetID string, wantStatus int) {
 		t.Helper()
 		var rows []model.AdminAuditLog
-		if err := gormDB.Order("id asc").Find(&rows).Error; err != nil {
+		if err := gormDB.Where("actor_name <> ?", actor.System.Name).Order("id asc").Find(&rows).Error; err != nil {
 			t.Fatalf("query admin_audit_logs: %v", err)
 		}
 		seenCount++
@@ -257,7 +257,7 @@ func TestAdminAuditRecordsFailedMutations(t *testing.T) {
 			}
 
 			var rows []model.AdminAuditLog
-			if err := gormDB.Order("id asc").Find(&rows).Error; err != nil {
+			if err := gormDB.Where("actor_name <> ?", actor.System.Name).Order("id asc").Find(&rows).Error; err != nil {
 				t.Fatalf("query admin_audit_logs: %v", err)
 			}
 			if len(rows) != i+1 {
@@ -277,7 +277,7 @@ func TestAdminAuditRecordsFailedMutations(t *testing.T) {
 	}
 
 	var successCount int64
-	if err := gormDB.Model(&model.AdminAuditLog{}).Where("outcome = ?", service.AuditOutcomeSuccess).Count(&successCount).Error; err != nil {
+	if err := gormDB.Model(&model.AdminAuditLog{}).Where("actor_name <> ? AND outcome = ?", actor.System.Name, service.AuditOutcomeSuccess).Count(&successCount).Error; err != nil {
 		t.Fatalf("count success rows: %v", err)
 	}
 	if successCount != 0 {
@@ -395,6 +395,13 @@ func TestStaleNotClearedByOlderReload(t *testing.T) {
 		logger,
 		service.WithAdminAPIKey(testAdminKey),
 	)
+	if err := gormDB.Create(&model.AdminKey{
+		Name:    "test-admin",
+		Tier:    model.AdminTierAdmin,
+		KeyHash: hashToken(testAdminKey, "test-pepper"),
+	}).Error; err != nil {
+		t.Fatalf("seed admin key: %v", err)
+	}
 	router := server.NewRouter(svc, cfg, logger)
 
 	checkReadyz := func() int {
@@ -513,6 +520,13 @@ func TestMutateReloadFailureFailsClosed(t *testing.T) {
 		logger,
 		service.WithAdminAPIKey(testAdminKey),
 	)
+	if err := gormDB.Create(&model.AdminKey{
+		Name:    "test-admin",
+		Tier:    model.AdminTierAdmin,
+		KeyHash: hashToken(testAdminKey, "test-pepper"),
+	}).Error; err != nil {
+		t.Fatalf("seed admin key: %v", err)
+	}
 	router := server.NewRouter(svc, cfg, logger)
 
 	// Provision a user + device and warm the verify cache with an allow.

@@ -19,7 +19,7 @@ Configuration is loaded in this order (later overrides earlier):
 
 - `ADDR` (default `:8080`)
 - `ADMIN_API_KEY` (enables the `/admin` API when set; must be ≥ 16 chars)
-- `ADMIN_RATE_LIMIT_RPS` (default `10`, throttles the `/admin` API, including key guessing)
+- `ADMIN_RATE_LIMIT_RPS` (default `10`, applied per client IP before authentication on `/admin`, including key guessing; client IP is the TCP peer address, so callers behind one reverse proxy share one bucket)
 - `ADMIN_RATE_LIMIT_BURST` (default `20`)
 - `LOG_LEVEL` (default `info`)
 - `ENABLE_CASBIN` (default `true`)
@@ -47,6 +47,11 @@ go run ./cmd/derp_admit
 Set `ADMIN_API_KEY` to enable the authenticated lifecycle API. All routes are
 under `/admin` and require `Authorization: Bearer <ADMIN_API_KEY>`. When the key
 is unset the admin routes are not mounted (provision via SQL instead).
+
+Requests to `/admin` are rate limited per client IP (`ADMIN_RATE_LIMIT_RPS`,
+`ADMIN_RATE_LIMIT_BURST`) before authentication. Because the client IP is the
+TCP peer address (forwarded headers are not trusted), all callers behind one
+reverse proxy share one bucket.
 
 | Method & path | Purpose |
 | --- | --- |
@@ -88,6 +93,9 @@ curl -s -XPOST "$BASE/register" -H 'content-type: application/json' \
 `nodeKey` must be a tailscale node public key in canonical text form
 (`nodekey:<64-hex>`); it is normalized to the same representation derper sends
 at verify time, so the two always match. A malformed key returns `400`.
+
+`/register` refuses a revoked device (`403`) without modifying it; re-enabling a
+revoked device goes through `POST /admin/devices/:id/enable`.
 
 ### Verify Flow
 

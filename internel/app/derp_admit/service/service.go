@@ -134,19 +134,11 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (int, error) {
 			if existing.UserID != token.UserID {
 				return errRegisterConflict
 			}
-			updates := map[string]any{}
 			if existing.RevokedAt != nil {
-				// Reactivating a revoked device re-counts against the limit.
-				if err := checkDeviceLimit(tx, token); err != nil {
-					return err
-				}
-				updates["revoked_at"] = nil
+				return errRegisterForbidden
 			}
 			if in.Label != "" {
-				updates["label"] = in.Label
-			}
-			if len(updates) > 0 {
-				if err := tx.Model(&model.Device{}).Where("id = ?", existing.ID).Updates(updates).Error; err != nil {
+				if err := tx.Model(&model.Device{}).Where("id = ?", existing.ID).Update("label", in.Label).Error; err != nil {
 					return fmt.Errorf("update existing device: %w", err)
 				}
 			}

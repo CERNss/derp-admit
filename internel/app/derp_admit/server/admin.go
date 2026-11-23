@@ -13,13 +13,13 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
-	"golang.org/x/time/rate"
 )
 
 // registerAdminRoutes mounts the authenticated /admin lifecycle API. It is only
-// called when an admin API key is configured. The rate limiter runs before the
-// key check so the static bearer key cannot be brute-forced at line rate.
-func registerAdminRoutes(router *gin.Engine, svc *service.Service, apiKey string, limiter *rate.Limiter, logger *zap.Logger) {
+// called when an admin API key is configured. The per-IP rate limiter runs
+// before the key check so the static bearer key cannot be brute-forced at line
+// rate.
+func registerAdminRoutes(router *gin.Engine, svc *service.Service, apiKey string, limiter *ipRateLimiter, logger *zap.Logger) {
 	admin := router.Group("/admin", adminRateLimit(limiter, logger), adminAuth(apiKey))
 
 	admin.POST("/users", func(c *gin.Context) {
@@ -179,10 +179,12 @@ func setDeviceRevoked(c *gin.Context, svc *service.Service, logger *zap.Logger, 
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-func adminRateLimit(limiter *rate.Limiter, logger *zap.Logger) gin.HandlerFunc {
+func adminRateLimit(limiter *ipRateLimiter, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if !limiter.Allow() {
-			logWithTrace(logger, c.Request.Context()).Warn("admin request rate limited")
+		if !limiter.Allow(c.ClientIP()) {
+			logWithTrace(logger, c.Request.Context()).Warn("admin request rate limited",
+				zap.String("client_ip", c.ClientIP()),
+			)
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"ok": false, "error": "rate limited"})
 			return
 		}

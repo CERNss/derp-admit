@@ -301,6 +301,174 @@ func (f *flakyPolicyEngine) Reload(ctx context.Context) error {
 	return f.inner.Reload(ctx)
 }
 
+func (f *flakyPolicyEngine) Version() int64 {
+	return f.inner.Version()
+}
+
+type controlledPolicyEngine struct {
+	db        *gorm.DB
+	active    atomic.Pointer[policy.Engine]
+	mode      atomic.Int32 // 0=normal reload, 1=B reads then pauses, 2=A fails
+	bReadDone chan struct{}
+	releaseB  chan struct{}
+}
+
+func (c *controlledPolicyEngine) Enforce(req policy.Request) (bool, error) {
+	return c.active.Load().Enforce(req)
+}
+
+func (c *controlledPolicyEngine) Version() int64 {
+	return c.active.Load().Version()
+}
+
+func (c *controlledPolicyEngine) Reload(ctx context.Context) error {
+	switch c.mode.Load() {
+	case 1:
+		// Mutation B's reload reads the DB now (capturing vB), signals bReadDone,
+		// and pauses before publishing until releaseB is closed.
+		snapB, err := policy.NewEngine(c.db, true)
+		if err != nil {
+			return err
+		}
+		close(c.bReadDone)
+		<-c.releaseB
+		c.active.Store(snapB)
+		return nil
+	case 2:
+		return errors.New("forced A reload failure")
+	default:
+		snap, err := policy.NewEngine(c.db, true)
+		if err != nil {
+			return err
+		}
+		c.active.Store(snap)
+		return nil
+	}
+}
+
+func TestStaleNotClearedByOlderReload(t *testing.T) {
+	dbURL := "sqlite://" + filepath.Join(t.TempDir(), "stale-order.db")
+	gormDB, err := db.OpenDatabase(dbURL)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := db.ApplyMigrations(context.Background(), gormDB, dbURL); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	if err := gormDB.Transaction(func(tx *gorm.DB) error {
+		_, err := policy.SeedBuiltins(tx)
+		return err
+	}); err != nil {
+		t.Fatalf("seed builtins: %v", err)
+	}
+
+	initialEngine, err := policy.NewEngine(gormDB, true)
+	if err != nil {
+		t.Fatalf("new initial policy engine: %v", err)
+	}
+	ctrl := &controlledPolicyEngine{
+		db:        gormDB,
+		bReadDone: make(chan struct{}),
+		releaseB:  make(chan struct{}),
+	}
+	ctrl.active.Store(initialEngine)
+
+	cfg := config.Config{
+		AdminAPIKey:          testAdminKey,
+		DBTimeout:            2 * time.Second,
+		PolicySyncInterval:   2 * time.Second,
+		VerifyCacheTTL:       time.Minute,
+		VerifyRateLimitRPS:   1000,
+		VerifyRateBurst:      1000,
+		RegisterRateLimitRPS: 1000,
+		RegisterRateBurst:    1000,
+		AdminRateLimitRPS:    1000,
+		AdminRateBurst:       1000,
+	}
+	logger := zap.NewNop()
+	svc := service.New(
+		gormDB,
+		ctrl,
+		"test-pepper",
+		cfg.DBTimeout,
+		service.NewVerifyCache(cfg.VerifyCacheTTL),
+		logger,
+		service.WithAdminAPIKey(testAdminKey),
+	)
+	router := server.NewRouter(svc, cfg, logger)
+
+	checkReadyz := func() int {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		return rec.Code
+	}
+
+	// Provision a user + device and confirm initial allow + 200 /readyz.
+	_, token := provisionUserAndToken(t, router, "order-base-user")
+	nodeKey := newNodeKey(t)
+	if status, _ := doJSONRequest(t, router, "/register", map[string]any{
+		"token":   token,
+		"nodeKey": nodeKey,
+	}); status != http.StatusOK {
+		t.Fatalf("register status=%d want=%d", status, http.StatusOK)
+	}
+	if _, payload := doRawRequest(t, router, "/verify", buildVerifyBody(t, nodeKey)); payload["Allow"] != true {
+		t.Fatalf("initial verify expected allow, got deny reason=%q", denyReason(payload))
+	}
+	if code := checkReadyz(); code != http.StatusOK {
+		t.Fatalf("initial /readyz=%d want=%d", code, http.StatusOK)
+	}
+
+	// Step 1: Start Mutation B; its reload reads DB at vB and pauses before publishing.
+	ctrl.mode.Store(1)
+	bDone := make(chan int, 1)
+	go func() {
+		status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/users", testAdminKey, map[string]any{
+			"username": "mutation-b",
+		})
+		bDone <- status
+	}()
+	<-ctrl.bReadDone
+
+	// Step 2 & 3: Mutation A commits vA (> vB) and A's reload fails.
+	ctrl.mode.Store(2)
+	if status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/users", testAdminKey, map[string]any{
+		"username": "mutation-a",
+	}); status != http.StatusCreated {
+		t.Fatalf("mutation A status=%d want=%d", status, http.StatusCreated)
+	}
+
+	// Step 4: Let Mutation B's older reload (covering only vB) finish and publish.
+	close(ctrl.releaseB)
+	if bStatus := <-bDone; bStatus != http.StatusCreated {
+		t.Fatalf("mutation B status=%d want=%d", bStatus, http.StatusCreated)
+	}
+
+	// Instance MUST remain stale because published version vB < required version vA.
+	if code := checkReadyz(); code != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz after older reload finished=%d want=%d (must stay stale)", code, http.StatusServiceUnavailable)
+	}
+	_, payload := doRawRequest(t, router, "/verify", buildVerifyBody(t, nodeKey))
+	if allow, _ := payload["Allow"].(bool); allow {
+		t.Fatalf("verify after older reload expected deny, got allow (fail-open!)")
+	}
+	if reason := denyReason(payload); reason != service.DenyReasonInternal {
+		t.Fatalf("verify reason=%q want=%q", reason, service.DenyReasonInternal)
+	}
+
+	// Step 5: A reload covering vA makes the instance current again.
+	ctrl.mode.Store(0)
+	if err := svc.ReloadPolicy(context.Background()); err != nil {
+		t.Fatalf("recovery ReloadPolicy: %v", err)
+	}
+	if code := checkReadyz(); code != http.StatusOK {
+		t.Fatalf("recovered /readyz=%d want=%d", code, http.StatusOK)
+	}
+	if _, payload := doRawRequest(t, router, "/verify", buildVerifyBody(t, nodeKey)); payload["Allow"] != true {
+		t.Fatalf("recovered verify expected allow, got deny reason=%q", denyReason(payload))
+	}
+}
+
 func TestMutateReloadFailureFailsClosed(t *testing.T) {
 	dbURL := "sqlite://" + filepath.Join(t.TempDir(), "stale.db")
 	gormDB, err := db.OpenDatabase(dbURL)

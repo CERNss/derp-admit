@@ -50,14 +50,20 @@ type Request struct {
 type PolicyEngine interface {
 	Enforce(Request) (bool, error)
 	Reload(ctx context.Context) error
+	Version() int64
 }
 
 var _ PolicyEngine = (*Engine)(nil)
 
+type snapshot struct {
+	enforcer *casbin.SyncedEnforcer
+	version  int64
+}
+
 type Engine struct {
 	db       *gorm.DB
 	reloadMu sync.Mutex
-	enforcer atomic.Pointer[casbin.SyncedEnforcer]
+	snap     atomic.Pointer[snapshot]
 }
 
 // NewEngine builds an always-enforcing Casbin policy engine backed by db and
@@ -71,14 +77,16 @@ func NewEngine(db *gorm.DB, _ bool) (*Engine, error) {
 	return e, nil
 }
 
-// Reload reads the role/relay registries and casbin_rule rows from the database
-// within a single read-only transaction snapshot, filters them down to managed
-// shapes, expands all_relays roles over registered relays in memory, and
-// atomically swaps in a brand-new read-only enforcer.
+// Reload reads policy_state.version, the role/relay registries, and casbin_rule
+// rows from the database within a single read-only transaction snapshot, filters
+// them down to managed shapes, expands all_relays roles over registered relays
+// in memory, and atomically swaps in a brand-new read-only snapshot carrying
+// both the enforcer and the version it covers.
 func (e *Engine) Reload(ctx context.Context) error {
 	e.reloadMu.Lock()
 	defer e.reloadMu.Unlock()
 
+	var state model.PolicyState
 	var roles []model.Role
 	var relays []model.Relay
 	var rules []model.CasbinRule
@@ -87,11 +95,14 @@ func (e *Engine) Reload(ctx context.Context) error {
 	if e.db.Dialector.Name() != "sqlite" {
 		// PostgreSQL defaults to READ COMMITTED, where separate SELECTs can see
 		// different commits; REPEATABLE READ pins one MVCC snapshot across all
-		// three queries. SQLite transactions are already serializable snapshots
-		// and mattn/go-sqlite3 rejects non-default sql.IsolationLevel values.
+		// queries. SQLite transactions are already serializable snapshots and
+		// mattn/go-sqlite3 rejects non-default sql.IsolationLevel values.
 		txOpts.Isolation = sql.LevelRepeatableRead
 	}
 	if err := e.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Select("version").First(&state, "id = ?", model.PolicyStateRowID).Error; err != nil {
+			return fmt.Errorf("load policy version: %w", err)
+		}
 		if err := tx.Find(&roles).Error; err != nil {
 			return fmt.Errorf("load roles: %w", err)
 		}
@@ -218,7 +229,19 @@ func (e *Engine) Reload(ctx context.Context) error {
 		}
 	}
 
-	e.enforcer.Store(enforcer)
+	next := &snapshot{
+		enforcer: enforcer,
+		version:  state.Version,
+	}
+	for {
+		cur := e.snap.Load()
+		if cur != nil && next.version < cur.version {
+			break
+		}
+		if e.snap.CompareAndSwap(cur, next) {
+			break
+		}
+	}
 	return nil
 }
 
@@ -226,15 +249,25 @@ func (e *Engine) Enforce(req Request) (bool, error) {
 	if req.UserID == uuid.Nil || !NamePattern.MatchString(req.Relay) {
 		return false, nil
 	}
-	enforcer := e.enforcer.Load()
-	if enforcer == nil {
+	s := e.snap.Load()
+	if s == nil || s.enforcer == nil {
 		return false, fmt.Errorf("policy engine not initialized")
 	}
-	allowed, err := enforcer.Enforce(UserSubject(req.UserID), relayObject(req.Relay), connectAct)
+	allowed, err := s.enforcer.Enforce(UserSubject(req.UserID), relayObject(req.Relay), connectAct)
 	if err != nil {
 		return false, fmt.Errorf("enforce policy: %w", err)
 	}
 	return allowed, nil
+}
+
+// Version returns the policy_state.version covered by the currently published
+// snapshot (0 before the first reload).
+func (e *Engine) Version() int64 {
+	s := e.snap.Load()
+	if s == nil {
+		return 0
+	}
+	return s.version
 }
 
 func UserSubject(userID uuid.UUID) string {

@@ -47,7 +47,7 @@ func (s *Service) decide(ctx context.Context, relay string, body []byte) verifyD
 		return verifyDecision{allow: false, reason: DenyReasonInvalidReq}
 	}
 
-	if s.sync.Stale() {
+	if s.SyncStale() {
 		logger.Error("policy sync stale, denying verify request",
 			zap.String("node_key", nodeKey),
 		)

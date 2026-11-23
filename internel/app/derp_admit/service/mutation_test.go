@@ -312,3 +312,67 @@ func TestMutateConcurrentWithVerifySQLite(t *testing.T) {
 			allow, reason, finalDevice.RevokedAt != nil, finalUser.DisabledAt != nil, wantAllow, wantReason)
 	}
 }
+
+func TestMutateReloadCoversCommittedVersion(t *testing.T) {
+	svc, gormDB := newMutationTestService(t, time.Minute)
+
+	if _, err := svc.CreateUser(testAdminCtx("user.create", "user", ""), CreateUserInput{Username: "ver-cover-user"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	stored, err := policy.ReadVersion(context.Background(), gormDB)
+	if err != nil {
+		t.Fatalf("ReadVersion: %v", err)
+	}
+	if stored <= 0 {
+		t.Fatalf("stored version=%d want > 0", stored)
+	}
+	if got := svc.policy.Version(); got < stored {
+		t.Fatalf("engine.Version()=%d want >= %d", got, stored)
+	}
+	if svc.SyncStale() {
+		t.Fatalf("SyncStale()=true want=false after successful reload")
+	}
+}
+
+func TestCacheEffectMutationAlsoReloads(t *testing.T) {
+	svc, gormDB := newMutationTestService(t, time.Minute)
+
+	user, err := svc.CreateUser(context.Background(), CreateUserInput{Username: "cache-reload-user"})
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	dev := model.Device{
+		ID:      uuid.New(),
+		UserID:  user.ID,
+		NodeKey: key.NewNode().Public().String(),
+	}
+	if err := gormDB.Create(&dev).Error; err != nil {
+		t.Fatalf("create device: %v", err)
+	}
+
+	vBefore, err := policy.ReadVersion(context.Background(), gormDB)
+	if err != nil {
+		t.Fatalf("ReadVersion before: %v", err)
+	}
+
+	// SetDeviceRevoked uses EffectCache; Mutate must still reload the engine so
+	// engine.Version() advances to match the stored version.
+	if err := svc.SetDeviceRevoked(testAdminCtx("device.revoke", "device", dev.ID.String()), dev.ID, true); err != nil {
+		t.Fatalf("SetDeviceRevoked: %v", err)
+	}
+
+	vAfter, err := policy.ReadVersion(context.Background(), gormDB)
+	if err != nil {
+		t.Fatalf("ReadVersion after: %v", err)
+	}
+	if vAfter != vBefore+1 {
+		t.Fatalf("stored version=%d want=%d", vAfter, vBefore+1)
+	}
+	if got := svc.policy.Version(); got != vAfter {
+		t.Fatalf("engine.Version()=%d want=%d (EffectCache mutation must reload)", got, vAfter)
+	}
+	if svc.SyncStale() {
+		t.Fatalf("SyncStale()=true want=false")
+	}
+}

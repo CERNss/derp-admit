@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -483,6 +484,134 @@ func TestReloadSeesOneConsistentSnapshot(t *testing.T) {
 	}
 	if got2 := eval(); got2 != newState {
 		t.Fatalf("post-commit Reload got=%v want new=%v", got2, newState)
+	}
+}
+
+func TestEngineVersionPublishedWithSnapshot(t *testing.T) {
+	dbConn := openPolicyTestDB(t)
+	seedBuiltins(t, dbConn)
+
+	if err := dbConn.Create(&model.Relay{Name: "eu-1"}).Error; err != nil {
+		t.Fatalf("create relay eu-1: %v", err)
+	}
+	if err := dbConn.Create(&model.Role{Name: "ops"}).Error; err != nil {
+		t.Fatalf("create role ops: %v", err)
+	}
+	u := uuid.New()
+	if err := dbConn.Transaction(func(tx *gorm.DB) error {
+		if err := policy.SetRoleGrants(tx, "ops", []string{"eu-1"}); err != nil {
+			return err
+		}
+		return policy.SetUserRoles(tx, u, []string{"ops"})
+	}); err != nil {
+		t.Fatalf("setup initial ops role: %v", err)
+	}
+
+	engine, err := policy.NewEngine(dbConn, true)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	if engine.Version() != 0 {
+		t.Fatalf("initial Version()=%d want=0", engine.Version())
+	}
+
+	// Alternate atomically between:
+	//   odd version  -> ops granted ["default"]
+	//   even version -> ops granted ["eu-1"]
+	// Concurrent readers bracket Enforce with Version() before and after; whenever
+	// vBefore == vAfter, the observed rules must match that version's parity.
+	const rounds = 40
+	stop := make(chan struct{})
+	var oddMatched, evenMatched atomic.Int64
+	errCh := make(chan error, 8)
+	var wg sync.WaitGroup
+
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				vBefore := engine.Version()
+				allowDef, err1 := engine.Enforce(policy.Request{UserID: u, Relay: "default"})
+				allowEU, err2 := engine.Enforce(policy.Request{UserID: u, Relay: "eu-1"})
+				vAfter := engine.Version()
+				if err1 != nil || err2 != nil {
+					select {
+					case errCh <- errors.Join(err1, err2):
+					default:
+					}
+					return
+				}
+				if vBefore != vAfter {
+					continue
+				}
+				if vBefore%2 == 1 {
+					if !allowDef || allowEU {
+						select {
+						case errCh <- errors.New("version/snapshot mismatch on odd version"):
+						default:
+						}
+						return
+					}
+					oddMatched.Add(1)
+				} else {
+					if allowDef || !allowEU {
+						select {
+						case errCh <- errors.New("version/snapshot mismatch on even version"):
+						default:
+						}
+						return
+					}
+					evenMatched.Add(1)
+				}
+			}
+		}()
+	}
+
+	for i := 1; i <= rounds; i++ {
+		target := []string{"eu-1"}
+		if i%2 == 1 {
+			target = []string{"default"}
+		}
+		var bumped int64
+		if err := dbConn.Transaction(func(tx *gorm.DB) error {
+			if err := policy.SetRoleGrants(tx, "ops", target); err != nil {
+				return err
+			}
+			var err error
+			bumped, err = policy.BumpVersion(tx)
+			return err
+		}); err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("round %d commit: %v", i, err)
+		}
+		if err := engine.Reload(context.Background()); err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("round %d reload: %v", i, err)
+		}
+		if got := engine.Version(); got != bumped {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("round %d Version()=%d want=%d", i, got, bumped)
+		}
+	}
+
+	close(stop)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent reader observed error: %v", err)
+	}
+	if oddMatched.Load() == 0 || evenMatched.Load() == 0 {
+		t.Fatalf("expected concurrent reads on both parities: odd=%d even=%d", oddMatched.Load(), evenMatched.Load())
 	}
 }
 

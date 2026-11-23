@@ -84,7 +84,10 @@ two `/etc/hosts` entries, replaces the CA and the firewall table, and restarts
 `tailscaled`. Teardown undoes those changes and stops the machines.
 
 Each machine gets an nftables table `inet derp_e2e` that drops all traffic,
-IPv4 and IPv6, to and from the other two machines' addresses. The only path
+IPv4 and IPv6, to and from the other two machines' addresses, plus all
+non-link-local IPv6 on `eth0` (a machine's global IPv6 address can appear
+only after the run has read the addresses; the services are reached over
+IPv4). The only path
 between clients is therefore through derper (precondition P2 checks it with
 plain `ping`). STUN (udp/39478) to our derper is allowed on purpose: it is the
 only STUN server in the DERP map and lets each client choose region 900 as its

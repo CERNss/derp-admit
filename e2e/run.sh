@@ -165,10 +165,14 @@ nft delete table inet derp_e2e 2>/dev/null || true
   echo "  chain pre { type filter hook prerouting priority raw; policy accept;"
   [ -n "$v4" ] && echo "    ip saddr { $v4 } drop"
   [ -n "$v6" ] && echo "    ip6 saddr { $v6 } drop"
+  # IPv6 global addresses can appear after the run started (SLAAC): drop all
+  # non-link-local IPv6 on eth0. The services are reached over IPv4.
+  echo "    iifname \"eth0\" ip6 saddr != fe80::/10 drop"
   echo "  }"
   echo "  chain out { type filter hook output priority raw; policy accept;"
   [ -n "$v4" ] && echo "    ip daddr { $v4 } drop"
   [ -n "$v6" ] && echo "    ip6 daddr { $v6 } drop"
+  echo "    oifname \"eth0\" ip6 daddr != fe80::/10 drop"
   echo "  }"
   echo "}"
 } | nft -f -
@@ -298,7 +302,15 @@ ensure_machine() {
 for n in "${MACHINES[@]}"; do ensure_machine "$n"; done
 
 mip4() { m "$1" ip -4 -o addr show dev eth0 | awk '{ sub("/.*", "", $4); print $4; exit }'; }
-mip6() { m "$1" ip -6 -o addr show dev eth0 scope global | awk '{ sub("/.*", "", $4); print $4 }' | paste -sd, -; }
+mip6() { # waits up to 10s for SLAAC after a machine start
+  local i a=""
+  for ((i = 0; i < 10; i++)); do
+    a=$(m "$1" ip -6 -o addr show dev eth0 scope global | awk '{ sub("/.*", "", $4); print $4 }' | paste -sd, -)
+    [ -n "$a" ] && break
+    sleep 1
+  done
+  echo "$a"
+}
 # Indexed like MACHINES (bash 3.2 on macOS has no associative arrays).
 IP4S=() IP6S=()
 for i in 0 1 2; do

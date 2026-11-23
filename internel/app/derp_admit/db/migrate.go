@@ -24,6 +24,7 @@ func ApplyMigrations(ctx context.Context, gormDB *gorm.DB, databaseURL string) e
 			&model.EnrollToken{},
 			&model.Device{},
 			&model.AuditLog{},
+			&model.CasbinRule{},
 			&model.Role{},
 			&model.Relay{},
 			&model.PolicyState{},

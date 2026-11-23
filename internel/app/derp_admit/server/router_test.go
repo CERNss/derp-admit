@@ -279,6 +279,7 @@ func TestVerifyAllowUpdatesLastSeenAndAudit(t *testing.T) {
 	nodeKey := newNodeKey(t)
 
 	user := createUser(t, testDB, "u-allow")
+	bindStandardRole(t, testDB, user.ID)
 	createEnrollToken(t, testDB, user.ID, pepper, "token-allow", nil, nil, 0)
 
 	status, _ := doJSONRequest(t, router, "/register", map[string]any{

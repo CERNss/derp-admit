@@ -33,12 +33,18 @@ func newMutationTestService(t *testing.T, cacheTTL time.Duration) (*Service, *go
 	if err := db.ApplyMigrations(context.Background(), gormDB, dbURL); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
+	if err := gormDB.Transaction(func(tx *gorm.DB) error {
+		_, err := policy.SeedBuiltins(tx)
+		return err
+	}); err != nil {
+		t.Fatalf("seed builtins: %v", err)
+	}
 	engine, err := policy.NewEngine(gormDB, true)
 	if err != nil {
 		t.Fatalf("new policy engine: %v", err)
 	}
-	if err := engine.Bootstrap(context.Background()); err != nil {
-		t.Fatalf("bootstrap policy: %v", err)
+	if err := engine.Reload(context.Background()); err != nil {
+		t.Fatalf("reload policy: %v", err)
 	}
 	svc := New(gormDB, engine, "test-pepper", 5*time.Second, NewVerifyCache(cacheTTL), zap.NewNop())
 	return svc, gormDB

@@ -47,8 +47,8 @@ func (a *App) Close() {
 }
 
 // Build initializes the application in the standard startup order:
-// migrate -> startup.WithLock(seed -> upgrade -> bootstrap key sync) ->
-// engine.Reload -> service -> StartSync -> router.
+// startup.WithLock(migrate -> policy.SeedBuiltins -> policy.RunUpgrade ->
+// svc.SyncBootstrapKey) -> engine.Reload -> svc.StartSync -> router.
 func Build(ctx context.Context, gormDB *gorm.DB, cfg config.Config, logger *zap.Logger, opts ...Option) (*App, error) {
 	bo := buildOptions{metrics: metrics.Nop}
 	for _, opt := range opts {
@@ -66,16 +66,21 @@ func Build(ctx context.Context, gormDB *gorm.DB, cfg config.Config, logger *zap.
 			return fmt.Errorf("apply migrations: %w", err)
 		}
 
+		if err := gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			_, err := policy.SeedBuiltins(tx)
+			return err
+		}); err != nil {
+			return fmt.Errorf("seed policy built-ins: %w", err)
+		}
+
+		if err := policy.RunUpgrade(ctx, gormDB, !cfg.EnableCasbin, logger); err != nil {
+			return fmt.Errorf("run policy upgrade: %w", err)
+		}
+
 		var err error
 		policyEngine, err = policy.NewEngine(gormDB, cfg.EnableCasbin)
 		if err != nil {
 			return fmt.Errorf("init policy: %w", err)
-		}
-		if err := policyEngine.Bootstrap(ctx); err != nil {
-			return fmt.Errorf("bootstrap policy: %w", err)
-		}
-		if err := policy.RunUpgrade(ctx, gormDB, !cfg.EnableCasbin, logger); err != nil {
-			return fmt.Errorf("run policy upgrade: %w", err)
 		}
 
 		svc = service.New(

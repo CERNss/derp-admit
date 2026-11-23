@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"derp-admit/internel/app/derp_admit/model"
+	"derp-admit/internel/app/derp_admit/policy"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -17,6 +18,9 @@ import (
 type CreateUserInput struct {
 	Username string
 	Email    *string
+	// Roles is nil when omitted (defaults to ["standard"]); an explicit empty
+	// slice binds no roles (decision A6).
+	Roles *[]string
 }
 
 func (s *Service) CreateUser(ctx context.Context, in CreateUserInput) (model.User, error) {
@@ -33,8 +37,13 @@ func (s *Service) CreateUser(ctx context.Context, in CreateUserInput) (model.Use
 		}
 	}
 
+	roles := []string{policy.BuiltinRole}
+	if in.Roles != nil {
+		roles = *in.Roles
+	}
+
 	var user model.User
-	err := s.Mutate(ctx, EffectNone, http.StatusCreated, func(tx *gorm.DB, ch *Change) error {
+	err := s.Mutate(ctx, EffectPolicy, http.StatusCreated, func(tx *gorm.DB, ch *Change) error {
 		// Uniqueness is enforced by the DB indexes on username/email, which is
 		// race-free where a check-then-insert would not be.
 		u := model.User{Username: in.Username, Email: in.Email}
@@ -44,10 +53,19 @@ func (s *Service) CreateUser(ctx context.Context, in CreateUserInput) (model.Use
 			}
 			return fmt.Errorf("create user: %w", err)
 		}
+		if err := policy.SetUserRoles(tx, u.ID, roles); err != nil {
+			if errors.Is(err, policy.ErrUnknownRole) {
+				return fmt.Errorf("%w: %v", ErrAdminInvalid, err)
+			}
+			return fmt.Errorf("bind user roles: %w", err)
+		}
 		user = u
 		ch.Changed = true
 		ch.TargetID = u.ID.String()
-		ch.Summary = map[string]any{"username": u.Username}
+		ch.Summary = map[string]any{
+			"username": u.Username,
+			"roles":    roles,
+		}
 		return nil
 	})
 	if err != nil {

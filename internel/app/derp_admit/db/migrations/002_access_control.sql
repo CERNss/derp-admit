@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS roles (
   name TEXT PRIMARY KEY,
   description TEXT NOT NULL DEFAULT '',
+  all_relays BOOLEAN NOT NULL DEFAULT false,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

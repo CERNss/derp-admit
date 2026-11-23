@@ -88,6 +88,7 @@ func (a *AuditLog) BeforeCreate(_ *gorm.DB) error {
 type Role struct {
 	Name        string    `gorm:"type:text;primaryKey;not null"`
 	Description string    `gorm:"type:text;not null;default:''"`
+	AllRelays   bool      `gorm:"not null;default:false"`
 	CreatedAt   time.Time `gorm:"not null"`
 }
 
@@ -170,4 +171,19 @@ func (a *AdminAuditLog) BeforeCreate(_ *gorm.DB) error {
 		a.TS = time.Now().UTC()
 	}
 	return nil
+}
+
+type CasbinRule struct {
+	ID    int64  `gorm:"primaryKey;autoIncrement"`
+	Ptype string `gorm:"column:ptype;size:100;not null;index:idx_casbin_rule_ptype"`
+	V0    string `gorm:"column:v0;size:100;index:idx_casbin_rule_v0"`
+	V1    string `gorm:"column:v1;size:100;index:idx_casbin_rule_v1"`
+	V2    string `gorm:"column:v2;size:100;index:idx_casbin_rule_v2"`
+	V3    string `gorm:"column:v3;size:100"`
+	V4    string `gorm:"column:v4;size:100"`
+	V5    string `gorm:"column:v5;size:100"`
+}
+
+func (CasbinRule) TableName() string {
+	return "casbin_rule"
 }

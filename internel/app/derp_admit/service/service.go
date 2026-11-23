@@ -41,7 +41,7 @@ func WithPolicySyncInterval(d time.Duration) Option {
 
 type Service struct {
 	db                 *gorm.DB
-	policy             *policy.Engine
+	policy             policy.PolicyEngine
 	tokenPepper        string
 	adminAPIKey        string
 	dbTimeout          time.Duration
@@ -52,7 +52,7 @@ type Service struct {
 	sync               *syncer
 }
 
-func New(db *gorm.DB, policyEngine *policy.Engine, tokenPepper string, dbTimeout time.Duration, cache *VerifyCache, logger *zap.Logger, opts ...Option) *Service {
+func New(db *gorm.DB, policyEngine policy.PolicyEngine, tokenPepper string, dbTimeout time.Duration, cache *VerifyCache, logger *zap.Logger, opts ...Option) *Service {
 	s := &Service{
 		db:                 db,
 		policy:             policyEngine,

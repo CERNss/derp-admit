@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"derp-admit/internel/app/derp_admit/db"
 	"derp-admit/internel/app/derp_admit/derp"
 	"derp-admit/internel/app/derp_admit/model"
+	"derp-admit/internel/app/derp_admit/policy"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -30,6 +32,8 @@ import (
 )
 
 const testAdminKey = "test-admin-key-0123456789"
+
+var testEngines sync.Map // *gorm.DB -> *policy.Engine
 
 func adminKeyOpt(c *config.Config) { c.AdminAPIKey = testAdminKey }
 
@@ -66,9 +70,27 @@ func newTestRouter(t *testing.T, opts ...func(*config.Config)) (http.Handler, *g
 	if err != nil {
 		t.Fatalf("build app: %v", err)
 	}
-	t.Cleanup(application.Close)
+	testEngines.Store(gormDB, application.Policy)
+	t.Cleanup(func() {
+		testEngines.Delete(gormDB)
+		application.Close()
+	})
 
 	return application.Router, gormDB
+}
+
+func bindStandardRole(t *testing.T, dbConn *gorm.DB, userID uuid.UUID) {
+	t.Helper()
+	if err := dbConn.Transaction(func(tx *gorm.DB) error {
+		return policy.SetUserRoles(tx, userID, []string{policy.BuiltinRole})
+	}); err != nil {
+		t.Fatalf("bind standard role: %v", err)
+	}
+	if v, ok := testEngines.Load(dbConn); ok {
+		if err := v.(*policy.Engine).Reload(context.Background()); err != nil {
+			t.Fatalf("reload policy engine: %v", err)
+		}
+	}
 }
 
 func insertAdminKey(t *testing.T, dbConn *gorm.DB, name string, tier actor.Tier) string {

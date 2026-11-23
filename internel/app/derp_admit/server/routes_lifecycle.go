@@ -24,8 +24,9 @@ func lifecycleRoutes() []adminRoute {
 			Handle: func(d adminDeps) gin.HandlerFunc {
 				return func(c *gin.Context) {
 					var req struct {
-						Username string  `json:"username"`
-						Email    *string `json:"email"`
+						Username string    `json:"username"`
+						Email    *string   `json:"email"`
+						Roles    *[]string `json:"roles"`
 					}
 					if !bindJSON(c, &req) {
 						return
@@ -33,6 +34,7 @@ func lifecycleRoutes() []adminRoute {
 					user, err := d.svc.CreateUser(c.Request.Context(), service.CreateUserInput{
 						Username: req.Username,
 						Email:    req.Email,
+						Roles:    req.Roles,
 					})
 					if err != nil {
 						writeAdminError(c, d.logger, err)

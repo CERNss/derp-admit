@@ -7,6 +7,7 @@ import (
 
 	"derp-admit/internel/app/derp_admit/derp"
 	"derp-admit/internel/app/derp_admit/model"
+	"derp-admit/internel/app/derp_admit/policy"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -37,7 +38,7 @@ func (s *Service) Verify(ctx context.Context, relay string, body []byte) (bool, 
 	return dec.allow, dec.reason
 }
 
-func (s *Service) decide(ctx context.Context, _ string, body []byte) verifyDecision {
+func (s *Service) decide(ctx context.Context, relay string, body []byte) verifyDecision {
 	logger := loggerWithTrace(s.logger, ctx)
 
 	_, nodeKey, err := derp.ParseRequest(body)
@@ -124,7 +125,11 @@ func (s *Service) decide(ctx context.Context, _ string, body []byte) verifyDecis
 		}
 	}
 
-	allowed, err := s.policy.EnforceConnect(nodeKey)
+	allowed, err := s.policy.Enforce(policy.Request{
+		UserID:  device.UserID,
+		NodeKey: nodeKey,
+		Relay:   relay,
+	})
 	if err != nil {
 		logger.Error("policy enforce failed",
 			zap.Error(err),

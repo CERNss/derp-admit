@@ -20,9 +20,20 @@ type columnSpec struct {
 }
 
 var expectedNewSchema = map[string][]columnSpec{
+	"casbin_rule": {
+		{name: "id", nullable: false},
+		{name: "ptype", nullable: false},
+		{name: "v0", nullable: true},
+		{name: "v1", nullable: true},
+		{name: "v2", nullable: true},
+		{name: "v3", nullable: true},
+		{name: "v4", nullable: true},
+		{name: "v5", nullable: true},
+	},
 	"roles": {
 		{name: "name", nullable: false},
 		{name: "description", nullable: false},
+		{name: "all_relays", nullable: false},
 		{name: "created_at", nullable: false},
 	},
 	"relays": {
@@ -62,6 +73,12 @@ var expectedNewSchema = map[string][]columnSpec{
 }
 
 var expectedIndexes = map[string][]string{
+	"casbin_rule": {
+		"idx_casbin_rule_ptype",
+		"idx_casbin_rule_v0",
+		"idx_casbin_rule_v1",
+		"idx_casbin_rule_v2",
+	},
 	"admin_keys": {
 		"idx_admin_keys_tier",
 		"idx_admin_keys_expires_at",
@@ -162,7 +179,7 @@ func TestApplyMigrationsPostgres(t *testing.T) {
 func assertSchemaSQLite(t *testing.T, conn *gorm.DB) {
 	t.Helper()
 
-	for _, table := range []string{"roles", "relays", "policy_state", "admin_keys", "admin_audit_logs"} {
+	for _, table := range []string{"casbin_rule", "roles", "relays", "policy_state", "admin_keys", "admin_audit_logs"} {
 		expectTableExists(t, conn, table)
 	}
 
@@ -296,6 +313,16 @@ func assertSchemaConstraints(t *testing.T, conn *gorm.DB) {
 	// Role and Relay inserts succeed with BeforeCreate defaults.
 	if err := tx.Create(&model.Role{Name: "ops", Description: "operators"}).Error; err != nil {
 		t.Fatalf("create role: %v", err)
+	}
+	var opsRole model.Role
+	if err := tx.First(&opsRole, "name = ?", "ops").Error; err != nil {
+		t.Fatalf("reload role ops: %v", err)
+	}
+	if opsRole.AllRelays {
+		t.Fatalf("expected roles.all_relays default false, got true")
+	}
+	if err := tx.Create(&model.Role{Name: "global", AllRelays: true}).Error; err != nil {
+		t.Fatalf("create all_relays role: %v", err)
 	}
 	if err := tx.Create(&model.Relay{Name: "eu-1", Description: "Europe 1"}).Error; err != nil {
 		t.Fatalf("create relay: %v", err)

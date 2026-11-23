@@ -149,13 +149,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (int, error) {
 		return http.StatusInternalServerError, txErr
 	}
 
-	policyErr := s.policy.EnsureDeviceForUser(in.NodeKey, enroll.UserID)
-	// The device row is committed either way, so any cached decision for this
-	// key is stale even when the policy write failed.
 	s.cache.Invalidate(in.NodeKey)
-	if policyErr != nil {
-		return http.StatusInternalServerError, fmt.Errorf("ensure policy bindings: %w", policyErr)
-	}
 
 	return http.StatusOK, nil
 }

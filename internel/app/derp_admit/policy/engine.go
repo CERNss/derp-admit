@@ -58,6 +58,7 @@ var _ PolicyEngine = (*Engine)(nil)
 type snapshot struct {
 	enforcer *casbin.SyncedEnforcer
 	version  int64
+	relays   map[string]struct{}
 }
 
 type Engine struct {
@@ -232,6 +233,7 @@ func (e *Engine) Reload(ctx context.Context) error {
 	next := &snapshot{
 		enforcer: enforcer,
 		version:  state.Version,
+		relays:   validRelays,
 	}
 	for {
 		cur := e.snap.Load()
@@ -268,6 +270,17 @@ func (e *Engine) Version() int64 {
 		return 0
 	}
 	return s.version
+}
+
+// HasRelay reports whether name is a registered relay in the currently
+// published policy snapshot.
+func (e *Engine) HasRelay(name string) bool {
+	s := e.snap.Load()
+	if s == nil {
+		return false
+	}
+	_, ok := s.relays[name]
+	return ok
 }
 
 func UserSubject(userID uuid.UUID) string {

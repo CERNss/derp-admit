@@ -1,11 +1,12 @@
 package server
 
 import (
-	"encoding/json"
+	"io"
 	"net/http"
 
 	"derp-admit/internel/app/derp_admit/derp"
 	"derp-admit/internel/app/derp_admit/metrics"
+	"derp-admit/internel/app/derp_admit/policy"
 	"derp-admit/internel/app/derp_admit/service"
 
 	"github.com/gin-gonic/gin"
@@ -23,17 +24,20 @@ func verifyHandler(svc *service.Service, verifyLimiter *rate.Limiter, logger *za
 			return
 		}
 
-		var raw json.RawMessage
-		if err := c.ShouldBindJSON(&raw); err != nil {
-			logWithTrace(logger, c.Request.Context()).Warn("invalid verify json payload",
-				zap.Error(err),
-			)
-			resp := derp.BuildResponse(false, service.DenyReasonInvalidReq)
-			c.JSON(http.StatusOK, resp)
-			return
+		relay := c.Param("relay")
+		if relay == "" {
+			relay = policy.BuiltinRelay
 		}
 
-		allow, denyReason := svc.Verify(c.Request.Context(), "default", raw)
+		body, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			logWithTrace(logger, c.Request.Context()).Warn("read verify request body",
+				zap.Error(err),
+			)
+			body = nil
+		}
+
+		allow, denyReason := svc.Verify(c.Request.Context(), relay, body)
 		resp := derp.BuildResponse(allow, denyReason)
 		c.JSON(http.StatusOK, resp)
 	}

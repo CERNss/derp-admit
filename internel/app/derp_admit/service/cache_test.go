@@ -8,8 +8,8 @@ import (
 
 func TestVerifyCacheDisabled(t *testing.T) {
 	c := NewVerifyCache(0)
-	c.Set("node", c.Epoch(), true, "", nil)
-	if _, ok := c.Get("node"); ok {
+	c.Set("default", "node", c.Epoch(), true, "", nil)
+	if _, ok := c.Get("default", "node"); ok {
 		t.Fatalf("disabled cache should never return a hit")
 	}
 }
@@ -17,8 +17,8 @@ func TestVerifyCacheDisabled(t *testing.T) {
 func TestVerifyCacheStoreAndExpire(t *testing.T) {
 	c := NewVerifyCache(50 * time.Millisecond)
 
-	c.Set("node", c.Epoch(), false, DenyReasonNotRegistered, nil)
-	entry, ok := c.Get("node")
+	c.Set("default", "node", c.Epoch(), false, DenyReasonNotRegistered, nil)
+	entry, ok := c.Get("default", "node")
 	if !ok {
 		t.Fatalf("expected cache hit")
 	}
@@ -27,7 +27,7 @@ func TestVerifyCacheStoreAndExpire(t *testing.T) {
 	}
 
 	time.Sleep(70 * time.Millisecond)
-	if _, ok := c.Get("node"); ok {
+	if _, ok := c.Get("default", "node"); ok {
 		t.Fatalf("expected entry to expire")
 	}
 }
@@ -37,7 +37,7 @@ func TestVerifyCacheBounded(t *testing.T) {
 	c.maxEntries = 100
 
 	for i := 0; i < 1000; i++ {
-		c.Set("node-"+strconv.Itoa(i), c.Epoch(), false, DenyReasonNotRegistered, nil)
+		c.Set("default", "node-"+strconv.Itoa(i), c.Epoch(), false, DenyReasonNotRegistered, nil)
 	}
 
 	c.mu.RLock()
@@ -57,13 +57,13 @@ func TestVerifyCacheInvalidateDropsStaleSet(t *testing.T) {
 
 	epoch := c.Epoch()
 	c.Invalidate("node")
-	c.Set("node", epoch, true, "", nil)
-	if _, ok := c.Get("node"); ok {
+	c.Set("default", "node", epoch, true, "", nil)
+	if _, ok := c.Get("default", "node"); ok {
 		t.Fatalf("set with a pre-invalidation epoch must be dropped")
 	}
 
-	c.Set("node", c.Epoch(), true, "", nil)
-	if _, ok := c.Get("node"); !ok {
+	c.Set("default", "node", c.Epoch(), true, "", nil)
+	if _, ok := c.Get("default", "node"); !ok {
 		t.Fatalf("set with a current epoch should be stored")
 	}
 }

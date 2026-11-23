@@ -117,7 +117,9 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger, opts
 		c.JSON(status, gin.H{"ok": false})
 	})
 
-	router.POST("/verify", verifyHandler(svc, verifyLimiter, logger, rec))
+	vh := verifyHandler(svc, verifyLimiter, logger, rec)
+	router.POST("/verify", vh)
+	router.POST("/verify/:relay", vh)
 
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{

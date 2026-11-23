@@ -50,7 +50,11 @@ func (a *App) Close() {
 // startup.WithLock(migrate -> policy.SeedBuiltins -> policy.RunUpgrade ->
 // svc.SyncBootstrapKey) -> engine.Reload -> svc.StartSync -> router.
 func Build(ctx context.Context, gormDB *gorm.DB, cfg config.Config, logger *zap.Logger, opts ...Option) (*App, error) {
-	bo := buildOptions{metrics: metrics.Nop}
+	var defaultMetrics metrics.Recorder = metrics.Nop
+	if cfg.MetricsEnabled {
+		defaultMetrics = metrics.NewPrometheus()
+	}
+	bo := buildOptions{metrics: defaultMetrics}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&bo)

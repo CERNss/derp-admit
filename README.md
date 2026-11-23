@@ -32,7 +32,7 @@ Configuration is loaded in this order (later overrides earlier):
 3. `.env` (override path with `ENV_FILE` in the process environment)
 4. Real process environment variables
 
-`.env.example` at the repository root lists every setting with its built-in default and leaves secrets blank. Because uncommented lines in `.env` override `config/config.yaml`, remove any line from `.env` that you want `config/config.yaml` to control.
+`.env.example` at the repository root lists every steady-state setting with its built-in default and leaves secrets blank (it omits the one-time `UPGRADE_POLICY_MODE` setting and the removed `ENABLE_CASBIN` setting). Because uncommented lines in `.env` override `config/config.yaml`, remove any line from `.env` that you want `config/config.yaml` to control.
 
 `CONFIG_FILE` and `ENV_FILE` are read from the process environment only (not from `.env` or YAML).
 
@@ -49,6 +49,7 @@ Configuration is loaded in this order (later overrides earlier):
 | `ADMIN_API_KEY` | `admin_api_key` | *(unset)* | Optional; enables `/admin` and configures the `bootstrap` admin key. Must be `>= 16` characters when set |
 | `DB_TIMEOUT` | `db_timeout` | `2s` | Go duration, must be `> 0` |
 | `POLICY_SYNC_INTERVAL` | `policy_sync_interval` | `2s` | Go duration, minimum `100ms` (values `< 100ms`, zero, or negative fail startup) |
+| `UPGRADE_POLICY_MODE` | `upgrade_policy_mode` | *(unset)* | Optional one-time upgrade setting: `enforced` or `disabled` (any other value fails config loading). Read only by the one-time upgrade at first start; has no effect afterwards and should be removed |
 | `VERIFY_RATE_LIMIT_RPS` | `verify_rate_limit_rps` | `100` | Must be `> 0`; global limit across `/verify` and `/verify/:relay` |
 | `VERIFY_RATE_LIMIT_BURST` | `verify_rate_limit_burst` | `200` | Integer `> 0` |
 | `VERIFY_CACHE_TTL` | `verify_cache_ttl` | `0s` | Go duration; `<= 0` disables the verify decision cache |
@@ -65,7 +66,7 @@ Configuration is loaded in this order (later overrides earlier):
 
 `sqlite://` is for tests and for running from source: the published container image is built with `CGO_ENABLED=0` and cannot open a sqlite database, so use PostgreSQL in containers.
 
-`ENABLE_CASBIN` / `enable_casbin` has been removed for enforcement; policy is always enforced. Its only remaining use is deciding the one-time database upgrade mode on the first start of this version (when absent or not a boolean on an existing database with devices and no registration rules, startup refuses to run until a boolean value is provided). After the first start it has no effect, logs a warning if still present, and should be removed (see [Upgrading from the previous version](#upgrading-from-the-previous-version)).
+`ENABLE_CASBIN` / `enable_casbin` has been removed for enforcement; policy is always enforced. A leftover `ENABLE_CASBIN=true` or `enable_casbin: true` (for example from an old mounted `config.yaml`) never confirms anything and only logs an ignored-setting warning. On the first start against an existing database without `UPGRADE_POLICY_MODE`, the old setting acts only as a hint that must agree with the existing device registration rules (and a non-boolean value at a higher-precedence layer, such as `ENABLE_CASBIN=off` or an empty value in the environment, does not hide a valid boolean from `.env` or YAML). To state the upgrade mode explicitly, use `UPGRADE_POLICY_MODE`. Remove `UPGRADE_POLICY_MODE`, `ENABLE_CASBIN`, and `enable_casbin` after the first successful start (see [Upgrading from the previous version](#upgrading-from-the-previous-version)).
 
 ### OpenTelemetry / SigNoz tracing
 
@@ -391,28 +392,38 @@ Follow these steps in order:
 1. **Take a database backup.** The one-time upgrade modifies role bindings and may revoke devices.
 2. **Stop every old instance before starting the new version.** Mixed-version operation is not supported: old instances do not bump or check `policy_state.version`, and their admin writes bypass policy sync and admin audit.
 3. **Ensure `ADMIN_API_KEY` is set at the first start.** Remediation requires the `/admin` API.
-4. **Decide whether `ENABLE_CASBIN` / `enable_casbin` is needed for the first start:**
-   - The one-time upgrade mode is decided once, at the first start of this version on a database: `ENABLE_CASBIN` (env or `.env`) or `enable_casbin` (YAML) present with a boolean value sets it (`false` = policy was disabled before, `true` = policy was enforced before). Environment variables and `.env` override YAML.
-   - In `config/config.yaml`, YAML 1.1 boolean spellings count (`off`, `no`, `n` are false). In env and `.env`, only values accepted by Go's `strconv.ParseBool` count (`false`, `0`, `f`, `F`, `FALSE`, `False`); `off`, `no`, or an empty value are not booleans there.
-   - When the setting is absent or not a boolean: a database with no devices, or with at least one registration rule (`g, device:..., user:...` in `casbin_rule`), is treated as **enforced** (the old default). A database that has devices but not a single registration rule looks like it ran with policy disabled; the service **refuses to start**, changes nothing, and tells the operator to start once with `ENABLE_CASBIN=false` (keep those devices allowed) or `ENABLE_CASBIN=true` (confirm they were denied).
-   - The new `.env.example` and `config/config.yaml` do not contain `ENABLE_CASBIN` / `enable_casbin`, so an operator rebuilding configuration from them must add it back by hand for the first start if policy was disabled before.
-   - **Warning:** Setting `false` on a deployment that did enforce policy binds every user to `standard` and revokes nothing, so devices that were denied become allowed. Use `false` **only** if the previous version really ran with policy disabled.
-   - The setting is read only for this one decision. After the first successful start it has no effect and should be removed.
+4. **Decide the upgrade mode (`UPGRADE_POLICY_MODE`):**
+
+   | Deployment state | Action for the first start |
+   | --- | --- |
+   | Previous version ran with policy enforced (the default) | Nothing needed |
+   | Previous version ran with `ENABLE_CASBIN=false` | Keep that old setting for the first start, or set `UPGRADE_POLICY_MODE=disabled` |
+   | Startup refused | Read the error message and start once with `UPGRADE_POLICY_MODE=disabled` or `UPGRADE_POLICY_MODE=enforced` |
+
+   - `UPGRADE_POLICY_MODE` (env or `.env`) / `upgrade_policy_mode` (YAML) accepts `enforced` or `disabled` (any other value is a configuration error). It is read only by the one-time upgrade at the first start on a database, has no effect afterwards, and is the only way to state the mode explicitly.
+   - Without `UPGRADE_POLICY_MODE`, the service infers the mode from the data, and the old `ENABLE_CASBIN` / `enable_casbin` setting is only a hint that must agree with the data:
+     - **No active (non-revoked) devices:** the upgrade runs directly.
+     - **At least one active device has its registration rule** (`g, device:<its node_key>, user:<its owner id>` in `casbin_rule`): policy was enforced. If the old setting says `false`, the service **refuses to start** (because disabled mode would bind every user and revoke nothing).
+     - **Active devices exist and none has its registration rule:** this looks like a database that ran with policy disabled. If the old setting says `false`, the upgrade runs in disabled mode. Otherwise (old setting `true`, absent, or not a boolean) the service **refuses to start**.
+   - A refusal changes nothing in the database (apart from the idempotent creation of the built-in relay `default` and role `standard`), writes no upgrade marker, and exits with an error that states the counts and names both `UPGRADE_POLICY_MODE` choices. Starting next with `UPGRADE_POLICY_MODE` set runs the upgrade normally.
+   - A leftover `enable_casbin: true` or `ENABLE_CASBIN=true` never confirms anything. The previous version shipped `enable_casbin: true` in `config/config.yaml`, so an old mounted file is expected and only produces the "ignored setting" warning.
+   - For the old setting, YAML 1.1 boolean spellings (`off`, `no`, `n`) count in YAML and Go's `strconv.ParseBool` values (`false`, `0`, `f`, `F`, `FALSE`, `False`) count in env/`.env`. A value that is not a boolean at a higher-precedence layer (for example `ENABLE_CASBIN=off` or an empty value in the environment) does not hide a valid boolean from a lower layer (`.env` or YAML). Note that the new `.env.example` and `config/config.yaml` do not contain `ENABLE_CASBIN` / `enable_casbin`.
+   - **Warning:** `UPGRADE_POLICY_MODE=disabled` binds every user to `standard` and revokes nothing. Use it **only** if the previous version really ran with policy disabled; on a deployment that enforced policy it gives access to devices that were denied. `UPGRADE_POLICY_MODE=enforced` leaves users that had no access with none and revokes every device without its registration rule.
 5. **Start the new version (start one instance first on a large database).** Startup has a 30-second limit covering waiting for the startup lock, migrations, and the upgrade; an instance that waits longer exits and should be restarted by its supervisor.
    - On first start against an existing database, startup runs schema migrations (creating `roles`, `relays`, `policy_state`, `admin_keys`, `admin_audit_logs`, and adding nullable `audit_logs.relay`), seeds `default` and `standard`, runs the one-time upgrade in a single transaction (recording a durable marker in `policy_state.upgraded_at` so it never runs again), and creates the `bootstrap` admin key from `ADMIN_API_KEY`.
    - **What the one-time upgrade does** (it deletes no `casbin_rule` row):
      - Imports valid role and relay names from existing `g, user:<uuid>, role:<name>` and `p, role:<name>, derp:<relay>, connect` rules into the `roles` and `relays` registries.
-     - **Disabled mode (`false`):** Every user not already covered on `default` is bound to `standard`; nothing is revoked.
-     - **Enforced mode (`true`):** A user who is not covered on `default` and has no devices is bound to `standard`; a user who is not covered and has devices is left as is and reported; every device without its registration rule (`g, device:<node_key>, user:<owner_id>`) is revoked, whoever owns it.
+     - **Disabled mode (`UPGRADE_POLICY_MODE=disabled`):** Every user not already covered on `default` is bound to `standard`; nothing is revoked.
+     - **Enforced mode (`UPGRADE_POLICY_MODE=enforced`):** A user who is not covered on `default` and has no devices is bound to `standard`; a user who is not covered and has devices is left as is and reported; every device without its registration rule (`g, device:<node_key>, user:<owner_id>`) is revoked, whoever owns it.
      - Rules outside the managed shapes (direct `p` rules on `user:` or `device:`, role-to-role `g` rules, pre-existing `derp:*` rules, legacy `g, device:*, user:*` rules) remain in `casbin_rule`, grant nothing under the new model, and are counted as unmanaged rules.
    - **What it records:**
-     - One info log line and one `system` admin audit row with action `upgrade.run` holding the mode and the counts (users bound, users left without access, devices revoked, unmanaged rules, and roles and relays imported).
+     - One info log line and one `system` admin audit row with action `upgrade.run` holding the mode, how it was determined (`explicit`, `legacy_setting`, `data`, or `empty`), and the counts (users bound, users left without access, devices revoked, unmanaged rules, and roles and relays imported).
      - One `system` admin audit row (`device.revoke`) per revoked device.
      - One warning log line listing the IDs of users left without access and devices revoked. This warning is logged once by the instance that ran the upgrade and is hidden at `LOG_LEVEL=error`, so read the admin audit (`GET /admin/audit/admin`) instead of relying on logs.
 6. **Verify and remediate:**
    - Query `GET /admin/audit/admin` (using `ADMIN_API_KEY`) to inspect the `upgrade.run` row and any `system` `device.revoke` rows rather than relying on the startup warning log.
    - Binding an uncovered user later with `PUT /admin/users/:id/roles` (for example `{"roles":["standard"]}`) admits only devices that were properly registered; re-enable any revoked device individually with `POST /admin/devices/:id/enable`.
-   - Remove `ENABLE_CASBIN` / `enable_casbin` after the first successful start.
+   - Remove `UPGRADE_POLICY_MODE`, `ENABLE_CASBIN`, and `enable_casbin` after the first successful start.
 7. **Review breaking changes for callers:**
    - `/register` now returns `403` for a revoked device instead of reactivating it.
    - `ADMIN_API_KEY` becomes the stored `bootstrap` key (`tier: admin`), keeping existing callers working; create named keys and revoke `bootstrap` when ready.

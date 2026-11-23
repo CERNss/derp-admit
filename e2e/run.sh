@@ -617,9 +617,10 @@ evidence "$MC tailscale status --json .Health" "$hc"
 evidence "$MA: tailscale ping $TSIP_C" "$p"
 if [ -n "$rej" ] && [ -z "$conn" ] && ! grep -q "pong from" <<<"$p"; then g1=1; else g1=0; fi
 
+# Mark before the start: c keeps retrying and may get in as soon as /verify answers.
+MARK_G2=$(now)
 dc start verifier 2>&1 | sed 's/^/   /'
 wait_until 60 sh -c "docker inspect -f '{{.State.Health.Status}}' \$(docker compose -p $PROJECT -f '$COMPOSE_FILE' ps -q verifier) | grep -qx healthy" || true
-MARK_G2=$(now)
 wait_until 60 derp_connected_since "$MC" "$MARK_G2" || true
 wait_until 30 audit_newest_is "$KEY_C" "$MARK_G2" true || true
 conn=$(derp_connected_since "$MC" "$MARK_G2" | tail -1 || true)

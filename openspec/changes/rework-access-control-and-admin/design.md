@@ -187,3 +187,14 @@ None blocking. These are decisions the owner may want to overrule:
 - D3: `ADMIN_API_KEY` is both the switch that enables `/admin` and the bootstrap key.
 - R1: the upgrade never loosens access, which includes revoking, when policy was enforced, every device without its registration rule, whoever owns it.
 - R3: provisioning policy by SQL is unsupported, and SQL changes take effect at the next policy reload, at an unpredictable time.
+
+## Known minor gaps
+
+Found by the last independent review (commit `4e4c315`) and left as they are. None loosens access.
+
+- `UPGRADE_POLICY_MODE`: an invalid value in a lower configuration layer is hidden by a valid value in a higher one instead of failing configuration loading; an empty value in a higher layer does not clear a lower one.
+- `enable_casbin` written through a YAML alias or merge key is not seen as the legacy setting (only top-level scalar keys are read). The previous version followed aliases, so such a file reads as "absent".
+- The unique index on `casbin_rule` is created by migration `002` and by the sqlite model. A PostgreSQL database that already recorded `002` from an earlier build of this branch does not get it. Creating it fails startup if the table already holds duplicate rows, which only hand-written SQL can produce.
+- In enforced mode a device whose owner row is missing is counted but not revoked. It can exist only where foreign keys are not enforced (sqlite), and `/verify` denies it because the owner lookup fails.
+- `users_bound_standard` in the `upgrade.run` summary counts a user whose binding already existed.
+- There is no test with a real Tailscale client, and the README's upgrade section was not fact-checked a second time after its last rewrite; the behaviour it describes was replayed on PostgreSQL.

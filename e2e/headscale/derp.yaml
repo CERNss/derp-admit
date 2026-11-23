@@ -4,7 +4,9 @@
 # file with gopkg.in/yaml.v3 straight into tailcfg.DERPMap.
 #
 # derp.e2e.test must match derper --hostname, the certificate SAN made by
-# e2etool pki, and the /etc/hosts entry run.sh writes inside each machine.
+# e2etool pki, and the /etc/hosts entry run.sh writes inside each machine
+# (derp.e2e.test -> the IPv4 address of host.orb.internal in that machine).
+# derpport/stunport are the loopback-published ports of the derper service.
 # No InsecureForTests and no CertName: clients verify the certificate against
 # the throwaway CA installed in their system trust store.
 regions:
@@ -17,5 +19,5 @@ regions:
         regionid: 900
         hostname: derp.e2e.test
         ipv6: none
-        derpport: 8443
-        stunport: 3478
+        derpport: 39443
+        stunport: 39478

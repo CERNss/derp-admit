@@ -2,9 +2,10 @@
 # Based on config-example.yaml at tag v0.29.7; only the keys that differ
 # from that file (or matter to the rig) are commented.
 ---
-# The machines reach headscale through an /etc/hosts entry run.sh writes.
-server_url: http://headscale.e2e.test:8080
-listen_addr: 0.0.0.0:8080
+# The machines reach headscale through an /etc/hosts entry run.sh writes
+# (headscale.e2e.test -> host.orb.internal) and the loopback-published port.
+server_url: http://headscale.e2e.test:39080
+listen_addr: 0.0.0.0:39080
 metrics_listen_addr: 127.0.0.1:9090
 grpc_listen_addr: 127.0.0.1:50443
 grpc_allow_insecure: false

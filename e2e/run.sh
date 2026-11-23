@@ -4,6 +4,8 @@
 #   e2e/run.sh            build, start, provision, assert A..G, tear down
 #   e2e/run.sh --keep     same, but leave the stack and the machines running
 #   e2e/run.sh --build    force rebuilding the local images first
+#   e2e/run.sh --prebuilt never build or pull: use images already loaded on
+#                         this host (same as E2E_PREBUILT=1; see README)
 #   e2e/run.sh --down     only tear down (same as e2e/down.sh)
 #
 # Servers (postgres, verifier, derper, headscale, tools) run in Docker Compose
@@ -23,18 +25,21 @@ MACHINES=("$MA" "$MB" "$MC")
 
 DERP_HOST=derp.e2e.test       # DERP map HostName == cert SAN == /etc/hosts name
 HS_HOST=headscale.e2e.test
+DERP_PORT=39443               # loopback-published ports (docker-compose.yml)
+HS_PORT=39080
 REGION=900                    # region id in headscale/derp.yaml
 REGION_CODE=e2e-derp
 RELAY=e2e                     # derper --verify-client-url=.../verify/e2e
 ROLE=e2e-access
 
-KEEP=0 BUILD=0 DOWN_ONLY=0
+KEEP=0 BUILD=0 DOWN_ONLY=0 PREBUILT=${E2E_PREBUILT:-0}
 for arg in "$@"; do
   case $arg in
     --keep) KEEP=1 ;;
     --build) BUILD=1 ;;
+    --prebuilt) PREBUILT=1 ;;
     --down) DOWN_ONLY=1 ;;
-    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -133,17 +138,20 @@ echo "tailscale $(dpkg-query -W -f="\${Version}" tailscale) installed"
 '
 
 # Reset the machine for a run: wipe tailscaled state, point the two rig host
-# names at the containers, trust the CA read from stdin, and drop all traffic
-# to and from the other machines (args: DERP_IP HS_IP V4PEERS V6PEERS, the
-# peer lists comma separated, possibly empty).
+# names at host.orb.internal (where OrbStack exposes the Docker host's
+# loopback-published ports to machines), trust the CA read from stdin, and
+# drop all traffic to and from the other machines (args: V4PEERS V6PEERS,
+# comma separated, possibly empty).
 # shellcheck disable=SC2016 # expanded inside the machine
 RESET_SCRIPT='
 set -euo pipefail
-derp_ip=$1 hs_ip=$2 v4=$3 v6=$4
+v4=$1 v6=$2
+svc=$(getent ahostsv4 host.orb.internal | awk "NR == 1 { print \$1 }")
+[ -n "$svc" ] || { echo "cannot resolve host.orb.internal" >&2; exit 1; }
 systemctl stop tailscaled
 rm -rf /var/lib/tailscale
 sed -i "/# derp-admit-e2e\$/d" /etc/hosts
-printf "%s derp.e2e.test # derp-admit-e2e\n%s headscale.e2e.test # derp-admit-e2e\n" "$derp_ip" "$hs_ip" >> /etc/hosts
+printf "%s derp.e2e.test # derp-admit-e2e\n%s headscale.e2e.test # derp-admit-e2e\n" "$svc" "$svc" >> /etc/hosts
 cat > /usr/local/share/ca-certificates/derp-admit-e2e.crt
 update-ca-certificates --fresh >/dev/null 2>&1
 nft delete table inet derp_e2e 2>/dev/null || true
@@ -161,7 +169,7 @@ nft delete table inet derp_e2e 2>/dev/null || true
 } | nft -f -
 systemctl start tailscaled
 for i in $(seq 1 30); do [ -S /run/tailscale/tailscaled.sock ] && break; sleep 1; done
-echo "reset done"
+echo "reset done; derp.e2e.test and headscale.e2e.test -> $svc (host.orb.internal)"
 '
 
 # Undo everything RESET_SCRIPT did (run before the machines are stopped).
@@ -228,11 +236,17 @@ images_missing() {
   done
   return 1
 }
-if [ "$BUILD" = 1 ] || images_missing; then
+if [ "$PREBUILT" = 1 ]; then
+  info "prebuilt mode: no build, no pull"
+  for img in $(dc config --images | sort -u); do
+    docker image inspect "$img" >/dev/null 2>&1 || die "prebuilt mode: image $img is not loaded"
+  done
+elif [ "$BUILD" = 1 ] || images_missing; then
   info "building verifier, derper and tools images"
   retry 3 10 dc build || die "image build failed"
 fi
 for img in $(dc config --images | sort -u); do
+  [ "$PREBUILT" = 1 ] && break
   case $img in derp-admit-e2e-*) continue ;; esac
   if ! docker image inspect "$img" >/dev/null 2>&1; then
     info "pulling $img"
@@ -247,14 +261,8 @@ done
 
 section "stack"
 dc down -v --remove-orphans >/dev/null 2>&1 || true
-dc up -d --wait 2>&1 | sed 's/^/   /'
-container_ip() { # container_ip SERVICE NETWORK
-  docker inspect -f "{{with index .NetworkSettings.Networks \"${PROJECT}_$2\"}}{{.IPAddress}}{{end}}" "$(dc ps -q "$1")"
-}
-DERP_IP=$(container_ip derper edge)
-HS_IP=$(container_ip headscale edge)
-[ -n "$DERP_IP" ] && [ -n "$HS_IP" ] || die "cannot read container IPs"
-info "derper edge IP $DERP_IP, headscale edge IP $HS_IP"
+dc up -d --wait --no-build --pull never 2>&1 | sed 's/^/   /'
+evidence "published ports (loopback only)" "$(docker ps --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}} {{.Ports}}' | grep -- '->' || true)"
 
 # ------------------------------------------------------------- machines ----
 
@@ -268,8 +276,8 @@ ensure_machine() {
   fi
   if [ -z "$st" ]; then
     for i in 1 2 3 4 5; do
-      info "$n: orb create --isolated $MACHINE_DISTRO $n (try $i)"
-      if orb create --isolated "$MACHINE_DISTRO" "$n"; then break; fi
+      info "$n: orb create $MACHINE_DISTRO $n (try $i)"
+      if orb create "$MACHINE_DISTRO" "$n"; then break; fi
       if [ -n "$(machine_state "$n")" ]; then orb delete -f "$n" >/dev/null 2>&1 || true; fi
       sleep 10
     done
@@ -305,7 +313,7 @@ for n in "${MACHINES[@]}"; do
     p6=$(ip6of "$p")
     if [ -n "$p6" ]; then v6="${v6:+$v6, }${p6//,/, }"; fi
   done
-  printf '%s\n' "$CA_PEM" | mbash "$n" "$RESET_SCRIPT" "$DERP_IP" "$HS_IP" "$v4" "$v6" | sed "s/^/   $n: /"
+  printf '%s\n' "$CA_PEM" | mbash "$n" "$RESET_SCRIPT" "$v4" "$v6" | sed "s/^/   $n: /"
 done
 
 # ------------------------------------------------------------ provision ----
@@ -366,7 +374,7 @@ peer_path() { # peer_path FROM PEER_TSIP: CurAddr and Relay of the peer in FROM'
   m "$1" tailscale status --json | tmpl "{{range .Peer}}{{if eq (index .TailscaleIPs 0) \"$2\"}}peer={{.HostName}} CurAddr=\"{{.CurAddr}}\" Relay={{.Relay}} Online={{.Online}}{{end}}{{end}}"
 }
 device_id() { api GET "/admin/devices?userId=$1" | tmpl "{{range .devices}}{{if eq .nodeKey \"$2\"}}{{.id}}{{end}}{{end}}"; }
-up() { m "$1" tailscale up --login-server="http://$HS_HOST:8080" --authkey="$AUTHKEY" \
+up() { m "$1" tailscale up --login-server="http://$HS_HOST:$HS_PORT" --authkey="$AUTHKEY" \
   --hostname="$1" --accept-dns=false --accept-routes=false --timeout=90s; }
 
 # ------------------------------------------------- preconditions (P1-P3) ---
@@ -376,8 +384,8 @@ for n in "${MACHINES[@]}"; do
   evidence "$n: uname -a / tailscale version" "$(m "$n" uname -a)
 $(m "$n" tailscale version | head -1)"
 done
-probe=$(m "$MA" curl -sS -o /dev/null -w 'HTTP %{http_code}, ssl_verify_result=%{ssl_verify_result}, %{remote_ip}:%{remote_port}' "https://$DERP_HOST:8443/derp/probe" 2>&1 || true)
-evidence "$MA: curl https://$DERP_HOST:8443/derp/probe (system trust store, throwaway CA)" "$probe"
+probe=$(m "$MA" curl -sS -o /dev/null -w 'HTTP %{http_code}, ssl_verify_result=%{ssl_verify_result}, %{remote_ip}:%{remote_port}' "https://$DERP_HOST:$DERP_PORT/derp/probe" 2>&1 || true)
+evidence "$MA: curl https://$DERP_HOST:$DERP_PORT/derp/probe (system trust store, throwaway CA)" "$probe"
 if grep -q "HTTP 200, ssl_verify_result=0" <<<"$probe"; then
   result P1 PASS "machine reaches derper over verified TLS for $DERP_HOST"
 else
@@ -395,8 +403,8 @@ for pair in "$MA $MC" "$MC $MA" "$MA $MB" "$MB $MA" "$MB $MC" "$MC $MB"; do
     out+="$f -> $t $a6: $(tail -2 <<<"$o" | head -1)"$'\n'
   done
 done
-ctl=$(m "$MA" ping -c 1 -W 2 "$DERP_IP" 2>&1 | tail -2 | head -1 || true)
-evidence "plain ping between machine addresses (must fail) and to derper (control)" "${out}$MA -> derper $DERP_IP: $ctl"
+ctl=$(m "$MA" ping -c 1 -W 2 "$(ip4of "$MA")" 2>&1 | tail -2 | head -1 || true)
+evidence "plain ping between machine addresses (must fail; last line: own address as control)" "${out}$MA -> itself: $ctl"
 if [ "$blocked" = 1 ]; then
   result P2 PASS "no direct IP path between any two machines (IPv4 and IPv6 dropped by nft table inet derp_e2e)"
 else

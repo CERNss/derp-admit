@@ -2,8 +2,12 @@
 #
 # Always run through e2e/run.sh (project name "derp-admit-e2e"). The three
 # Tailscale clients are OrbStack Linux machines (derp-e2e-a, -b, -c), not
-# services of this file; they reach headscale and derper by container IP on
-# the "edge" network. Nothing here publishes a host port.
+# services of this file. OrbStack machines cannot reach container IPs, so
+# headscale (tcp/39080) and derper (tcp/39443, STUN udp/39478) are published
+# on the Docker host's LOOPBACK only (127.0.0.1, not reachable from the LAN);
+# the machines reach them through host.orb.internal. Each service listens on
+# the same port number inside the container, so one number is used
+# everywhere (DERP map, headscale server_url, published port).
 #
 # derper asks the verifier about relay "e2e" (not the built-in "default"):
 # run.sh creates relay "e2e" and role "e2e-access" before any client starts.
@@ -90,6 +94,8 @@ services:
       - ./headscale/derp.yaml:/etc/headscale/derp.yaml:ro
       - headscale-data:/var/lib/headscale
     networks: [edge]
+    ports:
+      - "127.0.0.1:39080:39080/tcp"
     healthcheck:
       test: ["CMD", "headscale", "health"]
       interval: 2s
@@ -106,6 +112,9 @@ services:
       additional_contexts:
         golang:1.24: docker-image://${E2E_GOLANG_DERPER_IMAGE:-golang:1.24}
     networks: [backend, edge]
+    ports:
+      - "127.0.0.1:39443:39443/tcp"
+      - "127.0.0.1:39478:39478/udp"
     depends_on:
       tools:
         condition: service_healthy
@@ -116,9 +125,9 @@ services:
       # (derp/derp_server.go); without it derper logs only refusals.
       DERP_DEBUG_LOGS: "true"
     command:
-      - -a=:8443
+      - -a=:39443
       - --http-port=-1
-      - --stun-port=3478
+      - --stun-port=39478
       - --certmode=manual
       - --certdir=/pki
       - --hostname=derp.e2e.test
@@ -133,7 +142,7 @@ networks:
   # postgres, verifier, tools, derper. No route to the outside.
   backend:
     internal: true
-  # headscale and derper: the only services the client machines can reach.
+  # headscale and derper (published ports need a non-internal network).
   edge: {}
 
 volumes:

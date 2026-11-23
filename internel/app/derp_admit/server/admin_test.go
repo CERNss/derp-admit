@@ -1,11 +1,7 @@
 package server_test
 
 import (
-	"bytes"
-	"encoding/json"
-	"io"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -14,10 +10,6 @@ import (
 
 	"github.com/google/uuid"
 )
-
-const testAdminKey = "test-admin-key-0123456789"
-
-func adminKeyOpt(c *config.Config) { c.AdminAPIKey = testAdminKey }
 
 func TestAdminRequiresAuth(t *testing.T) {
 	router, _ := newTestRouter(t, adminKeyOpt)
@@ -264,85 +256,4 @@ func TestAdminRateLimitBeforeAuth(t *testing.T) {
 	if status, _ := doAdminRequestFrom(t, router, http.MethodGet, "/admin/users", "", "192.0.2.10:30002", nil); status != http.StatusTooManyRequests {
 		t.Fatalf("rate-limited unauthenticated request status=%d want=%d", status, http.StatusTooManyRequests)
 	}
-}
-
-// provisionUserAndToken creates a user and mints an enroll token through the
-// admin API, returning the user id and the one-time plaintext token.
-func provisionUserAndToken(t *testing.T, handler http.Handler, username string) (string, string) {
-	t.Helper()
-
-	status, body := doAdminRequest(t, handler, http.MethodPost, "/admin/users", testAdminKey, map[string]any{
-		"username": username,
-	})
-	if status != http.StatusCreated {
-		t.Fatalf("create user status=%d want=%d", status, http.StatusCreated)
-	}
-	userID := body["user"].(map[string]any)["id"].(string)
-
-	status, body = doAdminRequest(t, handler, http.MethodPost, "/admin/tokens", testAdminKey, map[string]any{
-		"userId": userID,
-	})
-	if status != http.StatusCreated {
-		t.Fatalf("create token status=%d want=%d", status, http.StatusCreated)
-	}
-	token, _ := body["token"].(string)
-	if token == "" {
-		t.Fatalf("expected a plaintext token in response")
-	}
-	return userID, token
-}
-
-func doAdminRequest(t *testing.T, handler http.Handler, method, path, apiKey string, payload any) (int, map[string]any) {
-	t.Helper()
-
-	var reader io.Reader
-	if payload != nil {
-		raw, err := json.Marshal(payload)
-		if err != nil {
-			t.Fatalf("marshal payload: %v", err)
-		}
-		reader = bytes.NewReader(raw)
-	}
-
-	req := httptest.NewRequest(method, path, reader)
-	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	var out map[string]any
-	_ = json.Unmarshal(rec.Body.Bytes(), &out)
-	return rec.Code, out
-}
-
-func doAdminRequestFrom(t *testing.T, handler http.Handler, method, path, apiKey, remoteAddr string, payload any) (int, map[string]any) {
-	t.Helper()
-
-	var reader io.Reader
-	if payload != nil {
-		raw, err := json.Marshal(payload)
-		if err != nil {
-			t.Fatalf("marshal payload: %v", err)
-		}
-		reader = bytes.NewReader(raw)
-	}
-
-	req := httptest.NewRequest(method, path, reader)
-	req.RemoteAddr = remoteAddr
-	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	var out map[string]any
-	_ = json.Unmarshal(rec.Body.Bytes(), &out)
-	return rec.Code, out
 }

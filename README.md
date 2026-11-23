@@ -133,3 +133,38 @@ docker buildx build \
   --push \
   .
 ```
+
+## Docker Compose stack and manual smoke test
+
+`builder/derp_admit/docker-compose.yml` runs three services: `postgres`, `verifier` (built from `builder/derp_admit/Dockerfile`) and `derper`. There is no usable published derper image (`tailscale/derper` and `ghcr.io/tailscale/derper` refuse anonymous pulls), so compose builds derper from `builder/derp_admit/derper.Dockerfile` at the tailscale version pinned in `go.mod` (`v1.84.3`).
+
+derper is started with `--verify-client-url=http://verifier:8080/verify/default` and `--verify-client-url-fail-open=false`, so it rejects every client when the verifier cannot be reached.
+
+Start the stack:
+
+```bash
+cp .env.example .env
+# Fill in TOKEN_PEPPER and ADMIN_API_KEY, and point the database at the compose postgres:
+# DATABASE_URL=postgres://verifier:verifier@postgres:5432/verifier?sslmode=disable
+docker compose -f builder/derp_admit/docker-compose.yml up -d --build
+```
+
+Host ports: `5432` (postgres), `8080` (verifier), `3340/tcp` (derper HTTP) and `3478/udp` (STUN).
+
+### TLS choice
+
+For the smoke test, derper serves plain HTTP on `:3340` with no certificate. derper only serves TLS when its listen address is `:443` or `--certmode=manual` is set (`serveTLS := tsweb.IsProd443(*addr) || *certMode == "manual"` in `cmd/derper/derper.go`); with `-a=:3340` neither holds, so no Let's Encrypt or certificate files are needed. Its node key is kept in the `derper-data` volume (`-c=/var/lib/derper/derper.key`). For real clients, serve derper over TLS: run it on `:443` with a public hostname, or use `--certmode=manual` with your own certificate.
+
+### Checking each service
+
+```bash
+dc() { docker compose -f builder/derp_admit/docker-compose.yml "$@"; }
+dc ps                                       # postgres should be "healthy"; verifier and derper "Up"
+curl -s http://127.0.0.1:8080/healthz        # {"ok":true}
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3340/derp/probe   # 200
+dc logs derper                              # "STUN server listening on [::]:3478", "derper: serving on :3340"
+dc logs verifier                            # "starting verifier server"
+dc down -v                                  # stop and delete the volumes
+```
+
+There is no automated end-to-end test with a real Tailscale client. Checking that derper actually admits or rejects a client through the verifier is a manual step: a Tailscale client has to use a DERP map that points at this derper.

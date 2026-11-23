@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"derp-admit/internel/app/derp_admit/model"
+	"derp-admit/internel/app/derp_admit/page"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -83,15 +84,29 @@ func (s *Service) CreateToken(ctx context.Context, in CreateTokenInput) (CreateT
 	return CreateTokenResult{Token: token, Plain: plain}, nil
 }
 
-func (s *Service) ListTokens(ctx context.Context) ([]model.EnrollToken, error) {
+func (s *Service) ListTokens(ctx context.Context, pg page.Request) ([]model.EnrollToken, *string, error) {
+	if pg.After != nil {
+		if _, err := uuid.Parse(pg.After.K); err != nil {
+			return nil, nil, fmt.Errorf("%w: invalid cursor", ErrAdminInvalid)
+		}
+	}
+
 	dbCtx, cancel := context.WithTimeout(ctx, s.dbTimeout)
 	defer cancel()
 
 	var tokens []model.EnrollToken
-	if err := s.db.WithContext(dbCtx).Order("created_at asc").Find(&tokens).Error; err != nil {
-		return nil, fmt.Errorf("list tokens: %w", err)
+	if err := page.Asc(s.db.WithContext(dbCtx).Model(&model.EnrollToken{}), pg, "created_at", "id", page.KeyString).
+		Find(&tokens).Error; err != nil {
+		if errors.Is(err, page.ErrInvalid) {
+			return nil, nil, fmt.Errorf("%w: %v", ErrAdminInvalid, err)
+		}
+		return nil, nil, fmt.Errorf("list tokens: %w", err)
 	}
-	return tokens, nil
+
+	tokens, nextCursor := page.Cut(tokens, pg, func(t model.EnrollToken) (time.Time, string) {
+		return t.CreatedAt, t.ID.String()
+	})
+	return tokens, nextCursor, nil
 }
 
 func (s *Service) RevokeToken(ctx context.Context, id uuid.UUID) error {
@@ -118,6 +133,36 @@ func (s *Service) RevokeToken(ctx context.Context, id uuid.UUID) error {
 		}
 
 		ch.Changed = true
+		return nil
+	})
+}
+
+// DeleteToken removes an enroll token without affecting devices previously
+// enrolled with it.
+func (s *Service) DeleteToken(ctx context.Context, id uuid.UUID) error {
+	return s.Mutate(ctx, EffectNone, http.StatusOK, func(tx *gorm.DB, ch *Change) error {
+		var token model.EnrollToken
+		if err := tx.First(&token, "id = ?", id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrAdminNotFound
+			}
+			return fmt.Errorf("lookup token: %w", err)
+		}
+
+		res := tx.Where("id = ?", id).Delete(&model.EnrollToken{})
+		if res.Error != nil {
+			return fmt.Errorf("delete token: %w", res.Error)
+		}
+		if res.RowsAffected == 0 {
+			return ErrAdminNotFound
+		}
+
+		ch.Changed = true
+		ch.TargetID = id.String()
+		ch.Summary = map[string]any{
+			"userId": token.UserID.String(),
+			"note":   token.Note,
+		}
 		return nil
 	})
 }

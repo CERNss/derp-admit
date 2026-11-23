@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"derp-admit/internel/app/derp_admit/model"
+	"derp-admit/internel/app/derp_admit/page"
 	"derp-admit/internel/app/derp_admit/policy"
 
 	"github.com/google/uuid"
@@ -23,10 +25,23 @@ type CreateUserInput struct {
 	Roles *[]string
 }
 
+type UserWithRoles struct {
+	User  model.User
+	Roles []string
+}
+
 func (s *Service) CreateUser(ctx context.Context, in CreateUserInput) (model.User, error) {
+	res, err := s.CreateUserWithRoles(ctx, in)
+	if err != nil {
+		return model.User{}, err
+	}
+	return res.User, nil
+}
+
+func (s *Service) CreateUserWithRoles(ctx context.Context, in CreateUserInput) (UserWithRoles, error) {
 	in.Username = strings.TrimSpace(in.Username)
 	if in.Username == "" {
-		return model.User{}, fmt.Errorf("%w: username required", ErrAdminInvalid)
+		return UserWithRoles{}, fmt.Errorf("%w: username required", ErrAdminInvalid)
 	}
 	if in.Email != nil {
 		trimmed := strings.TrimSpace(*in.Email)
@@ -39,7 +54,7 @@ func (s *Service) CreateUser(ctx context.Context, in CreateUserInput) (model.Use
 
 	roles := []string{policy.BuiltinRole}
 	if in.Roles != nil {
-		roles = *in.Roles
+		roles = dedupeSortedStrings(*in.Roles)
 	}
 
 	var user model.User
@@ -69,20 +84,52 @@ func (s *Service) CreateUser(ctx context.Context, in CreateUserInput) (model.Use
 		return nil
 	})
 	if err != nil {
-		return model.User{}, err
+		return UserWithRoles{}, err
 	}
-	return user, nil
+	return UserWithRoles{User: user, Roles: roles}, nil
 }
 
-func (s *Service) ListUsers(ctx context.Context) ([]model.User, error) {
+func (s *Service) ListUsers(ctx context.Context, pg page.Request) ([]UserWithRoles, *string, error) {
+	if pg.After != nil {
+		if _, err := uuid.Parse(pg.After.K); err != nil {
+			return nil, nil, fmt.Errorf("%w: invalid cursor", ErrAdminInvalid)
+		}
+	}
+
 	dbCtx, cancel := context.WithTimeout(ctx, s.dbTimeout)
 	defer cancel()
 
 	var users []model.User
-	if err := s.db.WithContext(dbCtx).Order("created_at asc").Find(&users).Error; err != nil {
-		return nil, fmt.Errorf("list users: %w", err)
+	if err := page.Asc(s.db.WithContext(dbCtx).Model(&model.User{}), pg, "created_at", "id", page.KeyString).
+		Find(&users).Error; err != nil {
+		if errors.Is(err, page.ErrInvalid) {
+			return nil, nil, fmt.Errorf("%w: %v", ErrAdminInvalid, err)
+		}
+		return nil, nil, fmt.Errorf("list users: %w", err)
 	}
-	return users, nil
+
+	users, nextCursor := page.Cut(users, pg, func(u model.User) (time.Time, string) {
+		return u.CreatedAt, u.ID.String()
+	})
+
+	ids := make([]uuid.UUID, len(users))
+	for i, u := range users {
+		ids[i] = u.ID
+	}
+	rolesByUser, err := policy.UserRoles(dbCtx, s.db, ids)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load user roles: %w", err)
+	}
+
+	out := make([]UserWithRoles, 0, len(users))
+	for _, u := range users {
+		roles := rolesByUser[u.ID]
+		if roles == nil {
+			roles = []string{}
+		}
+		out = append(out, UserWithRoles{User: u, Roles: roles})
+	}
+	return out, nextCursor, nil
 }
 
 // SetUserDisabled toggles a user's disabled state. Disabling also invalidates
@@ -119,4 +166,87 @@ func (s *Service) SetUserDisabled(ctx context.Context, id uuid.UUID, disabled bo
 		ch.Changed = true
 		return nil
 	})
+}
+
+// DeleteUser explicitly removes the user together with their enroll tokens,
+// devices, role bindings and legacy device rules in one transaction, while
+// preserving verify audit rows with device_id set to null.
+func (s *Service) DeleteUser(ctx context.Context, id uuid.UUID) error {
+	return s.Mutate(ctx, EffectPolicy, http.StatusOK, func(tx *gorm.DB, ch *Change) error {
+		var user model.User
+		if err := tx.First(&user, "id = ?", id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrAdminNotFound
+			}
+			return fmt.Errorf("lookup user: %w", err)
+		}
+
+		var devices []model.Device
+		if err := tx.Select("id", "node_key").Where("user_id = ?", id).Find(&devices).Error; err != nil {
+			return fmt.Errorf("lookup user devices: %w", err)
+		}
+
+		deviceIDs := make([]uuid.UUID, 0, len(devices))
+		nodeKeys := make([]string, 0, len(devices))
+		for _, dev := range devices {
+			deviceIDs = append(deviceIDs, dev.ID)
+			nodeKeys = append(nodeKeys, dev.NodeKey)
+		}
+
+		if len(deviceIDs) > 0 {
+			if err := tx.Model(&model.AuditLog{}).
+				Where("device_id IN ?", deviceIDs).
+				Update("device_id", nil).Error; err != nil {
+				return fmt.Errorf("clear verify audit device_id: %w", err)
+			}
+		}
+
+		if err := policy.DeleteUserRules(tx, id, nodeKeys); err != nil {
+			return fmt.Errorf("delete user policy rules: %w", err)
+		}
+
+		tokRes := tx.Where("user_id = ?", id).Delete(&model.EnrollToken{})
+		if tokRes.Error != nil {
+			return fmt.Errorf("delete user enroll tokens: %w", tokRes.Error)
+		}
+
+		devRes := tx.Where("user_id = ?", id).Delete(&model.Device{})
+		if devRes.Error != nil {
+			return fmt.Errorf("delete user devices: %w", devRes.Error)
+		}
+
+		userRes := tx.Where("id = ?", id).Delete(&model.User{})
+		if userRes.Error != nil {
+			return fmt.Errorf("delete user: %w", userRes.Error)
+		}
+		if userRes.RowsAffected == 0 {
+			return ErrAdminNotFound
+		}
+
+		ch.Changed = true
+		ch.TargetID = id.String()
+		ch.Summary = map[string]any{
+			"username":       user.Username,
+			"tokensDeleted":  tokRes.RowsAffected,
+			"devicesDeleted": devRes.RowsAffected,
+		}
+		return nil
+	})
+}
+
+func dedupeSortedStrings(items []string) []string {
+	if len(items) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, s := range items {
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
 }

@@ -31,7 +31,7 @@ func lifecycleRoutes() []adminRoute {
 					if !bindJSON(c, &req) {
 						return
 					}
-					user, err := d.svc.CreateUser(c.Request.Context(), service.CreateUserInput{
+					res, err := d.svc.CreateUserWithRoles(c.Request.Context(), service.CreateUserInput{
 						Username: req.Username,
 						Email:    req.Email,
 						Roles:    req.Roles,
@@ -40,7 +40,7 @@ func lifecycleRoutes() []adminRoute {
 						writeAdminError(c, d.logger, err)
 						return
 					}
-					c.JSON(http.StatusCreated, gin.H{"ok": true, "user": userView(user)})
+					c.JSON(http.StatusCreated, gin.H{"ok": true, "user": userView(res.User, res.Roles)})
 				}
 			},
 		},
@@ -50,16 +50,41 @@ func lifecycleRoutes() []adminRoute {
 			MinTier: actor.TierViewer,
 			Handle: func(d adminDeps) gin.HandlerFunc {
 				return func(c *gin.Context) {
-					users, err := d.svc.ListUsers(c.Request.Context())
+					pg, ok := pageParams(c, "users")
+					if !ok {
+						return
+					}
+					users, nextCursor, err := d.svc.ListUsers(c.Request.Context(), pg)
 					if err != nil {
 						writeAdminError(c, d.logger, err)
 						return
 					}
 					views := make([]gin.H, 0, len(users))
 					for _, u := range users {
-						views = append(views, userView(u))
+						views = append(views, userView(u.User, u.Roles))
 					}
-					c.JSON(http.StatusOK, gin.H{"ok": true, "users": views})
+					c.JSON(http.StatusOK, gin.H{"ok": true, "users": views, "nextCursor": nextCursor})
+				}
+			},
+		},
+		{
+			Method:      http.MethodDelete,
+			Path:        "/users/:id",
+			MinTier:     actor.TierOperator,
+			Action:      "user.delete",
+			TargetType:  "user",
+			TargetParam: "id",
+			Handle: func(d adminDeps) gin.HandlerFunc {
+				return func(c *gin.Context) {
+					id, ok := parseUUID(c, c.Param("id"))
+					if !ok {
+						return
+					}
+					if err := d.svc.DeleteUser(c.Request.Context(), id); err != nil {
+						writeAdminError(c, d.logger, err)
+						return
+					}
+					c.JSON(http.StatusOK, gin.H{"ok": true})
 				}
 			},
 		},
@@ -142,7 +167,11 @@ func lifecycleRoutes() []adminRoute {
 			MinTier: actor.TierViewer,
 			Handle: func(d adminDeps) gin.HandlerFunc {
 				return func(c *gin.Context) {
-					tokens, err := d.svc.ListTokens(c.Request.Context())
+					pg, ok := pageParams(c, "tokens")
+					if !ok {
+						return
+					}
+					tokens, nextCursor, err := d.svc.ListTokens(c.Request.Context(), pg)
 					if err != nil {
 						writeAdminError(c, d.logger, err)
 						return
@@ -151,7 +180,28 @@ func lifecycleRoutes() []adminRoute {
 					for _, t := range tokens {
 						views = append(views, tokenView(t))
 					}
-					c.JSON(http.StatusOK, gin.H{"ok": true, "tokens": views})
+					c.JSON(http.StatusOK, gin.H{"ok": true, "tokens": views, "nextCursor": nextCursor})
+				}
+			},
+		},
+		{
+			Method:      http.MethodDelete,
+			Path:        "/tokens/:id",
+			MinTier:     actor.TierOperator,
+			Action:      "token.delete",
+			TargetType:  "token",
+			TargetParam: "id",
+			Handle: func(d adminDeps) gin.HandlerFunc {
+				return func(c *gin.Context) {
+					id, ok := parseUUID(c, c.Param("id"))
+					if !ok {
+						return
+					}
+					if err := d.svc.DeleteToken(c.Request.Context(), id); err != nil {
+						writeAdminError(c, d.logger, err)
+						return
+					}
+					c.JSON(http.StatusOK, gin.H{"ok": true})
 				}
 			},
 		},
@@ -182,6 +232,10 @@ func lifecycleRoutes() []adminRoute {
 			MinTier: actor.TierViewer,
 			Handle: func(d adminDeps) gin.HandlerFunc {
 				return func(c *gin.Context) {
+					pg, ok := pageParams(c, "devices")
+					if !ok {
+						return
+					}
 					var userID *uuid.UUID
 					if raw := strings.TrimSpace(c.Query("userId")); raw != "" {
 						parsed, err := uuid.Parse(raw)
@@ -191,7 +245,7 @@ func lifecycleRoutes() []adminRoute {
 						}
 						userID = &parsed
 					}
-					devices, err := d.svc.ListDevices(c.Request.Context(), userID)
+					devices, nextCursor, err := d.svc.ListDevices(c.Request.Context(), userID, pg)
 					if err != nil {
 						writeAdminError(c, d.logger, err)
 						return
@@ -200,7 +254,28 @@ func lifecycleRoutes() []adminRoute {
 					for _, dev := range devices {
 						views = append(views, deviceView(dev))
 					}
-					c.JSON(http.StatusOK, gin.H{"ok": true, "devices": views})
+					c.JSON(http.StatusOK, gin.H{"ok": true, "devices": views, "nextCursor": nextCursor})
+				}
+			},
+		},
+		{
+			Method:      http.MethodDelete,
+			Path:        "/devices/:id",
+			MinTier:     actor.TierOperator,
+			Action:      "device.delete",
+			TargetType:  "device",
+			TargetParam: "id",
+			Handle: func(d adminDeps) gin.HandlerFunc {
+				return func(c *gin.Context) {
+					id, ok := parseUUID(c, c.Param("id"))
+					if !ok {
+						return
+					}
+					if err := d.svc.DeleteDevice(c.Request.Context(), id); err != nil {
+						writeAdminError(c, d.logger, err)
+						return
+					}
+					c.JSON(http.StatusOK, gin.H{"ok": true})
 				}
 			},
 		},

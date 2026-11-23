@@ -198,6 +198,10 @@ Tiers are ordered `viewer` < `operator` < `admin`, and each tier inherits all pe
 - `DELETE /admin/users/:id` deletes the user, their tokens, their devices, their role bindings, and their legacy device rules in one transaction, while preserving verify audit rows with `deviceId` set to `null`.
 - `DELETE /admin/tokens/:id` removes the token without affecting devices previously enrolled with it.
 
+### When a change takes effect on a connected client
+
+`derper` asks the verifier once, when a client opens its connection to the relay (`derp/derp_server.go`, in `accept`, tailscale v1.84.3). It does not ask again while that connection stays open. So revoking a device, disabling a user, removing a role or a grant, or deleting a relay stops **new** connections at once, but a client that is already connected keeps relaying until its connection to the relay is re-established (client restart, network change, relay restart). The real-client test in `e2e/` shows exactly this: a revoked device kept its open connection, and was refused with `revoked` as soon as it reconnected. To cut an existing connection immediately, restart the `derper`.
+
 ### Pagination (breaking change)
 
 > **Breaking change:** Every list endpoint (`GET /admin/users`, `/tokens`, `/devices`, `/roles`, `/relays`, `/keys`, `/audit/admin`, `/audit/verify`) is now paginated and returns at most `50` items by default. Callers that previously expected a single unpaginated response must follow `nextCursor`.
@@ -520,4 +524,4 @@ dc logs verifier                            # "starting verifier server"
 dc down -v                                  # stop and delete the volumes
 ```
 
-There is no automated end-to-end test with a real Tailscale client. Checking that derper actually admits or rejects a client through the verifier is a manual step: a Tailscale client has to use a DERP map that points at this derper.
+A test with real Tailscale clients lives in `e2e/` (see `e2e/README.md`). It runs `tailscaled` in three OrbStack Linux machines against Headscale, this verifier and a `derper` with real TLS, and checks admission, relayed traffic, refusal of an unregistered device, revocation, per-relay policy and behaviour while the verifier is down. It needs OrbStack and is run by hand; it is not part of `go test` and no CI runs it. It uses Headscale, not a Tailscale-hosted tailnet.

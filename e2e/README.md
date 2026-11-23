@@ -213,4 +213,4 @@ restart).
 - That the verifier is safe to expose: in this rig only derper and the tools
   container can reach it.
 - The built-in relay `default` with a real client: derper uses `/verify/e2e`
-  throughout (plain `/verify` is covered by the unit tests only).
+  throughout, so `/verify` and `/verify/default` are not exercised by this rig.

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -232,21 +231,4 @@ func (s *Service) DeleteUser(ctx context.Context, id uuid.UUID) error {
 		}
 		return nil
 	})
-}
-
-func dedupeSortedStrings(items []string) []string {
-	if len(items) == 0 {
-		return []string{}
-	}
-	seen := make(map[string]struct{}, len(items))
-	out := make([]string, 0, len(items))
-	for _, s := range items {
-		if _, dup := seen[s]; dup {
-			continue
-		}
-		seen[s] = struct{}{}
-		out = append(out, s)
-	}
-	sort.Strings(out)
-	return out
 }

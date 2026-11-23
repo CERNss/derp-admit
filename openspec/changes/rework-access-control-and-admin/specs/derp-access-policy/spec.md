@@ -71,19 +71,27 @@ At every startup the system MUST ensure, idempotently, that relay `default` exis
 - **THEN** `standard` is still granted only `eu-1`
 
 ### Requirement: Policy is always enforced
-The system MUST always enforce policy. A leftover `ENABLE_CASBIN` setting from any configuration source MUST be ignored for enforcement whatever its value, including one that does not parse, and MUST produce a startup warning. Its only remaining use is as input to the one-time upgrade.
+The system MUST always enforce policy. A leftover `ENABLE_CASBIN` / `enable_casbin` setting from any configuration source MUST be ignored for enforcement whatever its value, including one that does not parse, and MUST produce a startup warning whenever it is present. Its only remaining use is as a hint to the one-time upgrade. A configuration layer MUST override the legacy value of a lower layer only when its own value parses as a boolean.
 
 #### Scenario: ENABLE_CASBIN=false is still configured
 - **WHEN** the service starts with `ENABLE_CASBIN=false` in the environment, `.env` or `enable_casbin: false` in `config.yaml`
 - **THEN** startup succeeds, a warning says the setting is ignored, and `/verify` enforces policy
 
+#### Scenario: ENABLE_CASBIN=true is still configured
+- **WHEN** the service starts with `enable_casbin: true` in `config.yaml` on a database where the one-time upgrade has already run
+- **THEN** startup succeeds with the same warning, and `/verify` enforces policy exactly as without the setting
+
 #### Scenario: ENABLE_CASBIN has an unparsable value
 - **WHEN** the service starts with `ENABLE_CASBIN=maybe` on a database where the one-time upgrade has already run or does not refuse to start
 - **THEN** startup succeeds with the same warning
 
-#### Scenario: ENABLE_CASBIN has an unparsable value on an ambiguous database
-- **WHEN** the service starts for the first time with `ENABLE_CASBIN=maybe` on a database with a non-revoked device and no legacy device rule
-- **THEN** the value counts as absent, and startup fails as described in "One-time upgrade refuses to guess whether policy was enforced"
+#### Scenario: An unparsable value does not mask a valid lower-layer value
+- **WHEN** `config.yaml` holds `enable_casbin: false` and the environment or `.env` holds `ENABLE_CASBIN=maybe` or `ENABLE_CASBIN=`
+- **THEN** configuration loads, the warning is logged, and the one-time upgrade reads the legacy setting as false
+
+#### Scenario: ENABLE_CASBIN has an unparsable value on a database without registration rules
+- **WHEN** the service starts for the first time with `ENABLE_CASBIN=maybe`, no valid lower-layer value and no `UPGRADE_POLICY_MODE`, on a database with non-revoked devices none of which has its registration rule
+- **THEN** the legacy setting counts as not a boolean, and startup fails as described in "One-time upgrade refuses to guess whether policy was enforced"
 
 ### Requirement: Existing policy data is upgraded once per database
 On the first start of this version against a database, the system MUST run a one-time upgrade in one transaction, on sqlite and Postgres, and MUST record a durable marker so it never runs again. A start on which the upgrade refuses to run (see "One-time upgrade refuses to guess whether policy was enforced") writes no marker, and the upgrade runs at the next start that does not refuse. The upgrade MUST NOT delete any existing `casbin_rule` row.
@@ -100,7 +108,7 @@ On the first start of this version against a database, the system MUST run a one
 No device that `POST /verify` denied immediately before the one-time upgrade MUST be allowed by it immediately after. A user is covered on `default` when, after the role and relay import, the user has a `g, user:<id>, role:<name>` binding to a registered role with a managed grant on `default`. Whether policy was enforced before is decided as described in "One-time upgrade decides once whether policy was enforced before".
 
 #### Scenario: Deployment that ran with ENABLE_CASBIN=false
-- **WHEN** the first start of this version runs with `ENABLE_CASBIN=false` still configured
+- **WHEN** the first start of this version runs as disabled, because `UPGRADE_POLICY_MODE=disabled` is set, or because `ENABLE_CASBIN=false` is still configured and no non-revoked device has its registration rule
 - **THEN** every user who is not covered on `default` is bound to `standard`, `standard` is granted `default`, no device is revoked, and every device allowed before is still allowed on `POST /verify`
 
 #### Scenario: Not enforced, user bound only to a role without a grant on default
@@ -113,67 +121,112 @@ No device that `POST /verify` denied immediately before the one-time upgrade MUS
 
 #### Scenario: Enforced, user not covered but with devices
 - **WHEN** policy was enforced before the upgrade and a user is not covered on `default` and has device rows
-- **THEN** the user's bindings are left as they are, the user is reported, the user's devices that have their legacy device rule are still denied with `policy denied`, and the user's devices without it are revoked and denied with `revoked`
+- **THEN** the user's bindings are left as they are, the user is reported, the user's devices that have their registration rule are still denied with `policy denied`, and the user's devices without it are revoked and denied with `revoked`
 
 #### Scenario: Enforced, user bound only to a role without a grant on default
 - **WHEN** policy was enforced before the upgrade, a user's only binding is to a role that has no grant on `default`, and the user has device rows
 - **THEN** the user is left as is and reported, and the user's devices are still denied on `POST /verify`
 
-#### Scenario: Enforced, covered user's device without legacy device rule
-- **WHEN** policy was enforced before the upgrade, a user is covered on `default`, and one of the user's non-revoked devices has no `g, device:<node_key>, user:<owner id>` rule naming that user
+#### Scenario: Enforced, covered user's device without its registration rule
+- **WHEN** policy was enforced before the upgrade, a user is covered on `default`, and one of the user's non-revoked devices does not have its registration rule
 - **THEN** the upgrade sets the device's `revoked_at` and reports it, so `POST /verify` denies it with `revoked`, and an admin can re-enable it with `POST /admin/devices/:id/enable`
 
 #### Scenario: ENABLE_CASBIN removed before the first start
-- **WHEN** a deployment that ran with `ENABLE_CASBIN=false` removes the setting before the first start of this version, and the database has no non-revoked device or holds at least one legacy device rule
+- **WHEN** a deployment that ran with `ENABLE_CASBIN=false` removes the setting and sets no `UPGRADE_POLICY_MODE` before the first start of this version, and the database has no non-revoked device or at least one non-revoked device has its registration rule
 - **THEN** the upgrade treats policy as enforced before the upgrade and applies the enforced rules
 
-#### Scenario: ENABLE_CASBIN removed before the first start on a database without legacy device rules
-- **WHEN** a deployment that ran with `ENABLE_CASBIN=false` removes the setting before the first start of this version, and the database has a non-revoked device and no legacy device rule
+#### Scenario: ENABLE_CASBIN removed before the first start on a database without registration rules
+- **WHEN** a deployment that ran with `ENABLE_CASBIN=false` removes the setting and sets no `UPGRADE_POLICY_MODE` before the first start of this version, and the database has non-revoked devices none of which has its registration rule
 - **THEN** the upgrade refuses to run and startup fails, as described in "One-time upgrade refuses to guess whether policy was enforced"
 
+### Requirement: UPGRADE_POLICY_MODE states the upgrade mode explicitly
+The system MUST accept a one-time setting `UPGRADE_POLICY_MODE` (environment or `.env`) or `upgrade_policy_mode` (`config.yaml`) with value `enforced` or `disabled`, compared case-insensitively after trimming. Any other non-empty value MUST fail configuration loading. Only the one-time upgrade MUST read it, and it MUST have no effect once the upgrade has run.
+
+#### Scenario: Invalid value
+- **WHEN** the service starts with `UPGRADE_POLICY_MODE=yes`
+- **THEN** configuration loading fails with an error naming the setting and its allowed values, and the one-time upgrade does not run
+
+#### Scenario: Case and whitespace
+- **WHEN** the service starts with `UPGRADE_POLICY_MODE=" Disabled "`
+- **THEN** configuration loads and the one-time upgrade reads the mode as `disabled`
+
+#### Scenario: Setting left in place after the upgrade
+- **WHEN** the one-time upgrade has already run and the service restarts with `UPGRADE_POLICY_MODE=disabled`
+- **THEN** startup succeeds, no user is bound and no device is revoked, and `/verify` enforces policy
+
+### Requirement: Only a device's own canonical rule counts as its registration rule
+A non-revoked device MUST count as having its registration rule only when `casbin_rule` holds the canonical row `g, device:<that device's node_key>, user:<that device's owner id>`, with the owner id in its canonical form. A `g, device:..., user:...` row that names another user, a node key with no device row, or a user id in a non-canonical form MUST NOT count as a registration rule for any device.
+
+#### Scenario: A stale rule does not count
+- **WHEN** a database's non-revoked devices have no registration rule, and `casbin_rule` holds `g, device:<node_key of a deleted device>, user:<id>`, `g, device:<node_key of device D>, user:<id of a user other than D's owner>` and `g, device:<node_key of device E>, user:<E's owner id in upper case>`
+- **THEN** no device counts as having its registration rule, the mode is decided as for a database with no registration rule, and when the upgrade runs as enforced devices D and E are revoked
+
 ### Requirement: One-time upgrade decides once whether policy was enforced before
-The upgrade MUST decide its mode once, before it changes anything. An `ENABLE_CASBIN` setting (environment or `.env`) or `enable_casbin` (`config.yaml`) with a boolean value decides it: false means policy was not enforced before, true means it was. When the setting is absent or not a boolean, policy counts as enforced before if the database has no non-revoked device, or if `casbin_rule` holds at least one legacy device rule `g, device:<node_key>, user:<user_id>`.
+The upgrade MUST decide its mode, enforced or disabled, once, before it changes anything. When `UPGRADE_POLICY_MODE` is set it MUST decide the mode, and nothing else is consulted. Otherwise the mode MUST be inferred from the data: enforced when no device is non-revoked or when at least one non-revoked device has its registration rule, and disabled when non-revoked devices exist, none has its registration rule and the legacy `ENABLE_CASBIN` setting is false.
 
-#### Scenario: Explicit false
-- **WHEN** the first start runs with `ENABLE_CASBIN=false` on a database with devices and no legacy device rule
-- **THEN** the upgrade runs as not enforced before, binds every user who is not covered on `default` to `standard`, revokes no device, and writes the marker
+#### Scenario: Explicit disabled
+- **WHEN** the first start runs with `UPGRADE_POLICY_MODE=disabled` and `enable_casbin: true`, on a database where non-revoked devices have their registration rules
+- **THEN** the upgrade runs as disabled, binds every user who is not covered on `default` to `standard`, revokes no device, records `mode_source` `explicit`, and writes the marker
 
-#### Scenario: Explicit true
-- **WHEN** the first start runs with `ENABLE_CASBIN=true` on a database with non-revoked devices and no legacy device rule
-- **THEN** the upgrade runs as enforced before and, because no device has its legacy device rule, revokes every non-revoked device and writes the marker
+#### Scenario: Explicit enforced
+- **WHEN** the first start runs with `UPGRADE_POLICY_MODE=enforced` and `ENABLE_CASBIN=false`, on a database with non-revoked devices none of which has its registration rule
+- **THEN** the upgrade runs as enforced, revokes every non-revoked device, records `mode_source` `explicit`, and writes the marker
 
-#### Scenario: No setting and a legacy device rule exists
-- **WHEN** the first start runs without `ENABLE_CASBIN` on a database with non-revoked devices and at least one legacy device rule
-- **THEN** the upgrade runs as enforced before and writes the marker
+#### Scenario: No non-revoked device
+- **WHEN** the first start runs without `UPGRADE_POLICY_MODE`, with any value or none of the legacy setting, on a database with no non-revoked device
+- **THEN** the upgrade runs as enforced, revokes nothing, records `mode_source` `empty`, and writes the marker
 
-#### Scenario: No setting on an empty database
-- **WHEN** the first start runs without `ENABLE_CASBIN` on a database with no non-revoked device
-- **THEN** the upgrade runs as enforced before, revokes nothing, and writes the marker
+#### Scenario: Registration rules exist and no legacy setting
+- **WHEN** the first start runs without `UPGRADE_POLICY_MODE` or the legacy setting, on a database where at least one non-revoked device has its registration rule
+- **THEN** the upgrade runs as enforced, revokes the non-revoked devices without their registration rule, records `mode_source` `data`, and writes the marker
+
+#### Scenario: No registration rule and the legacy setting is false
+- **WHEN** the first start runs without `UPGRADE_POLICY_MODE` and with `ENABLE_CASBIN=false`, on a database with non-revoked devices none of which has its registration rule
+- **THEN** the upgrade runs as disabled, binds every user who is not covered on `default` to `standard`, revokes no device, records `mode_source` `legacy_setting`, and writes the marker
 
 ### Requirement: One-time upgrade refuses to guess whether policy was enforced
-When `ENABLE_CASBIN` and `enable_casbin` are absent or not a boolean, the database has at least one non-revoked device, and `casbin_rule` holds no legacy device rule, the upgrade MUST change nothing and MUST write no marker, and startup MUST fail with an error that names both choices: `ENABLE_CASBIN=false` to keep the devices allowed, and `ENABLE_CASBIN=true` to confirm they were denied. A later start with a boolean value MUST run the upgrade normally.
+Without `UPGRADE_POLICY_MODE`, the upgrade MUST refuse when at least one non-revoked device has its registration rule and the legacy setting is false, and when non-revoked devices exist, none has its registration rule and the legacy setting is true, absent or not a boolean. A leftover true legacy setting MUST NOT confirm anything. A refusal MUST roll back the upgrade, MUST write no marker and MUST fail startup. A later start with `UPGRADE_POLICY_MODE` MUST run the upgrade normally.
 
-#### Scenario: Refuses on an ambiguous database
-- **WHEN** the first start runs without `ENABLE_CASBIN` on a database with a non-revoked device and no legacy device rule
-- **THEN** startup fails with an error naming `ENABLE_CASBIN=false` and `ENABLE_CASBIN=true`, no binding, device, registry row or audit row is changed or written, and no upgrade marker exists
+#### Scenario: Registration rules exist and the legacy setting is false
+- **WHEN** the first start runs without `UPGRADE_POLICY_MODE` and with `ENABLE_CASBIN=false`, on a database where at least one non-revoked device has its registration rule
+- **THEN** startup fails with an error saying the setting says disabled while the data says enforced, no binding, device or audit row is changed or written, and no upgrade marker exists
 
-#### Scenario: Later start with an explicit value
-- **WHEN** startup was refused on such a database and the service is started again with `ENABLE_CASBIN=false`
-- **THEN** the upgrade runs as not enforced before, startup succeeds, and the marker is written
+#### Scenario: A leftover enable_casbin true does not confirm
+- **WHEN** the first start runs without `UPGRADE_POLICY_MODE` and with `enable_casbin: true` left in `config.yaml` or `ENABLE_CASBIN=true`, on a database with non-revoked devices none of which has its registration rule
+- **THEN** startup fails, no binding, device or audit row is changed or written, and no upgrade marker exists
+
+#### Scenario: No registration rule and no legacy setting
+- **WHEN** the first start runs without `UPGRADE_POLICY_MODE` or the legacy setting, on a database with non-revoked devices none of which has its registration rule
+- **THEN** startup fails, no binding, device or audit row is changed or written, and no upgrade marker exists
+
+#### Scenario: Seeding survives a refusal
+- **WHEN** startup is refused on a database that had no relay `default` or role `standard`
+- **THEN** relay `default` and role `standard` exist afterwards, and nothing else the upgrade would change has changed
+
+#### Scenario: Later start with the setting
+- **WHEN** startup was refused and the service is started again with `UPGRADE_POLICY_MODE=disabled` or `UPGRADE_POLICY_MODE=enforced`
+- **THEN** the upgrade runs in that mode, startup succeeds, `mode_source` is `explicit`, and the marker is written
+
+### Requirement: The upgrade refusal tells the operator how to proceed
+The error of a refused upgrade MUST give the number of non-revoked devices and how many of them have their registration rule, MUST say which contradiction caused the refusal, and MUST name both choices with their consequences: `UPGRADE_POLICY_MODE=disabled` binds every user who is not covered to `standard` and revokes nothing, and `UPGRADE_POLICY_MODE=enforced` revokes every non-revoked device without its registration rule.
+
+#### Scenario: Refusal message
+- **WHEN** the first start is refused on a database with five non-revoked devices, none of which has its registration rule, and `enable_casbin: true`
+- **THEN** the error says there are 5 non-revoked devices and 0 with their registration rule, that the legacy setting does not agree with the data, and names `UPGRADE_POLICY_MODE=disabled` and `UPGRADE_POLICY_MODE=enforced` with their consequences
 
 ### Requirement: One-time upgrade keeps unregistered devices denied on every relay
-When policy was enforced before the upgrade, the upgrade MUST revoke and report every non-revoked device that has no legacy device rule `g, device:<node_key>, user:<owner id>` naming its owner, whoever owns it and whatever the owner's bindings. When policy was not enforced before, the upgrade MUST NOT revoke any device. A device that was never properly registered therefore stays denied on every relay, also after its owner is later bound to a role.
+When policy was enforced before the upgrade, the upgrade MUST revoke and report every non-revoked device that does not have its registration rule, whoever owns it, whatever the owner's bindings and whatever other rules name the device. When policy was not enforced before, the upgrade MUST NOT revoke any device. A device that was never properly registered therefore stays denied on every relay, also after its owner is later bound to a role.
 
-#### Scenario: Enforced, user covered only on another relay, device without legacy device rule
-- **WHEN** policy was enforced before the upgrade, a user's only binding is `g, user:<id>, role:ops`, the only grant of `ops` is `p, role:ops, derp:eu-1, connect`, and one of the user's non-revoked devices has no `g, device:<node_key>, user:<owner id>` rule naming that user
+#### Scenario: Enforced, user covered only on another relay, device without its registration rule
+- **WHEN** policy was enforced before the upgrade, a user's only binding is `g, user:<id>, role:ops`, the only grant of `ops` is `p, role:ops, derp:eu-1, connect`, and one of the user's non-revoked devices does not have its registration rule
 - **THEN** the upgrade sets the device's `revoked_at` and reports it, so `POST /verify/eu-1` denies it with `revoked`; the user's bindings are left as they are and the user is reported as not covered on `default`
 
-#### Scenario: Enforced, user without any grant has devices without legacy device rule revoked
-- **WHEN** policy was enforced before the upgrade, a user has no managed binding to a role with a grant on any relay, and one of the user's non-revoked devices has no legacy device rule
+#### Scenario: Enforced, user without any grant has devices without their registration rule revoked
+- **WHEN** policy was enforced before the upgrade, a user has no managed binding to a role with a grant on any relay, and one of the user's non-revoked devices does not have its registration rule
 - **THEN** the upgrade sets that device's `revoked_at` and reports it
 
 #### Scenario: User left without access is bound after the upgrade
-- **WHEN** after an enforced upgrade an operator binds a user who was left without access to a role granted `default`, and the user has one device with its legacy device rule and one device the upgrade revoked
+- **WHEN** after an enforced upgrade an operator binds a user who was left without access to a role granted `default`, and the user has one device with its registration rule and one device the upgrade revoked
 - **THEN** `POST /verify` allows the first device, and denies the revoked one with `revoked` until it is re-enabled with `POST /admin/devices/:id/enable`
 
 ### Requirement: One-time upgrade imports roles and relays from existing rules
@@ -190,9 +243,13 @@ The upgrade MUST add to the role registry every name that matches the role name 
 ### Requirement: Rules outside the managed shapes grant nothing
 Under the new model, a `casbin_rule` row that is not a `g, user:<uuid>, role:<name>` binding or a `p, role:<name>, derp:<relay>, connect` grant with valid names MUST NOT allow any request at any time. This includes direct `p` rules on `user:` or `device:` subjects, other actions, invalid names, other grouping shapes, and a rule that existed before the upgrade with object `derp:*`. The upgrade MUST leave such rows in place.
 
-#### Scenario: Device allowed only by a direct rule
-- **WHEN** before the upgrade a device was allowed only through `p, device:<node_key>, derp:default, connect`, and the upgrade runs
-- **THEN** the rule stays in the table, `POST /verify` for that device returns `Allow=false` with `DenyReason="policy denied"`, the upgrade warning includes the rule in its count of unmanaged rules, and the device is not listed in the warning
+#### Scenario: Registered device whose owner is allowed only by a direct rule
+- **WHEN** policy was enforced before the upgrade, a non-revoked device has its registration rule, its owner has no managed binding to a role granted `default`, the owner was allowed only through `p, user:<owner id>, derp:default, connect` or another unmanaged rule, and the upgrade runs
+- **THEN** the rule stays in the table, the device is not revoked, `POST /verify` for that device returns `Allow=false` with `DenyReason="policy denied"`, the upgrade warning includes the rule in its count of unmanaged rules, and the device is not listed in the warning
+
+#### Scenario: Device without its registration rule allowed only by a direct rule
+- **WHEN** policy was enforced before the upgrade, a non-revoked device does not have its registration rule, it was allowed only through `p, device:<node_key>, derp:default, connect`, and the upgrade runs
+- **THEN** the rule stays in the table and is counted as unmanaged, and the device is revoked and reported like every device without its registration rule, so `POST /verify` denies it with `revoked`
 
 #### Scenario: Role inheritance between roles
 - **WHEN** a database has `g, role:a, role:b`
@@ -206,11 +263,11 @@ The upgrade MUST log one warning with the ids and count of users it left not cov
 - **THEN** one warning lists both user ids and the device id with their counts, and one admin audit row with actor `system` records the revocation
 
 ### Requirement: One-time upgrade records a summary of what it did
-Besides the warning and the per-device revocation rows, the upgrade MUST log one info-level line and write one admin audit row with actor `system` and action `upgrade.run`, in the upgrade's transaction. Both MUST hold the mode and how it was determined, and the counts of users bound to `standard`, users left without access on `default`, devices revoked, unmanaged rules, and roles and relays imported, and no ids. On a database with no users the upgrade MUST write the marker and no such row.
+Besides its warning, the upgrade MUST log one info line and write one admin audit row with actor `system` and action `upgrade.run`, in its transaction. Both MUST hold the mode, its `mode_source` (`explicit`, `legacy_setting`, `data` or `empty`), the counts of users bound to `standard`, users left without access on `default`, devices revoked, unmanaged rules, and roles and relays imported, and no ids. On a database with no users the upgrade MUST write the marker and no such row.
 
 #### Scenario: Upgrade with users
-- **WHEN** the upgrade runs as enforced, determined by an existing legacy device rule, binds three users to `standard`, leaves one user without access on `default` and revokes two devices
-- **THEN** one info log line and one `upgrade.run` audit row with actor `system` carry the mode, that it was determined by the legacy device rules, and those counts together with the counts of unmanaged rules and of imported roles and relays, and neither contains a user or device id
+- **WHEN** the upgrade runs as enforced because non-revoked devices have their registration rules, binds three users to `standard`, leaves one user without access on `default` and revokes two devices
+- **THEN** one info log line and one `upgrade.run` audit row with actor `system` carry the mode `enforced`, `mode_source` `data`, and those counts together with the counts of unmanaged rules and of imported roles and relays, and neither contains a user or device id
 
 #### Scenario: Fresh database
 - **WHEN** the upgrade runs on a database with no users

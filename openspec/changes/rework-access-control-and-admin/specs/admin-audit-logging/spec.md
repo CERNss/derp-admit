@@ -49,7 +49,7 @@ Each admin audit row MUST carry a summary of the requested change. The summary a
 - **THEN** the audit row's summary has the user id and token metadata, and neither the plaintext token nor its hash
 
 ### Requirement: Startup actions are audited as system
-The system MUST write an admin audit row with actor `system` whenever startup creates or reactivates the `bootstrap` key or changes its hash, and for each device the one-time upgrade revokes. A startup that changes neither MUST NOT write a row.
+The system MUST write an admin audit row with actor `system` whenever startup creates or reactivates the `bootstrap` key or changes its hash, for each device the one-time upgrade revokes, and once with action `upgrade.run` for a one-time upgrade that runs on a database with at least one user. A startup that does none of these MUST NOT write a row.
 
 #### Scenario: Bootstrap key is created at startup
 - **WHEN** the service creates the `bootstrap` key at startup
@@ -58,6 +58,14 @@ The system MUST write an admin audit row with actor `system` whenever startup cr
 #### Scenario: Upgrade revokes a device
 - **WHEN** the one-time upgrade revokes a device
 - **THEN** an admin audit row records actor `system`, a revoke action, target type `device`, the device id and a summary saying the upgrade revoked it
+
+#### Scenario: Upgrade run is audited
+- **WHEN** the one-time upgrade runs on a database with users
+- **THEN** one admin audit row with actor `system` and action `upgrade.run` is written in the upgrade's transaction, and its summary holds the mode and how it was determined, and the counts of users bound to `standard`, users left without access on `default`, devices revoked, unmanaged rules, and roles and relays imported, with no user or device id
+
+#### Scenario: Upgrade on a fresh database
+- **WHEN** the one-time upgrade runs on a database with no users
+- **THEN** the marker is written and no `upgrade.run` audit row is written
 
 #### Scenario: Restart with the same ADMIN_API_KEY
 - **WHEN** the service restarts while the `bootstrap` key is active and `ADMIN_API_KEY` is unchanged

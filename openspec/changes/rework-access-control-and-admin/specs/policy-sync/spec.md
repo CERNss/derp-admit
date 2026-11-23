@@ -79,12 +79,16 @@ When an instance has gone longer than three sync intervals without a successful 
 - **THEN** the instance does not become stale, and `/readyz` keeps returning HTTP `200`
 
 ### Requirement: Policy is provisioned only through the admin API
-The admin API MUST be the only supported way to create or change roles, grants, bindings and relays. Rows changed directly in the database MUST be applied by a running instance no later than its next restart, and are not required to be applied earlier.
+The admin API MUST be the only supported way to create or change roles, grants, bindings and relays; changing them by SQL is unsupported. A running instance picks up such rows at its next policy reload, which happens at restart and whenever an admin change or a new registration moves the policy version, so they take effect at an unpredictable time. Without `ADMIN_API_KEY` there is no supported way to bind users to roles.
 
 #### Scenario: User inserted by SQL
 - **WHEN** a deployment without `ADMIN_API_KEY` inserts a user and an enroll token by SQL and the user registers a device
 - **THEN** the device is denied with `policy denied` until the user is bound to a role through the admin API
 
 #### Scenario: Role binding inserted by SQL
-- **WHEN** an operator inserts a role binding by SQL
+- **WHEN** an operator inserts a role binding by SQL and nothing moves the policy version
 - **THEN** running instances are not required to apply it, and every instance applies it once it restarts
+
+#### Scenario: Role binding inserted by SQL before another change
+- **WHEN** an operator inserts a role binding by SQL and later an admin change or a new device registration moves the policy version
+- **THEN** an instance that reloads its policy for that version change also applies the inserted binding, without a restart

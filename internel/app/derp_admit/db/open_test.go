@@ -18,6 +18,7 @@ import (
 	"derp-admit/internel/app/derp_admit/model"
 
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type bufLogWriter struct {
@@ -64,26 +65,39 @@ func assertDatabaseLogHasNoBoundValues(t *testing.T, dbURL string) {
 
 	const (
 		sentinelNotFound = "SENTINEL_HASH_NOT_FOUND_9f8e7d6c5b4a"
+		sentinelSuccess  = "SENTINEL_HASH_SUCCESS_7c6d5e4f3a2b"
 		sentinelError    = "SENTINEL_HASH_ERROR_1a2b3c4d5e6f"
 	)
 
-	// 1. Unknown-row lookup (ErrRecordNotFound): must NOT log "record not found"
-	//    and must NOT log the bound sentinel.
+	// 1. Unknown-row lookup (ErrRecordNotFound): the default warn-level log must
+	//    be completely empty (no "record not found" and no bound sentinel).
 	var key model.AdminKey
 	err = gormDB.Where("key_hash = ?", sentinelNotFound).First(&key).Error
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("unknown-key lookup err=%v want ErrRecordNotFound", err)
 	}
-	afterNotFound := bufWriter.String()
-	if strings.Contains(strings.ToLower(afterNotFound), "record not found") {
-		t.Fatalf("ErrRecordNotFound was unexpectedly logged: %q", afterNotFound)
-	}
-	if strings.Contains(afterNotFound, sentinelNotFound) {
-		t.Fatalf("not-found sentinel leaked into log: %q", afterNotFound)
+	if afterNotFound := bufWriter.String(); afterNotFound != "" {
+		t.Fatalf("expected empty warn-level log on ErrRecordNotFound, got: %q", afterNotFound)
 	}
 
-	// 2. Statement forced to fail: the failing statement IS logged, while the
-	//    bound sentinel and "record not found" are absent.
+	// 2. Successful statement logged at Info level through the same gorm logger:
+	//    the SQL statement IS logged, while its bound sentinel value is absent.
+	infoDB := gormDB.Session(&gorm.Session{Logger: gormDB.Logger.LogMode(gormlogger.Info)})
+	var count int64
+	if err := infoDB.Model(&model.AdminKey{}).Where("key_hash = ?", sentinelSuccess).Count(&count).Error; err != nil {
+		t.Fatalf("info-level count query: %v", err)
+	}
+	afterSuccess := bufWriter.String()
+	if !strings.Contains(afterSuccess, "admin_keys") {
+		t.Fatalf("expected successful statement to be logged at Info level, got: %q", afterSuccess)
+	}
+	if strings.Contains(afterSuccess, sentinelSuccess) {
+		t.Fatalf("bound sentinel leaked into Info-level SQL log: %q", afterSuccess)
+	}
+	bufWriter.Reset()
+
+	// 3. Statement forced to fail at default Warn level: the failing statement IS
+	//    logged, while the bound sentinel and "record not found" are absent.
 	err = gormDB.Where("nonexistent_column_for_test = ?", sentinelError).First(&key).Error
 	if err == nil {
 		t.Fatalf("expected SQL error for nonexistent column")

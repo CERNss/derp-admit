@@ -207,15 +207,59 @@ func TestLoadFromEnv_EnableCasbinIgnored(t *testing.T) {
 		}
 	})
 
-	t.Run("env maybe overrides yaml false to nil", func(t *testing.T) {
+	t.Run("env maybe does not override yaml false", func(t *testing.T) {
 		aBaseEnv(t, "enable_casbin: false\n", "")
 		t.Setenv("ENABLE_CASBIN", "maybe")
 		cfg, err := LoadFromEnv()
 		if err != nil {
 			t.Fatalf("LoadFromEnv: %v", err)
 		}
-		if cfg.LegacyCasbinEnabled != nil {
-			t.Fatalf("LegacyCasbinEnabled=%v want=nil when env overrides yaml false", *cfg.LegacyCasbinEnabled)
+		if cfg.LegacyCasbinEnabled == nil || *cfg.LegacyCasbinEnabled {
+			t.Fatalf("LegacyCasbinEnabled=%v want=false when env value is unparsable", cfg.LegacyCasbinEnabled)
+		}
+		if len(cfg.Warnings) != 1 {
+			t.Fatalf("Warnings=%v want 1 deduplicated warning", cfg.Warnings)
+		}
+	})
+
+	t.Run("env off does not override yaml false", func(t *testing.T) {
+		aBaseEnv(t, "enable_casbin: false\n", "")
+		t.Setenv("ENABLE_CASBIN", "off")
+		cfg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv: %v", err)
+		}
+		if cfg.LegacyCasbinEnabled == nil || *cfg.LegacyCasbinEnabled {
+			t.Fatalf("LegacyCasbinEnabled=%v want=false when env value is unparsable 'off'", cfg.LegacyCasbinEnabled)
+		}
+		if len(cfg.Warnings) != 1 {
+			t.Fatalf("Warnings=%v want 1 deduplicated warning", cfg.Warnings)
+		}
+	})
+
+	t.Run("env empty does not mask dotenv false", func(t *testing.T) {
+		aBaseEnv(t, "", "ENABLE_CASBIN=false\n")
+		t.Setenv("ENABLE_CASBIN", "")
+		cfg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv: %v", err)
+		}
+		if cfg.LegacyCasbinEnabled == nil || *cfg.LegacyCasbinEnabled {
+			t.Fatalf("LegacyCasbinEnabled=%v want=false when process env is empty", cfg.LegacyCasbinEnabled)
+		}
+		if len(cfg.Warnings) != 1 {
+			t.Fatalf("Warnings=%v want 1 deduplicated warning", cfg.Warnings)
+		}
+	})
+
+	t.Run("dotenv unparsable does not override yaml true", func(t *testing.T) {
+		aBaseEnv(t, "enable_casbin: true\n", "ENABLE_CASBIN=maybe\n")
+		cfg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv: %v", err)
+		}
+		if cfg.LegacyCasbinEnabled == nil || !*cfg.LegacyCasbinEnabled {
+			t.Fatalf("LegacyCasbinEnabled=%v want=true when dotenv value is unparsable", cfg.LegacyCasbinEnabled)
 		}
 		if len(cfg.Warnings) != 1 {
 			t.Fatalf("Warnings=%v want 1 deduplicated warning", cfg.Warnings)
@@ -379,6 +423,115 @@ func TestLoadFromEnv_PolicySyncInterval(t *testing.T) {
 			t.Setenv("POLICY_SYNC_INTERVAL", bad)
 			if _, err := LoadFromEnv(); err == nil {
 				t.Fatalf("expected error for POLICY_SYNC_INTERVAL=%q", bad)
+			}
+		})
+	}
+}
+
+func TestLoadFromEnv_UpgradePolicyMode(t *testing.T) {
+	baseEnv := func(t *testing.T, yamlContent, envContent string) {
+		t.Helper()
+		tempDir := t.TempDir()
+		yamlPath := filepath.Join(tempDir, "config.yaml")
+		envPath := filepath.Join(tempDir, ".env")
+		if yamlContent != "" {
+			if err := os.WriteFile(yamlPath, []byte(yamlContent), 0o644); err != nil {
+				t.Fatalf("write config yaml: %v", err)
+			}
+		} else {
+			yamlPath = filepath.Join(tempDir, "missing.yaml")
+		}
+		if envContent != "" {
+			if err := os.WriteFile(envPath, []byte(envContent), 0o644); err != nil {
+				t.Fatalf("write env file: %v", err)
+			}
+		} else {
+			envPath = filepath.Join(tempDir, "missing.env")
+		}
+		t.Setenv("CONFIG_FILE", yamlPath)
+		t.Setenv("ENV_FILE", envPath)
+		t.Setenv("DATABASE_URL", "sqlite://"+filepath.Join(tempDir, "cfg.db"))
+		t.Setenv("TOKEN_PEPPER", "pepper")
+	}
+
+	t.Run("unset is empty", func(t *testing.T) {
+		baseEnv(t, "", "")
+		cfg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv: %v", err)
+		}
+		if cfg.UpgradePolicyMode != "" {
+			t.Fatalf("UpgradePolicyMode=%q want empty", cfg.UpgradePolicyMode)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"env_enforced", "enforced", "enforced"},
+		{"env_disabled", "disabled", "disabled"},
+		{"env_mixed_case_and_spaces", "  EnFoRcEd \t", "enforced"},
+		{"env_upper_disabled", "DISABLED", "disabled"},
+		{"env_whitespace_only", "   ", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			baseEnv(t, "", "")
+			t.Setenv("UPGRADE_POLICY_MODE", tc.raw)
+			cfg, err := LoadFromEnv()
+			if err != nil {
+				t.Fatalf("LoadFromEnv(%q): %v", tc.raw, err)
+			}
+			if cfg.UpgradePolicyMode != tc.want {
+				t.Fatalf("UpgradePolicyMode=%q want=%q", cfg.UpgradePolicyMode, tc.want)
+			}
+		})
+	}
+
+	t.Run("yaml valid normalized", func(t *testing.T) {
+		baseEnv(t, "upgrade_policy_mode: \"  DiSaBlEd \"\n", "")
+		cfg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv: %v", err)
+		}
+		if cfg.UpgradePolicyMode != "disabled" {
+			t.Fatalf("UpgradePolicyMode=%q want=disabled", cfg.UpgradePolicyMode)
+		}
+	})
+
+	t.Run("dotenv overrides yaml and process env overrides dotenv", func(t *testing.T) {
+		baseEnv(t, "upgrade_policy_mode: enforced\n", "UPGRADE_POLICY_MODE=disabled\n")
+		cfg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv(dotenv): %v", err)
+		}
+		if cfg.UpgradePolicyMode != "disabled" {
+			t.Fatalf("dotenv override: UpgradePolicyMode=%q want=disabled", cfg.UpgradePolicyMode)
+		}
+
+		t.Setenv("UPGRADE_POLICY_MODE", "ENFORCED")
+		cfg, err = LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv(env): %v", err)
+		}
+		if cfg.UpgradePolicyMode != "enforced" {
+			t.Fatalf("process env override: UpgradePolicyMode=%q want=enforced", cfg.UpgradePolicyMode)
+		}
+	})
+
+	for _, bad := range []string{"true", "false", "auto", "off", "enable"} {
+		t.Run("invalid_env_"+bad, func(t *testing.T) {
+			baseEnv(t, "", "")
+			t.Setenv("UPGRADE_POLICY_MODE", bad)
+			if _, err := LoadFromEnv(); err == nil {
+				t.Fatalf("expected error for UPGRADE_POLICY_MODE=%q", bad)
+			}
+		})
+		t.Run("invalid_yaml_"+bad, func(t *testing.T) {
+			baseEnv(t, "upgrade_policy_mode: "+bad+"\n", "")
+			if _, err := LoadFromEnv(); err == nil {
+				t.Fatalf("expected error for yaml upgrade_policy_mode=%q", bad)
 			}
 		})
 	}

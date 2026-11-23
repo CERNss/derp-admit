@@ -175,13 +175,13 @@ func (a *AdminAuditLog) BeforeCreate(_ *gorm.DB) error {
 
 type CasbinRule struct {
 	ID    int64  `gorm:"primaryKey;autoIncrement"`
-	Ptype string `gorm:"column:ptype;size:100;not null;index:idx_casbin_rule_ptype"`
-	V0    string `gorm:"column:v0;size:100;index:idx_casbin_rule_v0"`
-	V1    string `gorm:"column:v1;size:100;index:idx_casbin_rule_v1"`
-	V2    string `gorm:"column:v2;size:100;index:idx_casbin_rule_v2"`
-	V3    string `gorm:"column:v3;size:100"`
-	V4    string `gorm:"column:v4;size:100"`
-	V5    string `gorm:"column:v5;size:100"`
+	Ptype string `gorm:"column:ptype;size:100;not null;index:idx_casbin_rule_ptype;uniqueIndex:idx_casbin_rule,priority:1"`
+	V0    string `gorm:"column:v0;size:100;index:idx_casbin_rule_v0;uniqueIndex:idx_casbin_rule,priority:2"`
+	V1    string `gorm:"column:v1;size:100;index:idx_casbin_rule_v1;uniqueIndex:idx_casbin_rule,priority:3"`
+	V2    string `gorm:"column:v2;size:100;index:idx_casbin_rule_v2;uniqueIndex:idx_casbin_rule,priority:4"`
+	V3    string `gorm:"column:v3;size:100;uniqueIndex:idx_casbin_rule,priority:5"`
+	V4    string `gorm:"column:v4;size:100;uniqueIndex:idx_casbin_rule,priority:6"`
+	V5    string `gorm:"column:v5;size:100;uniqueIndex:idx_casbin_rule,priority:7"`
 }
 
 func (CasbinRule) TableName() string {

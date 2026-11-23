@@ -55,3 +55,5 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_target_ts_id ON admin_audit_logs
 ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS relay TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_audit_logs_relay_ts_id ON audit_logs(relay, ts DESC, id DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_casbin_rule ON casbin_rule (ptype, v0, v1, v2, v3, v4, v5);

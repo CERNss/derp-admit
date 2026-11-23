@@ -736,4 +736,53 @@ func TestCursorRejectedUnderDifferentFilters(t *testing.T) {
 	if st, _ := doAdminRequest(t, router, http.MethodGet, "/admin/audit/verify?limit=1&since="+url.QueryEscape(sinceAPlus8)+"&cursor="+url.QueryEscape(tzCur), testAdminKey, nil); st != http.StatusOK {
 		t.Fatalf("equivalent timezone cursor status=%d want=200", st)
 	}
+
+	// Multi-filter case 1: admin audit cursor issued with action is rejected when targetType is added.
+	t.Run("multi_filter/admin_audit_add_targetType", func(t *testing.T) {
+		st, body := doAdminRequest(t, router, http.MethodGet, "/admin/audit/admin?limit=1&action=user.create", testAdminKey, nil)
+		if st != http.StatusOK {
+			t.Fatalf("issue action cursor status=%d want=200", st)
+		}
+		cur, ok := body["nextCursor"].(string)
+		if !ok || cur == "" {
+			t.Fatalf("expected non-empty nextCursor, got %#v", body["nextCursor"])
+		}
+		if st, _ := doAdminRequest(t, router, http.MethodGet, "/admin/audit/admin?limit=1&action=user.create&cursor="+url.QueryEscape(cur), testAdminKey, nil); st != http.StatusOK {
+			t.Fatalf("same action filter status=%d want=200", st)
+		}
+		if st, _ := doAdminRequest(t, router, http.MethodGet, "/admin/audit/admin?limit=1&action=user.create&targetType=user&cursor="+url.QueryEscape(cur), testAdminKey, nil); st != http.StatusBadRequest {
+			t.Fatalf("adding targetType to action cursor status=%d want=400", st)
+		}
+	})
+
+	// Multi-filter case 2: verify audit cursor issued with relay, allowed, and since is rejected
+	// when any one of the three values changes or any one of the three is dropped.
+	t.Run("multi_filter/verify_audit_relay_allowed_since", func(t *testing.T) {
+		baseQuery := "relay=default&allowed=true&since=" + url.QueryEscape(sinceA)
+		st, body := doAdminRequest(t, router, http.MethodGet, "/admin/audit/verify?limit=1&"+baseQuery, testAdminKey, nil)
+		if st != http.StatusOK {
+			t.Fatalf("issue multi-filter cursor status=%d want=200", st)
+		}
+		cur, ok := body["nextCursor"].(string)
+		if !ok || cur == "" {
+			t.Fatalf("expected non-empty nextCursor, got %#v", body["nextCursor"])
+		}
+		if st, _ := doAdminRequest(t, router, http.MethodGet, "/admin/audit/verify?limit=1&"+baseQuery+"&cursor="+url.QueryEscape(cur), testAdminKey, nil); st != http.StatusOK {
+			t.Fatalf("same three filters status=%d want=200", st)
+		}
+
+		rejectedQueries := map[string]string{
+			"change_relay":   "relay=eu-1&allowed=true&since=" + url.QueryEscape(sinceA),
+			"change_allowed": "relay=default&allowed=false&since=" + url.QueryEscape(sinceA),
+			"change_since":   "relay=default&allowed=true&since=" + url.QueryEscape(sinceB),
+			"drop_relay":     "allowed=true&since=" + url.QueryEscape(sinceA),
+			"drop_allowed":   "relay=default&since=" + url.QueryEscape(sinceA),
+			"drop_since":     "relay=default&allowed=true",
+		}
+		for name, q := range rejectedQueries {
+			if st, _ := doAdminRequest(t, router, http.MethodGet, "/admin/audit/verify?limit=1&"+q+"&cursor="+url.QueryEscape(cur), testAdminKey, nil); st != http.StatusBadRequest {
+				t.Fatalf("%s accepted cursor: status=%d want=400", name, st)
+			}
+		}
+	})
 }

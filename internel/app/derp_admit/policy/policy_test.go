@@ -910,6 +910,56 @@ func TestRuleFunctions(t *testing.T) {
 	}
 }
 
+func TestRuleWritesIdempotentWithUniqueIndex(t *testing.T) {
+	dbConn := openPolicyTestDB(t)
+	seedBuiltins(t, dbConn)
+
+	if err := dbConn.Create(&model.Role{Name: "ops"}).Error; err != nil {
+		t.Fatalf("create role ops: %v", err)
+	}
+	if err := dbConn.Create(&model.Relay{Name: "eu-1"}).Error; err != nil {
+		t.Fatalf("create relay eu-1: %v", err)
+	}
+
+	userID := uuid.New()
+
+	// Write the same user binding twice (including duplicate entries in the slice).
+	for i := 0; i < 2; i++ {
+		if err := dbConn.Transaction(func(tx *gorm.DB) error {
+			return policy.SetUserRoles(tx, userID, []string{"ops", "ops"})
+		}); err != nil {
+			t.Fatalf("SetUserRoles attempt %d: %v", i+1, err)
+		}
+	}
+	var bindCount int64
+	if err := dbConn.Model(&model.CasbinRule{}).
+		Where("ptype = ? AND v0 = ? AND v1 = ?", "g", policy.UserSubject(userID), "role:ops").
+		Count(&bindCount).Error; err != nil {
+		t.Fatalf("count user role binding: %v", err)
+	}
+	if bindCount != 1 {
+		t.Fatalf("user role binding count=%d want=1", bindCount)
+	}
+
+	// Write the same role grant twice (including duplicate entries in the slice).
+	for i := 0; i < 2; i++ {
+		if err := dbConn.Transaction(func(tx *gorm.DB) error {
+			return policy.SetRoleGrants(tx, "ops", []string{"eu-1", "eu-1"})
+		}); err != nil {
+			t.Fatalf("SetRoleGrants attempt %d: %v", i+1, err)
+		}
+	}
+	var grantCount int64
+	if err := dbConn.Model(&model.CasbinRule{}).
+		Where("ptype = ? AND v0 = ? AND v1 = ? AND v2 = ?", "p", "role:ops", "derp:eu-1", "connect").
+		Count(&grantCount).Error; err != nil {
+		t.Fatalf("count role grant: %v", err)
+	}
+	if grantCount != 1 {
+		t.Fatalf("role grant count=%d want=1", grantCount)
+	}
+}
+
 func seedBuiltins(t *testing.T, dbConn *gorm.DB) {
 	t.Helper()
 	if err := dbConn.Transaction(func(tx *gorm.DB) error {

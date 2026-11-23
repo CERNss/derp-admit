@@ -471,15 +471,23 @@ func TestBuildFailsOnAmbiguousUpgrade(t *testing.T) {
 		t.Fatalf("create device: %v", err)
 	}
 
-	// Absent legacy setting on a DB with active devices and zero device rules must fail app.Build.
-	cfg := aTestConfig(dbURL)
-	if _, err := app.Build(context.Background(), gormDB, cfg, zap.NewNop()); err == nil {
-		t.Fatalf("expected app.Build to fail on ambiguous upgrade")
-	} else {
-		msg := err.Error()
-		for _, want := range []string{"1", "0", "ENABLE_CASBIN=false", "ENABLE_CASBIN=true"} {
-			if !strings.Contains(msg, want) {
-				t.Fatalf("error %q missing expected substring %q", msg, want)
+	// Absent setting AND stale LegacyCasbinEnabled=true on a DB with active devices
+	// and zero registration rules must both fail app.Build.
+	legacyTrue := true
+	for name, legacyVal := range map[string]*bool{
+		"absent":     nil,
+		"stale_true": &legacyTrue,
+	} {
+		cfg := aTestConfig(dbURL)
+		cfg.LegacyCasbinEnabled = legacyVal
+		if _, err := app.Build(context.Background(), gormDB, cfg, zap.NewNop()); err == nil {
+			t.Fatalf("%s: expected app.Build to fail on ambiguous upgrade", name)
+		} else {
+			msg := err.Error()
+			for _, want := range []string{"1", "0", "UPGRADE_POLICY_MODE=disabled", "UPGRADE_POLICY_MODE=enforced"} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("%s: error %q missing expected substring %q", name, msg, want)
+				}
 			}
 		}
 	}
@@ -500,16 +508,35 @@ func TestBuildFailsOnAmbiguousUpgrade(t *testing.T) {
 		t.Fatalf("expected device not to be revoked after refused upgrade")
 	}
 
-	// Starting once with explicit ENABLE_CASBIN=false succeeds and keeps the device allowed.
-	disabled := false
-	cfg.LegacyCasbinEnabled = &disabled
+	// Starting once with explicit UPGRADE_POLICY_MODE=disabled succeeds and keeps the device allowed.
+	cfg := aTestConfig(dbURL)
+	cfg.UpgradePolicyMode = "disabled"
 	application, err := app.Build(context.Background(), gormDB, cfg, zap.NewNop())
 	if err != nil {
-		t.Fatalf("app.Build with LegacyCasbinEnabled=false failed: %v", err)
+		t.Fatalf("app.Build with UpgradePolicyMode=disabled failed: %v", err)
 	}
 	t.Cleanup(application.Close)
 
 	if allow, reason := application.Service.Verify(context.Background(), policy.BuiltinRelay, aVerifyBody(t, nk)); !allow {
-		t.Fatalf("verify after explicit false upgrade: allow=false reason=%q want allow=true", reason)
+		t.Fatalf("verify after explicit disabled upgrade: allow=false reason=%q want allow=true", reason)
+	}
+
+	// Restarting with UPGRADE_POLICY_MODE still set logs an info message saying it can be removed.
+	infoCore, infoLogs := observer.New(zapcore.InfoLevel)
+	application2, err := app.Build(context.Background(), gormDB, cfg, zap.New(infoCore))
+	if err != nil {
+		t.Fatalf("second app.Build with UpgradePolicyMode still set failed: %v", err)
+	}
+	t.Cleanup(application2.Close)
+
+	foundRemovableInfo := false
+	for _, entry := range infoLogs.FilterLevelExact(zapcore.InfoLevel).All() {
+		if strings.Contains(entry.Message, "UPGRADE_POLICY_MODE") && strings.Contains(strings.ToLower(entry.Message), "remove") {
+			foundRemovableInfo = true
+			break
+		}
+	}
+	if !foundRemovableInfo {
+		t.Fatalf("expected info log advising removal of UPGRADE_POLICY_MODE after upgrade already ran, got %v", infoLogs.All())
 	}
 }

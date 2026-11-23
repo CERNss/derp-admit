@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,6 +75,7 @@ var expectedNewSchema = map[string][]columnSpec{
 
 var expectedIndexes = map[string][]string{
 	"casbin_rule": {
+		"idx_casbin_rule",
 		"idx_casbin_rule_ptype",
 		"idx_casbin_rule_v0",
 		"idx_casbin_rule_v1",
@@ -219,6 +221,45 @@ func assertSchemaSQLite(t *testing.T, conn *gorm.DB) {
 			}
 		}
 	}
+
+	// Verify idx_casbin_rule is unique over (ptype, v0, v1, v2, v3, v4, v5).
+	type sqliteIdxList struct {
+		Name   string `gorm:"column:name"`
+		Unique int    `gorm:"column:unique"`
+	}
+	var idxRows []sqliteIdxList
+	if err := conn.Raw(`PRAGMA index_list("casbin_rule")`).Scan(&idxRows).Error; err != nil {
+		t.Fatalf("pragma index_list(casbin_rule): %v", err)
+	}
+	foundUnique := false
+	for _, r := range idxRows {
+		if r.Name == "idx_casbin_rule" {
+			if r.Unique != 1 {
+				t.Fatalf("sqlite idx_casbin_rule unique=%d want=1", r.Unique)
+			}
+			foundUnique = true
+		}
+	}
+	if !foundUnique {
+		t.Fatalf("sqlite idx_casbin_rule missing from index_list")
+	}
+	type sqliteIdxCol struct {
+		Seqno int    `gorm:"column:seqno"`
+		Name  string `gorm:"column:name"`
+	}
+	var idxCols []sqliteIdxCol
+	if err := conn.Raw(`PRAGMA index_info("idx_casbin_rule")`).Scan(&idxCols).Error; err != nil {
+		t.Fatalf("pragma index_info(idx_casbin_rule): %v", err)
+	}
+	wantCols := []string{"ptype", "v0", "v1", "v2", "v3", "v4", "v5"}
+	if len(idxCols) != len(wantCols) {
+		t.Fatalf("sqlite idx_casbin_rule cols=%+v want=%v", idxCols, wantCols)
+	}
+	for i, want := range wantCols {
+		if idxCols[i].Name != want {
+			t.Fatalf("sqlite idx_casbin_rule col[%d]=%q want=%q", i, idxCols[i].Name, want)
+		}
+	}
 }
 
 func assertSchemaPostgres(t *testing.T, conn *gorm.DB) {
@@ -275,6 +316,16 @@ func assertSchemaPostgres(t *testing.T, conn *gorm.DB) {
 				t.Fatalf("postgres index %s on %s does not exist", idx, table)
 			}
 		}
+	}
+
+	var idxDef string
+	if err := conn.Raw(
+		`SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename = 'casbin_rule' AND indexname = 'idx_casbin_rule'`,
+	).Scan(&idxDef).Error; err != nil {
+		t.Fatalf("query postgres idx_casbin_rule def: %v", err)
+	}
+	if idxDef == "" || !strings.Contains(idxDef, "UNIQUE INDEX") || !strings.Contains(idxDef, "(ptype, v0, v1, v2, v3, v4, v5)") {
+		t.Fatalf("postgres idx_casbin_rule def=%q want UNIQUE INDEX over (ptype, v0, v1, v2, v3, v4, v5)", idxDef)
 	}
 }
 
@@ -414,6 +465,21 @@ func assertSchemaConstraints(t *testing.T, conn *gorm.DB) {
 		Allowed: true,
 	}).Error; err != nil {
 		t.Fatalf("create audit_log with relay: %v", err)
+	}
+
+	// casbin_rule: duplicate (ptype, v0..v5) rejected by idx_casbin_rule unique index.
+	dupRule := model.CasbinRule{Ptype: "p", V0: "role:ops", V1: "derp:eu-1", V2: "connect"}
+	if err := tx.Create(&dupRule).Error; err != nil {
+		t.Fatalf("create first casbin_rule: %v", err)
+	}
+	if err := tx.SavePoint("sp_casbin_dup").Error; err != nil {
+		t.Fatalf("savepoint: %v", err)
+	}
+	if err := tx.Create(&model.CasbinRule{Ptype: "p", V0: "role:ops", V1: "derp:eu-1", V2: "connect"}).Error; err == nil {
+		t.Fatalf("expected unique constraint error inserting duplicate casbin_rule row")
+	}
+	if err := tx.RollbackTo("sp_casbin_dup").Error; err != nil {
+		t.Fatalf("rollback savepoint: %v", err)
 	}
 }
 

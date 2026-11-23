@@ -37,23 +37,38 @@ type upgradeRunSummary struct {
 	RelaysImported        int    `json:"relays_imported"`
 }
 
+// UpgradeOptions configures how the one-time policy data upgrade decides
+// whether the pre-upgrade deployment ran with policy enforced or disabled.
+type UpgradeOptions struct {
+	// ExplicitMode is the normalized UPGRADE_POLICY_MODE / upgrade_policy_mode
+	// setting: "", "enforced", or "disabled". When non-empty it takes precedence
+	// over all inference and legacy hints.
+	ExplicitMode string
+	// LegacyCasbinEnabled carries the three-state legacy ENABLE_CASBIN /
+	// enable_casbin setting: nil when absent or unparsable, *true, or *false.
+	// Used only as a hint that must agree with the database contents.
+	LegacyCasbinEnabled *bool
+}
+
 // RunUpgrade executes the one-time policy data upgrade in a single database
 // transaction on both SQLite and PostgreSQL. It is guarded by
 // policy_state.upgraded_at so it executes at most once per database.
 //
-// legacyCasbinEnabled carries the three-state legacy ENABLE_CASBIN /
-// enable_casbin setting: nil when absent or unparsable, *true when explicitly
-// enabled (enforced), *false when explicitly disabled.
-//
 // The upgrade never deletes any casbin_rule row and never loosens access
 // compared to the previous model on relay "default" (design A7, R1, R2, R4, S1, S2).
-func RunUpgrade(ctx context.Context, db *gorm.DB, legacyCasbinEnabled *bool, logger *zap.Logger) error {
+func RunUpgrade(ctx context.Context, db *gorm.DB, opts UpgradeOptions, logger *zap.Logger) error {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 
+	explicitMode := strings.ToLower(strings.TrimSpace(opts.ExplicitMode))
+	if explicitMode != "" && explicitMode != "enforced" && explicitMode != "disabled" {
+		return fmt.Errorf("invalid UPGRADE_POLICY_MODE %q: must be \"enforced\" or \"disabled\"", opts.ExplicitMode)
+	}
+
 	var (
 		ran                bool
+		alreadyUpgraded    bool
 		wroteRunAudit      bool
 		runSummary         upgradeRunSummary
 		uncoveredUserIDs   []string
@@ -67,6 +82,7 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, legacyCasbinEnabled *bool, log
 			return err
 		}
 		if state.UpgradedAt != nil {
+			alreadyUpgraded = true
 			return nil
 		}
 
@@ -93,38 +109,6 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, legacyCasbinEnabled *bool, log
 		var devices []model.Device
 		if err := tx.Order("id asc").Find(&devices).Error; err != nil {
 			return fmt.Errorf("load devices for upgrade: %w", err)
-		}
-
-		activeDeviceCount := 0
-		for _, d := range devices {
-			if d.RevokedAt == nil {
-				activeDeviceCount++
-			}
-		}
-
-		deviceRuleCount := 0
-		for _, rule := range rules {
-			if isAnyDeviceUserRule(rule) {
-				deviceRuleCount++
-			}
-		}
-
-		if activeDeviceCount > 0 && deviceRuleCount == 0 && legacyCasbinEnabled == nil {
-			return fmt.Errorf(
-				"ambiguous one-time policy upgrade: found %d non-revoked device(s) and %d device registration rule(s) (g, device:<...>, user:<...>), which looks like this database ran with policy disabled; start once with ENABLE_CASBIN=false (devices stay allowed) or ENABLE_CASBIN=true (confirm that policy was enforced and these devices were denied)",
-				activeDeviceCount, deviceRuleCount,
-			)
-		}
-
-		casbinWasDisabled := false
-		modeSource := "default"
-		if legacyCasbinEnabled != nil {
-			casbinWasDisabled = !*legacyCasbinEnabled
-			modeSource = "setting"
-		}
-		upgradeMode := "enforced"
-		if casbinWasDisabled {
-			upgradeMode = "disabled"
 		}
 
 		importRoles := make(map[string]struct{})
@@ -175,6 +159,62 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, legacyCasbinEnabled *bool, log
 			default:
 				unmanagedCount++
 			}
+		}
+
+		activeDeviceCount := 0
+		registeredActiveDeviceCount := 0
+		for _, d := range devices {
+			if d.RevokedAt != nil {
+				continue
+			}
+			activeDeviceCount++
+			if _, ok := legacyDeviceRules[[2]string{d.NodeKey, d.UserID.String()}]; ok {
+				registeredActiveDeviceCount++
+			}
+		}
+
+		var (
+			casbinWasDisabled bool
+			modeSource        string
+		)
+		switch explicitMode {
+		case "enforced":
+			casbinWasDisabled = false
+			modeSource = "explicit"
+		case "disabled":
+			casbinWasDisabled = true
+			modeSource = "explicit"
+		default:
+			legacyIsFalse := opts.LegacyCasbinEnabled != nil && !*opts.LegacyCasbinEnabled
+			switch {
+			case activeDeviceCount == 0:
+				casbinWasDisabled = false
+				modeSource = "empty"
+			case registeredActiveDeviceCount > 0:
+				if legacyIsFalse {
+					return fmt.Errorf(
+						"ambiguous one-time policy upgrade: found %d non-revoked device(s) and %d device(s) with their registration rule (data shows policy was enforced), contradicting legacy ENABLE_CASBIN/enable_casbin=false; start once with UPGRADE_POLICY_MODE=disabled (every user is bound to standard and nothing is revoked; use only if the previous version really ran with policy disabled) or UPGRADE_POLICY_MODE=enforced (users that had no access keep none and every device without its registration rule is revoked)",
+						activeDeviceCount, registeredActiveDeviceCount,
+					)
+				}
+				casbinWasDisabled = false
+				modeSource = "data"
+			default:
+				if legacyIsFalse {
+					casbinWasDisabled = true
+					modeSource = "legacy_setting"
+				} else {
+					return fmt.Errorf(
+						"ambiguous one-time policy upgrade: found %d non-revoked device(s) and %d device(s) with their registration rule (database looks like it ran with policy disabled, while legacy ENABLE_CASBIN/enable_casbin is not false); start once with UPGRADE_POLICY_MODE=disabled (every user is bound to standard and nothing is revoked; use only if the previous version really ran with policy disabled) or UPGRADE_POLICY_MODE=enforced (users that had no access keep none and every device without its registration rule is revoked)",
+						activeDeviceCount, registeredActiveDeviceCount,
+					)
+				}
+			}
+		}
+
+		upgradeMode := "enforced"
+		if casbinWasDisabled {
+			upgradeMode = "disabled"
 		}
 
 		knownRoles := make(map[string]model.Role, len(existingRoles)+len(importRoles))
@@ -325,6 +365,15 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, legacyCasbinEnabled *bool, log
 		return err
 	}
 
+	if alreadyUpgraded {
+		if explicitMode != "" {
+			logger.Info("UPGRADE_POLICY_MODE is set, but the one-time policy upgrade has already run; you can remove UPGRADE_POLICY_MODE / upgrade_policy_mode from configuration",
+				zap.String("upgrade_policy_mode", explicitMode),
+			)
+		}
+		return nil
+	}
+
 	if ran && wroteRunAudit {
 		logger.Info("one-time policy upgrade completed",
 			zap.String("mode", runSummary.Mode),
@@ -415,15 +464,6 @@ func parseManagedGrantRule(rule model.CasbinRule) (string, string, bool) {
 	return roleName, relayName, true
 }
 
-func isAnyDeviceUserRule(rule model.CasbinRule) bool {
-	if rule.Ptype != "g" || rule.V2 != "" || rule.V3 != "" || rule.V4 != "" || rule.V5 != "" {
-		return false
-	}
-	nodeKey, okDev := strings.CutPrefix(rule.V0, devicePrefix)
-	userVal, okUser := strings.CutPrefix(rule.V1, userPrefix)
-	return okDev && nodeKey != "" && okUser && userVal != ""
-}
-
 func parseLegacyDeviceRule(rule model.CasbinRule) (string, uuid.UUID, bool) {
 	if rule.Ptype != "g" || rule.V2 != "" || rule.V3 != "" || rule.V4 != "" || rule.V5 != "" {
 		return "", uuid.Nil, false
@@ -467,7 +507,7 @@ func bindUserToStandardWithoutDeleting(
 	if _, ok := knownRoles[BuiltinRole]; !ok {
 		return false, fmt.Errorf("%w: %s", ErrUnknownRole, BuiltinRole)
 	}
-	if err := tx.Create(&model.CasbinRule{
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&model.CasbinRule{
 		Ptype: "g",
 		V0:    UserSubject(userID),
 		V1:    roleSubject(BuiltinRole),

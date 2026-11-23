@@ -58,7 +58,7 @@ func SeedBuiltins(tx *gorm.DB) (created bool, err error) {
 			return false, fmt.Errorf("check standard default grant: %w", err)
 		}
 		if existing == 0 {
-			if err := tx.Create(&model.CasbinRule{
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&model.CasbinRule{
 				Ptype: "p",
 				V0:    roleSubject(BuiltinRole),
 				V1:    relayObject(BuiltinRelay),

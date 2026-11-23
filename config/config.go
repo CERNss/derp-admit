@@ -25,6 +25,7 @@ type Config struct {
 	AdminAPIKey          string
 	LogLevel             string
 	LegacyCasbinEnabled  *bool
+	UpgradePolicyMode    string
 	Warnings             []string
 	OTELEnabled          bool
 	OTELServiceName      string
@@ -49,6 +50,7 @@ type fileConfig struct {
 	TokenPepper          *string  `yaml:"token_pepper"`
 	AdminAPIKey          *string  `yaml:"admin_api_key"`
 	LogLevel             *string  `yaml:"log_level"`
+	UpgradePolicyMode    *string  `yaml:"upgrade_policy_mode"`
 	OTELEnabled          *bool    `yaml:"otel_enabled"`
 	OTELServiceName      *string  `yaml:"otel_service_name"`
 	OTLPEndpoint         *string  `yaml:"otel_exporter_otlp_endpoint"`
@@ -97,6 +99,8 @@ func LoadFromEnv() (Config, error) {
 	if legacyCasbinSeen {
 		cfg.Warnings = append(cfg.Warnings, legacyEnableCasbinWarning)
 	}
+
+	cfg.UpgradePolicyMode = strings.ToLower(strings.TrimSpace(cfg.UpgradePolicyMode))
 
 	if err := validate(cfg); err != nil {
 		return Config{}, err
@@ -157,12 +161,13 @@ func mergeFromYAMLFile(cfg *Config, path string) (bool, error) {
 	if fc.LogLevel != nil {
 		cfg.LogLevel = *fc.LogLevel
 	}
+	if fc.UpgradePolicyMode != nil {
+		cfg.UpgradePolicyMode = strings.TrimSpace(*fc.UpgradePolicyMode)
+	}
 	if node, present := extractYAMLKey(content, "enable_casbin"); present {
 		legacyCasbinSeen = true
 		if parsed, ok := parseYAMLBoolNode(node); ok {
 			cfg.LegacyCasbinEnabled = &parsed
-		} else {
-			cfg.LegacyCasbinEnabled = nil
 		}
 	}
 	if fc.OTELEnabled != nil {
@@ -319,12 +324,26 @@ func mergeFromEnv(cfg *Config, fileVars map[string]string) (bool, error) {
 	if v := getEnvOrDefault("LOG_LEVEL", fileVars, ""); v != "" {
 		cfg.LogLevel = v
 	}
-	if v, ok := getEnv("ENABLE_CASBIN", fileVars); ok {
+	if v, ok := fileVars["ENABLE_CASBIN"]; ok {
 		legacyCasbinSeen = true
 		if parsed, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
 			cfg.LegacyCasbinEnabled = &parsed
-		} else {
-			cfg.LegacyCasbinEnabled = nil
+		}
+	}
+	if v, ok := os.LookupEnv("ENABLE_CASBIN"); ok {
+		legacyCasbinSeen = true
+		if parsed, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			cfg.LegacyCasbinEnabled = &parsed
+		}
+	}
+	if v, ok := fileVars["UPGRADE_POLICY_MODE"]; ok {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			cfg.UpgradePolicyMode = trimmed
+		}
+	}
+	if v, ok := os.LookupEnv("UPGRADE_POLICY_MODE"); ok {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			cfg.UpgradePolicyMode = trimmed
 		}
 	}
 	if v, ok := getEnv("OTEL_ENABLED", fileVars); ok {
@@ -437,6 +456,11 @@ func validate(cfg Config) error {
 	}
 	if cfg.AdminAPIKey != "" && len(cfg.AdminAPIKey) < 16 {
 		return fmt.Errorf("ADMIN_API_KEY must be at least 16 characters when set")
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.UpgradePolicyMode)) {
+	case "", "enforced", "disabled":
+	default:
+		return fmt.Errorf("invalid UPGRADE_POLICY_MODE %q: must be \"enforced\" or \"disabled\"", cfg.UpgradePolicyMode)
 	}
 	if cfg.VerifyRateLimitRPS <= 0 {
 		return fmt.Errorf("VERIFY_RATE_LIMIT_RPS must be > 0")

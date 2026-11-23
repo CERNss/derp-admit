@@ -367,11 +367,14 @@ func DeleteRoleRules(tx *gorm.DB, role string) (bindings int64, err error) {
 	if err := tx.Where("ptype = ? AND v0 = ?", "p", sub).Delete(&model.CasbinRule{}).Error; err != nil {
 		return 0, fmt.Errorf("delete role grants for %s: %w", role, err)
 	}
-	res := tx.Where("ptype = ? AND v0 LIKE ? AND v1 = ?", "g", userPrefix+"%", sub).Delete(&model.CasbinRule{})
-	if res.Error != nil {
-		return 0, fmt.Errorf("delete user bindings for role %s: %w", role, res.Error)
+	userRes := tx.Where("ptype = ? AND v0 LIKE ? AND v1 = ?", "g", userPrefix+"%", sub).Delete(&model.CasbinRule{})
+	if userRes.Error != nil {
+		return 0, fmt.Errorf("delete user bindings for role %s: %w", role, userRes.Error)
 	}
-	return res.RowsAffected, nil
+	if err := tx.Where("ptype = ? AND v1 = ?", "g", sub).Delete(&model.CasbinRule{}).Error; err != nil {
+		return 0, fmt.Errorf("delete remaining grouping rules for role %s: %w", role, err)
+	}
+	return userRes.RowsAffected, nil
 }
 
 // DeleteRelayGrants locks the relay row FOR UPDATE on PostgreSQL (when present)

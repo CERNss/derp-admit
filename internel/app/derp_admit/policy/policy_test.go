@@ -795,6 +795,15 @@ func TestRuleFunctions(t *testing.T) {
 	}); !errors.Is(err, policy.ErrBuiltin) {
 		t.Fatalf("DeleteRoleRules builtin err=%v want ErrBuiltin", err)
 	}
+	// Seed non-user grouping rows naming role:ops; DeleteRoleRules must delete
+	// them too while counting only the 2 user bindings in its return value.
+	if err := dbConn.Create(&[]model.CasbinRule{
+		{Ptype: "g", V0: "role:eng", V1: "role:ops"},
+		{Ptype: "g", V0: "device:nodekey:stale-dev", V1: "role:ops"},
+	}).Error; err != nil {
+		t.Fatalf("seed non-user grouping rules for ops: %v", err)
+	}
+
 	var removed int64
 	if err := dbConn.Transaction(func(tx *gorm.DB) error {
 		var err error
@@ -805,6 +814,13 @@ func TestRuleFunctions(t *testing.T) {
 	}
 	if removed != 2 {
 		t.Fatalf("DeleteRoleRules removed=%d want=2", removed)
+	}
+	var leftoverOpsGroupings int64
+	if err := dbConn.Model(&model.CasbinRule{}).Where("ptype = ? AND v1 = ?", "g", "role:ops").Count(&leftoverOpsGroupings).Error; err != nil {
+		t.Fatalf("count leftover ops grouping rules: %v", err)
+	}
+	if leftoverOpsGroupings != 0 {
+		t.Fatalf("leftover g,*,role:ops rows=%d want=0", leftoverOpsGroupings)
 	}
 	grants, err = policy.RoleGrants(context.Background(), dbConn, []string{"ops", "eng"})
 	if err != nil {

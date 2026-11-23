@@ -1117,3 +1117,43 @@ func TestBootstrapCollidesWithExistingViewerKeyAndNoBootstrap(t *testing.T) {
 		t.Fatalf("viewer key GET /admin/keys status=%d want=%d", status, http.StatusForbidden)
 	}
 }
+
+func TestConfiguredKeyWithoutStoredRowIsRejected(t *testing.T) {
+	dbURL, gormDB := cOpenTempDB(t, "configured-key-no-fallback.db")
+
+	// Start with ADMIN_API_KEY, create a second admin key, and revoke bootstrap.
+	app1 := cBuildApp(t, dbURL, gormDB, testAdminKey, nil)
+	_, secondAdminPlain := cCreateKey(t, app1.Router, testAdminKey, "second-admin", model.AdminTierAdmin, nil)
+
+	var boot model.AdminKey
+	if err := gormDB.Where("name = ?", service.BootstrapKeyName).First(&boot).Error; err != nil {
+		t.Fatalf("load bootstrap key: %v", err)
+	}
+	if status, _ := doAdminRequest(t, app1.Router, http.MethodPost, "/admin/keys/"+boot.ID.String()+"/revoke", secondAdminPlain, nil); status != http.StatusOK {
+		t.Fatalf("revoke bootstrap status=%d want=%d", status, http.StatusOK)
+	}
+
+	// Restart on the same database with ADMIN_API_KEY still set: startup takes
+	// the "grants nothing" branch, and there is no static fallback to ADMIN_API_KEY.
+	app2 := cBuildApp(t, dbURL, gormDB, testAdminKey, nil)
+
+	// Configured value must be rejected with 401 on read and write routes.
+	if status, _ := doAdminRequest(t, app2.Router, http.MethodGet, "/admin/users", testAdminKey, nil); status != http.StatusUnauthorized {
+		t.Fatalf("configured ADMIN_API_KEY GET /admin/users status=%d want=%d", status, http.StatusUnauthorized)
+	}
+	if status, _ := doAdminRequest(t, app2.Router, http.MethodPost, "/admin/users", testAdminKey, map[string]any{
+		"username": "should-be-rejected",
+	}); status != http.StatusUnauthorized {
+		t.Fatalf("configured ADMIN_API_KEY POST /admin/users status=%d want=%d", status, http.StatusUnauthorized)
+	}
+
+	// Second admin key still works on both read and write routes.
+	if status, _ := doAdminRequest(t, app2.Router, http.MethodGet, "/admin/users", secondAdminPlain, nil); status != http.StatusOK {
+		t.Fatalf("second admin GET /admin/users status=%d want=%d", status, http.StatusOK)
+	}
+	if status, _ := doAdminRequest(t, app2.Router, http.MethodPost, "/admin/users", secondAdminPlain, map[string]any{
+		"username": "created-by-second-admin",
+	}); status != http.StatusCreated {
+		t.Fatalf("second admin POST /admin/users status=%d want=%d", status, http.StatusCreated)
+	}
+}

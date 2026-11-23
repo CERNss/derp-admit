@@ -543,114 +543,197 @@ func TestAuditQueryTiers(t *testing.T) {
 func TestCursorRejectedUnderDifferentFilters(t *testing.T) {
 	router, gormDB := newTestRouter(t, adminKeyOpt)
 
-	// 1. GET /admin/devices?userId=A cursor rejected for userId=B and for unfiltered.
+	// Seed fixtures so every filter returns >= 2 rows (guaranteeing a non-empty nextCursor at limit=1).
 	uA := createUser(t, gormDB, "cursor-filter-a")
 	uB := createUser(t, gormDB, "cursor-filter-b")
-	for i := 0; i < 3; i++ {
-		createDevice(t, gormDB, uA.ID, newNodeKey(t), fmt.Sprintf("a-%d", i), nil)
-		createDevice(t, gormDB, uB.ID, newNodeKey(t), fmt.Sprintf("b-%d", i), nil)
-	}
+	devA1 := createDevice(t, gormDB, uA.ID, newNodeKey(t), "a-1", nil)
+	_ = createDevice(t, gormDB, uA.ID, newNodeKey(t), "a-2", nil)
+	devB1 := createDevice(t, gormDB, uB.ID, newNodeKey(t), "b-1", nil)
+	_ = createDevice(t, gormDB, uB.ID, newNodeKey(t), "b-2", nil)
 
-	status, body := doAdminRequest(t, router, http.MethodGet, "/admin/devices?limit=1&userId="+uA.ID.String(), testAdminKey, nil)
-	if status != http.StatusOK {
-		t.Fatalf("GET /admin/devices?userId=A status=%d want=200", status)
-	}
-	devCurA, ok := body["nextCursor"].(string)
-	if !ok || devCurA == "" {
-		t.Fatalf("expected non-empty nextCursor for userId=A, got %#v", body["nextCursor"])
-	}
-
-	// Same filter works.
-	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/devices?limit=1&userId="+uA.ID.String()+"&cursor="+url.QueryEscape(devCurA), testAdminKey, nil); status != http.StatusOK {
-		t.Fatalf("same userId cursor status=%d want=200", status)
-	}
-	// Different userId rejected with 400.
-	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/devices?limit=1&userId="+uB.ID.String()+"&cursor="+url.QueryEscape(devCurA), testAdminKey, nil); status != http.StatusBadRequest {
-		t.Fatalf("different userId cursor status=%d want=400", status)
-	}
-	// Unfiltered rejected with 400.
-	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/devices?limit=1&cursor="+url.QueryEscape(devCurA), testAdminKey, nil); status != http.StatusBadRequest {
-		t.Fatalf("filtered cursor on unfiltered /admin/devices status=%d want=400", status)
-	}
-	// Unfiltered cursor rejected when userId is added.
-	status, body = doAdminRequest(t, router, http.MethodGet, "/admin/devices?limit=1", testAdminKey, nil)
-	if status != http.StatusOK {
-		t.Fatalf("unfiltered /admin/devices status=%d want=200", status)
-	}
-	devCurAll := body["nextCursor"].(string)
-	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/devices?limit=1&userId="+uA.ID.String()+"&cursor="+url.QueryEscape(devCurAll), testAdminKey, nil); status != http.StatusBadRequest {
-		t.Fatalf("unfiltered cursor on filtered /admin/devices status=%d want=400", status)
-	}
-
-	// 2. GET /admin/audit/admin cursor bound to filters.
 	base := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	sinceA := base.Format(time.RFC3339)
+	sinceAPlus8 := base.In(time.FixedZone("+08", 8*3600)).Format(time.RFC3339)
+	sinceB := base.Add(time.Second).Format(time.RFC3339)
+	untilA := base.Add(10 * time.Minute).Format(time.RFC3339)
+	untilB := base.Add(9 * time.Minute).Format(time.RFC3339)
+
+	actorA := uuid.New()
+	actorB := uuid.New()
 	statusOK := http.StatusOK
 	for i := 0; i < 3; i++ {
 		if err := gormDB.Create(&model.AdminAuditLog{
-			TS:         base.Add(time.Duration(i) * time.Minute),
-			ActorName:  "op",
+			TS:         base.Add(time.Duration(i+1) * time.Minute),
+			ActorKeyID: &actorA,
+			ActorName:  "op-a",
 			ActorTier:  model.AdminTierOperator,
 			Action:     "user.create",
 			TargetType: "user",
-			TargetID:   fmt.Sprintf("u-%d", i),
+			TargetID:   "target-a",
 			Outcome:    service.AuditOutcomeSuccess,
 			HTTPStatus: &statusOK,
 			Summary:    "{}",
 		}).Error; err != nil {
-			t.Fatalf("seed admin audit: %v", err)
+			t.Fatalf("seed admin audit %d: %v", i, err)
 		}
 	}
 
-	status, body = doAdminRequest(t, router, http.MethodGet, "/admin/audit/admin?limit=1&action=user.create", testAdminKey, nil)
-	if status != http.StatusOK {
-		t.Fatalf("GET /admin/audit/admin?action=user.create status=%d want=200", status)
-	}
-	adminCur := body["nextCursor"].(string)
-	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/audit/admin?limit=1&action=user.create&cursor="+url.QueryEscape(adminCur), testAdminKey, nil); status != http.StatusOK {
-		t.Fatalf("same admin audit filter status=%d want=200", status)
-	}
-	for _, mismatched := range []string{
-		"/admin/audit/admin?limit=1&action=device.revoke&cursor=" + url.QueryEscape(adminCur),
-		"/admin/audit/admin?limit=1&cursor=" + url.QueryEscape(adminCur),
-		"/admin/audit/admin?limit=1&action=user.create&targetType=user&cursor=" + url.QueryEscape(adminCur),
-	} {
-		if status, _ := doAdminRequest(t, router, http.MethodGet, mismatched, testAdminKey, nil); status != http.StatusBadRequest {
-			t.Fatalf("mismatched admin audit filter %s status=%d want=400", mismatched, status)
-		}
-	}
-
-	// 3. GET /admin/audit/verify cursor bound to filters (and normalizes equivalent timestamps).
 	relayDefault := "default"
+	nkA := devA1.NodeKey
+	nkB := devB1.NodeKey
 	for i := 0; i < 3; i++ {
 		if err := gormDB.Create(&model.AuditLog{
-			NodeKey: fmt.Sprintf("nodekey:%064d", i),
-			Relay:   &relayDefault,
-			Allowed: true,
-			TS:      base.Add(time.Duration(i) * time.Minute),
+			DeviceID: &devA1.ID,
+			NodeKey:  nkA,
+			Relay:    &relayDefault,
+			Allowed:  true,
+			TS:       base.Add(time.Duration(i+1) * time.Minute),
 		}).Error; err != nil {
-			t.Fatalf("seed verify audit: %v", err)
+			t.Fatalf("seed verify audit %d: %v", i, err)
 		}
 	}
 
-	sinceUTC := base.Format(time.RFC3339)
-	sincePlus8 := base.In(time.FixedZone("+08", 8*3600)).Format(time.RFC3339)
-	status, body = doAdminRequest(t, router, http.MethodGet, "/admin/audit/verify?limit=1&relay=default&allowed=true&since="+url.QueryEscape(sinceUTC), testAdminKey, nil)
-	if status != http.StatusOK {
-		t.Fatalf("GET /admin/audit/verify filtered status=%d want=200", status)
+	type filterCase struct {
+		name      string
+		path      string
+		filterA   string
+		filterAlt string // different value for the same filter
 	}
-	verifyCur := body["nextCursor"].(string)
+
+	cases := []filterCase{
+		// Devices: userId
+		{
+			name:      "devices/userId",
+			path:      "/admin/devices",
+			filterA:   "userId=" + uA.ID.String(),
+			filterAlt: "userId=" + uB.ID.String(),
+		},
+
+		// Admin audit: actorKeyId, action, targetType, targetId, since, until
+		{
+			name:      "admin_audit/actorKeyId",
+			path:      "/admin/audit/admin",
+			filterA:   "actorKeyId=" + actorA.String(),
+			filterAlt: "actorKeyId=" + actorB.String(),
+		},
+		{
+			name:      "admin_audit/action",
+			path:      "/admin/audit/admin",
+			filterA:   "action=user.create",
+			filterAlt: "action=device.revoke",
+		},
+		{
+			name:      "admin_audit/targetType",
+			path:      "/admin/audit/admin",
+			filterA:   "targetType=user",
+			filterAlt: "targetType=device",
+		},
+		{
+			name:      "admin_audit/targetId",
+			path:      "/admin/audit/admin",
+			filterA:   "targetId=target-a",
+			filterAlt: "targetId=target-b",
+		},
+		{
+			name:      "admin_audit/since",
+			path:      "/admin/audit/admin",
+			filterA:   "since=" + url.QueryEscape(sinceA),
+			filterAlt: "since=" + url.QueryEscape(sinceB),
+		},
+		{
+			name:      "admin_audit/until",
+			path:      "/admin/audit/admin",
+			filterA:   "until=" + url.QueryEscape(untilA),
+			filterAlt: "until=" + url.QueryEscape(untilB),
+		},
+
+		// Verify audit: nodeKey, deviceId, relay, allowed, since, until
+		{
+			name:      "verify_audit/nodeKey",
+			path:      "/admin/audit/verify",
+			filterA:   "nodeKey=" + url.QueryEscape(nkA),
+			filterAlt: "nodeKey=" + url.QueryEscape(nkB),
+		},
+		{
+			name:      "verify_audit/deviceId",
+			path:      "/admin/audit/verify",
+			filterA:   "deviceId=" + devA1.ID.String(),
+			filterAlt: "deviceId=" + devB1.ID.String(),
+		},
+		{
+			name:      "verify_audit/relay",
+			path:      "/admin/audit/verify",
+			filterA:   "relay=default",
+			filterAlt: "relay=eu-1",
+		},
+		{
+			name:      "verify_audit/allowed",
+			path:      "/admin/audit/verify",
+			filterA:   "allowed=true",
+			filterAlt: "allowed=false",
+		},
+		{
+			name:      "verify_audit/since",
+			path:      "/admin/audit/verify",
+			filterA:   "since=" + url.QueryEscape(sinceA),
+			filterAlt: "since=" + url.QueryEscape(sinceB),
+		},
+		{
+			name:      "verify_audit/until",
+			path:      "/admin/audit/verify",
+			filterA:   "until=" + url.QueryEscape(untilA),
+			filterAlt: "until=" + url.QueryEscape(untilB),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Issue an unfiltered cursor.
+			st, body := doAdminRequest(t, router, http.MethodGet, tc.path+"?limit=1", testAdminKey, nil)
+			if st != http.StatusOK {
+				t.Fatalf("unfiltered GET %s status=%d want=200", tc.path, st)
+			}
+			unfilteredCur, ok := body["nextCursor"].(string)
+			if !ok || unfilteredCur == "" {
+				t.Fatalf("expected non-empty unfiltered nextCursor for %s, got %#v", tc.path, body["nextCursor"])
+			}
+
+			// Issue a filtered cursor under filterA.
+			st, body = doAdminRequest(t, router, http.MethodGet, tc.path+"?limit=1&"+tc.filterA, testAdminKey, nil)
+			if st != http.StatusOK {
+				t.Fatalf("filtered GET %s?%s status=%d want=200", tc.path, tc.filterA, st)
+			}
+			filteredCur, ok := body["nextCursor"].(string)
+			if !ok || filteredCur == "" {
+				t.Fatalf("expected non-empty filtered nextCursor for %s?%s, got %#v", tc.path, tc.filterA, body["nextCursor"])
+			}
+
+			// 1. Same filter accepts the filtered cursor.
+			if st, _ := doAdminRequest(t, router, http.MethodGet, tc.path+"?limit=1&"+tc.filterA+"&cursor="+url.QueryEscape(filteredCur), testAdminKey, nil); st != http.StatusOK {
+				t.Fatalf("same filter cursor status=%d want=200", st)
+			}
+			// 2. Unfiltered cursor rejected when filter is added.
+			if st, _ := doAdminRequest(t, router, http.MethodGet, tc.path+"?limit=1&"+tc.filterA+"&cursor="+url.QueryEscape(unfilteredCur), testAdminKey, nil); st != http.StatusBadRequest {
+				t.Fatalf("unfiltered cursor accepted with %s: status=%d want=400", tc.filterA, st)
+			}
+			// 3. Filtered cursor rejected when filter is removed.
+			if st, _ := doAdminRequest(t, router, http.MethodGet, tc.path+"?limit=1&cursor="+url.QueryEscape(filteredCur), testAdminKey, nil); st != http.StatusBadRequest {
+				t.Fatalf("filtered cursor accepted without filter: status=%d want=400", st)
+			}
+			// 4. Filtered cursor rejected under a different value of the same filter.
+			if st, _ := doAdminRequest(t, router, http.MethodGet, tc.path+"?limit=1&"+tc.filterAlt+"&cursor="+url.QueryEscape(filteredCur), testAdminKey, nil); st != http.StatusBadRequest {
+				t.Fatalf("filtered cursor accepted with %s instead of %s: status=%d want=400", tc.filterAlt, tc.filterA, st)
+			}
+		})
+	}
+
 	// Equivalent timestamp in a different timezone offset normalizes to the same fingerprint -> 200.
-	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/audit/verify?limit=1&relay=default&allowed=true&since="+url.QueryEscape(sincePlus8)+"&cursor="+url.QueryEscape(verifyCur), testAdminKey, nil); status != http.StatusOK {
-		t.Fatalf("equivalent timezone verify audit filter status=%d want=200", status)
+	st, body := doAdminRequest(t, router, http.MethodGet, "/admin/audit/verify?limit=1&since="+url.QueryEscape(sinceA), testAdminKey, nil)
+	if st != http.StatusOK {
+		t.Fatalf("verify audit since UTC status=%d want=200", st)
 	}
-	for _, mismatched := range []string{
-		"/admin/audit/verify?limit=1&relay=eu-1&allowed=true&since=" + url.QueryEscape(sinceUTC) + "&cursor=" + url.QueryEscape(verifyCur),
-		"/admin/audit/verify?limit=1&relay=default&allowed=false&since=" + url.QueryEscape(sinceUTC) + "&cursor=" + url.QueryEscape(verifyCur),
-		"/admin/audit/verify?limit=1&relay=default&cursor=" + url.QueryEscape(verifyCur),
-		"/admin/audit/verify?limit=1&cursor=" + url.QueryEscape(verifyCur),
-	} {
-		if status, _ := doAdminRequest(t, router, http.MethodGet, mismatched, testAdminKey, nil); status != http.StatusBadRequest {
-			t.Fatalf("mismatched verify audit filter %s status=%d want=400", mismatched, status)
-		}
+	tzCur := body["nextCursor"].(string)
+	if st, _ := doAdminRequest(t, router, http.MethodGet, "/admin/audit/verify?limit=1&since="+url.QueryEscape(sinceAPlus8)+"&cursor="+url.QueryEscape(tzCur), testAdminKey, nil); st != http.StatusOK {
+		t.Fatalf("equivalent timezone cursor status=%d want=200", st)
 	}
 }

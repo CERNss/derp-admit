@@ -13,12 +13,17 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// NewLogger constructs a gorm logger that suppresses ErrRecordNotFound noise
-// and keeps SQL parameterized so bound secrets/hashes are never printed.
-func NewLogger(w logger.Writer, level logger.LogLevel) logger.Interface {
+// NewGormLogger constructs the shared gorm logger configuration used by
+// OpenDatabase for both backends. When w is nil it writes to os.Stdout.
+// ErrRecordNotFound is suppressed and SQL remains parameterized so bound
+// secrets and hashes are never logged.
+func NewGormLogger(w logger.Writer) logger.Interface {
+	if w == nil {
+		w = log.New(os.Stdout, "\r\n", log.LstdFlags)
+	}
 	return logger.New(w, logger.Config{
 		SlowThreshold:             200 * time.Millisecond,
-		LogLevel:                  level,
+		LogLevel:                  logger.Warn,
 		IgnoreRecordNotFoundError: true,
 		ParameterizedQueries:      true,
 		Colorful:                  false,
@@ -26,7 +31,16 @@ func NewLogger(w logger.Writer, level logger.LogLevel) logger.Interface {
 }
 
 func OpenDatabase(databaseURL string) (*gorm.DB, error) {
-	stdWriter := log.New(os.Stdout, "\r\n", log.LstdFlags)
+	return OpenDatabaseWithLogWriter(databaseURL, nil)
+}
+
+// OpenDatabaseWithLogWriter opens databaseURL using the standard gorm logger
+// configuration writing to w (or os.Stdout when w is nil).
+func OpenDatabaseWithLogWriter(databaseURL string, w logger.Writer) (*gorm.DB, error) {
+	gormCfg := &gorm.Config{
+		Logger:         NewGormLogger(w),
+		TranslateError: true,
+	}
 	switch {
 	case strings.HasPrefix(databaseURL, "sqlite://"):
 		path := strings.TrimPrefix(databaseURL, "sqlite://")
@@ -39,15 +53,9 @@ func OpenDatabase(databaseURL string) (*gorm.DB, error) {
 		if strings.Contains(path, "?") {
 			sep = "&"
 		}
-		return gorm.Open(sqlite.Open(path+sep+"_txlock=immediate&_busy_timeout=5000"), &gorm.Config{
-			Logger:         NewLogger(stdWriter, logger.Silent),
-			TranslateError: true,
-		})
+		return gorm.Open(sqlite.Open(path+sep+"_txlock=immediate&_busy_timeout=5000"), gormCfg)
 	case strings.HasPrefix(databaseURL, "postgres://"), strings.HasPrefix(databaseURL, "postgresql://"):
-		return gorm.Open(postgres.Open(databaseURL), &gorm.Config{
-			Logger:         NewLogger(stdWriter, logger.Warn),
-			TranslateError: true,
-		})
+		return gorm.Open(postgres.Open(databaseURL), gormCfg)
 	default:
 		return nil, fmt.Errorf("unsupported DATABASE_URL scheme")
 	}

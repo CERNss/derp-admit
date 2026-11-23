@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -446,5 +447,55 @@ func TestSyncStaleUsesElapsedTimeNotWallClock(t *testing.T) {
 	}
 	if allow, reason := svc.Verify(context.Background(), policy.BuiltinRelay, body); !allow || reason != "" {
 		t.Fatalf("recovered verify=(%v, %q) want allow", allow, reason)
+	}
+}
+
+func TestSyncerDefaultClockIsMonotonic(t *testing.T) {
+	s := newSyncer()
+
+	t1 := s.now()
+	t2 := s.now()
+
+	if !strings.Contains(t1.String(), "m=") {
+		t.Fatalf("default clock reading %q lacks monotonic component (m=)", t1.String())
+	}
+	if !strings.Contains(t2.String(), "m=") {
+		t.Fatalf("second default clock reading %q lacks monotonic component (m=)", t2.String())
+	}
+	if diff := t2.Sub(t1); diff < 0 {
+		t.Fatalf("t2.Sub(t1)=%v want >= 0", diff)
+	}
+	if elapsed := s.since(t1); elapsed < 0 {
+		t.Fatalf("s.since(t1)=%v want >= 0", elapsed)
+	}
+}
+
+func TestSyncMetricsReportsUTCTimeZone(t *testing.T) {
+	svc, _, _ := bSetupService(t, 0, time.Hour)
+	rec := &bRecordingMetrics{}
+	svc.metrics = rec
+
+	nonUTC := time.Date(2026, 11, 24, 12, 0, 0, 0, time.FixedZone("+08", 8*3600))
+	svc.sync.setClock(func() time.Time { return nonUTC })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.StartSync(ctx)
+
+	rec.mu.Lock()
+	startTS := rec.lastSyncTS
+	rec.mu.Unlock()
+	if startTS.Location() != time.UTC {
+		t.Fatalf("StartSync passed location=%v want=UTC", startTS.Location())
+	}
+
+	if err := svc.syncOnce(context.Background()); err != nil {
+		t.Fatalf("syncOnce: %v", err)
+	}
+	rec.mu.Lock()
+	syncTS := rec.lastSyncTS
+	rec.mu.Unlock()
+	if syncTS.Location() != time.UTC {
+		t.Fatalf("syncOnce passed location=%v want=UTC", syncTS.Location())
 	}
 }

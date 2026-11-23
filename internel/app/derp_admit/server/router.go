@@ -46,8 +46,6 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger, opts
 
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
-	router.RedirectTrailingSlash = false
-	router.RedirectFixedPath = false
 	// Trust no proxy headers: ClientIP is the TCP peer address, so the per-IP
 	// register and admin limiters cannot be reset with a spoofed X-Forwarded-For.
 	_ = router.SetTrustedProxies(nil)

@@ -700,6 +700,31 @@ func TestVerifyTrailingSlashIsMalformedRelay(t *testing.T) {
 	}
 }
 
+func TestTrailingSlashRedirectUnchangedOnOtherRoutes(t *testing.T) {
+	application := bBuildSingleApp(t)
+
+	// POST /register/ still gets gin's trailing-slash redirect to /register.
+	req := httptest.NewRequest(http.MethodPost, "/register/", nil)
+	rec := httptest.NewRecorder()
+	application.Router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("POST /register/ status=%d want=%d", rec.Code, http.StatusTemporaryRedirect)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/register" {
+		t.Fatalf("POST /register/ Location=%q want=/register", loc)
+	}
+
+	// POST /verify/ is NOT redirected: it is handled as a malformed empty relay.
+	nk := newNodeKey(t)
+	vCode, vPayload := doRawRequest(t, application.Router, "/verify/", buildVerifyBody(t, nk))
+	if vCode != http.StatusOK {
+		t.Fatalf("POST /verify/ status=%d want=200 (must not redirect)", vCode)
+	}
+	if allow, _ := vPayload["Allow"].(bool); allow || denyReason(vPayload) != service.DenyReasonUnknownRelay {
+		t.Fatalf("POST /verify/ payload=%+v want deny %q", vPayload, service.DenyReasonUnknownRelay)
+	}
+}
+
 func TestVerifyRelayWithSlashIsMalformedRelay(t *testing.T) {
 	application := bBuildSingleApp(t)
 	nk := newNodeKey(t)

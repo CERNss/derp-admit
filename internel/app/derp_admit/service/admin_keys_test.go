@@ -71,21 +71,6 @@ func cAdminCtx(action, targetType, targetID string) context.Context {
 	})
 }
 
-func TestAdminAuthRejectsStaticKeyWithoutStoredRow(t *testing.T) {
-	const staticKey = "static-env-key-0123456789abcdef"
-	gormDB := cOpenTestDB(t, "no-fallback.db")
-	svc := cNewTestService(t, gormDB, nil)
-
-	// Static fallback must be gone: without a stored row, ADMIN_API_KEY is rejected.
-	a, ok, err := svc.AuthenticateAdminKey(context.Background(), staticKey)
-	if err != nil {
-		t.Fatalf("AuthenticateAdminKey err=%v want=nil", err)
-	}
-	if ok || a.Tier != actor.TierNone {
-		t.Fatalf("expected static key without stored row to be rejected, got actor=%+v ok=%v", a, ok)
-	}
-}
-
 func TestAdminAuthLastUsedAtWriteFailureStillAuthenticates(t *testing.T) {
 	gormDB := cOpenTestDB(t, "last-used-best-effort.db")
 	svc := cNewTestService(t, gormDB, nil)

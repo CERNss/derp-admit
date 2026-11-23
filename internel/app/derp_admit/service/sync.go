@@ -203,7 +203,7 @@ func (s *Service) StartSync(ctx context.Context) {
 	s.sync.intervalNano.Store(int64(interval))
 	now := s.sync.now()
 	s.sync.recordSuccess(now)
-	s.metrics.PolicySync(true, s.publishedVersion(), now)
+	s.metrics.PolicySync(true, s.publishedVersion(), now.UTC())
 
 	go func() {
 		ticker := time.NewTicker(interval)

@@ -437,7 +437,7 @@ func TestPostgresRoleDeleteRacesBinding(t *testing.T) {
 	}
 	userID := body["user"].(map[string]any)["id"].(string)
 
-	const rounds = 25
+	const rounds = 40
 	for i := 0; i < rounds; i++ {
 		roleName := fmt.Sprintf("race-role-%d", i)
 		if st, _ := doAdminRequest(t, router, http.MethodPost, "/admin/roles", testAdminKey, map[string]any{
@@ -497,7 +497,7 @@ func TestPostgresRelayDeleteRacesGrant(t *testing.T) {
 		t.Fatalf("create role status=%d want=201", st)
 	}
 
-	const rounds = 25
+	const rounds = 40
 	for i := 0; i < rounds; i++ {
 		relayName := fmt.Sprintf("race-relay-%d", i)
 		if st, _ := doAdminRequest(t, router, http.MethodPost, "/admin/relays", testAdminKey, map[string]any{
@@ -541,6 +541,119 @@ func TestPostgresRelayDeleteRacesGrant(t *testing.T) {
 		}
 		if orphanCount != 0 {
 			t.Fatalf("round %d orphan casbin_rule rows for deleted relay %s = %d want=0", i, relayName, orphanCount)
+		}
+	}
+}
+
+func TestPostgresRoleDeleteRacesGrantReplace(t *testing.T) {
+	application, gormDB := openFreshPostgresApp(t, 0)
+	router := application.Router
+
+	if st, _ := doAdminRequest(t, router, http.MethodPost, "/admin/relays", testAdminKey, map[string]any{
+		"name": "eu-1",
+	}); st != http.StatusCreated {
+		t.Fatalf("create relay eu-1 status=%d want=201", st)
+	}
+
+	const rounds = 40
+	for i := 0; i < rounds; i++ {
+		roleName := fmt.Sprintf("race-grant-role-%d", i)
+		if st, _ := doAdminRequest(t, router, http.MethodPost, "/admin/roles", testAdminKey, map[string]any{
+			"name":   roleName,
+			"relays": []string{},
+		}); st != http.StatusCreated {
+			t.Fatalf("round %d create role status=%d want=201", i, st)
+		}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var putStatus, delStatus int
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			putStatus, _ = doAdminRequest(t, router, http.MethodPut, "/admin/roles/"+roleName+"/relays", testAdminKey, map[string]any{
+				"relays": []string{"default", "eu-1"},
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			delStatus, _ = doAdminRequest(t, router, http.MethodDelete, "/admin/roles/"+roleName, testAdminKey, nil)
+		}()
+		close(start)
+		wg.Wait()
+
+		if delStatus != http.StatusOK {
+			t.Fatalf("round %d delete role status=%d want=200", i, delStatus)
+		}
+		if putStatus != http.StatusOK && putStatus != http.StatusNotFound {
+			t.Fatalf("round %d unexpected grant-replace status=%d (want 200 or 404)", i, putStatus)
+		}
+
+		// No casbin_rule row may name a role or relay not in its registry.
+		var orphanCount int64
+		if err := gormDB.Model(&model.CasbinRule{}).
+			Where("(ptype = 'g' AND v1 = ?) OR (ptype = 'p' AND v0 = ?)", "role:"+roleName, "role:"+roleName).
+			Count(&orphanCount).Error; err != nil {
+			t.Fatalf("round %d count orphan role rules: %v", i, err)
+		}
+		if orphanCount != 0 {
+			t.Fatalf("round %d orphan casbin_rule rows for deleted role %s = %d want=0", i, roleName, orphanCount)
+		}
+	}
+}
+
+func TestPostgresRoleDeleteRacesUserCreate(t *testing.T) {
+	application, gormDB := openFreshPostgresApp(t, 0)
+	router := application.Router
+
+	const rounds = 40
+	for i := 0; i < rounds; i++ {
+		roleName := fmt.Sprintf("race-ucreate-role-%d", i)
+		if st, _ := doAdminRequest(t, router, http.MethodPost, "/admin/roles", testAdminKey, map[string]any{
+			"name":   roleName,
+			"relays": []string{"default"},
+		}); st != http.StatusCreated {
+			t.Fatalf("round %d create role status=%d want=201", i, st)
+		}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var createStatus, delStatus int
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			createStatus, _ = doAdminRequest(t, router, http.MethodPost, "/admin/users", testAdminKey, map[string]any{
+				"username": fmt.Sprintf("race-created-user-%d", i),
+				"roles":    []string{roleName},
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			delStatus, _ = doAdminRequest(t, router, http.MethodDelete, "/admin/roles/"+roleName, testAdminKey, nil)
+		}()
+		close(start)
+		wg.Wait()
+
+		if delStatus != http.StatusOK {
+			t.Fatalf("round %d delete role status=%d want=200", i, delStatus)
+		}
+		if createStatus != http.StatusCreated && createStatus != http.StatusBadRequest {
+			t.Fatalf("round %d unexpected user-create status=%d (want 201 or 400)", i, createStatus)
+		}
+
+		// No casbin_rule row may name a role not in its registry.
+		var orphanCount int64
+		if err := gormDB.Model(&model.CasbinRule{}).
+			Where("(ptype = 'g' AND v1 = ?) OR (ptype = 'p' AND v0 = ?)", "role:"+roleName, "role:"+roleName).
+			Count(&orphanCount).Error; err != nil {
+			t.Fatalf("round %d count orphan role rules: %v", i, err)
+		}
+		if orphanCount != 0 {
+			t.Fatalf("round %d orphan casbin_rule rows for deleted role %s = %d want=0", i, roleName, orphanCount)
 		}
 	}
 }

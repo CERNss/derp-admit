@@ -914,12 +914,13 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 		disabled bool
 	}
 	type stateCase struct {
-		name       string
-		users      []userSpec
-		devs       []deviceSpec
-		preRoles   []model.Role
-		preRelays  []model.Relay
-		buildRules func(uIDs map[string]uuid.UUID, devKeys map[string]string) []model.CasbinRule
+		name            string
+		users           []userSpec
+		devs            []deviceSpec
+		preRoles        []model.Role
+		preRelays       []model.Relay
+		exactAllowMatch bool
+		buildRules      func(uIDs map[string]uuid.UUID, devKeys map[string]string) []model.CasbinRule
 	}
 
 	states := []stateCase{
@@ -944,8 +945,9 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			},
 		},
 		{
-			name:  "standard_default_grant_row_deleted",
-			users: []userSpec{{name: "u-std"}},
+			name:            "standard_default_grant_row_deleted",
+			exactAllowMatch: true,
+			users:           []userSpec{{name: "u-std"}},
 			devs: []deviceSpec{
 				{user: "u-std", key: "std-with-legacy"},
 				{user: "u-std", key: "std-no-legacy"},
@@ -975,7 +977,8 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			},
 		},
 		{
-			name: "preexisting_roles_and_relays_with_all_relays",
+			name:            "preexisting_roles_and_relays_with_all_relays",
+			exactAllowMatch: true,
 			preRelays: []model.Relay{
 				{Name: "pre-eu"},
 			},
@@ -1002,8 +1005,9 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			},
 		},
 		{
-			name:  "disabled_user_without_devices",
-			users: []userSpec{{name: "dis-nodev", disabled: true}, {name: "en-withdev"}},
+			name:            "disabled_user_without_devices",
+			exactAllowMatch: true,
+			users:           []userSpec{{name: "dis-nodev", disabled: true}, {name: "en-withdev"}},
 			devs: []deviceSpec{
 				{user: "en-withdev", key: "en-d1"},
 			},
@@ -1016,8 +1020,9 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			},
 		},
 		{
-			name:  "noncanonical_legacy_device_rule_with_canonical_role_binding",
-			users: []userSpec{{name: "u-canon"}},
+			name:            "noncanonical_legacy_device_rule_with_canonical_role_binding",
+			exactAllowMatch: true,
+			users:           []userSpec{{name: "u-canon"}},
 			devs: []deviceSpec{
 				{user: "u-canon", key: "canon-upper-legacy"},
 				{user: "u-canon", key: "canon-valid-legacy"},
@@ -1033,8 +1038,9 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			},
 		},
 		{
-			name:  "covered_standard_with_and_without_legacy",
-			users: []userSpec{{name: "u1"}},
+			name:            "covered_standard_with_and_without_legacy",
+			exactAllowMatch: true,
+			users:           []userSpec{{name: "u1"}},
 			devs: []deviceSpec{
 				{user: "u1", key: "c1-with-legacy"},
 				{user: "u1", key: "c1-no-legacy"},
@@ -1135,8 +1141,9 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			},
 		},
 		{
-			name:  "custom_role_with_default_grant",
-			users: []userSpec{{name: "ops-user"}},
+			name:            "custom_role_with_default_grant",
+			exactAllowMatch: true,
+			users:           []userSpec{{name: "ops-user"}},
 			devs: []deviceSpec{
 				{user: "ops-user", key: "ops-with-legacy"},
 				{user: "ops-user", key: "ops-no-legacy"},
@@ -1151,8 +1158,9 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			},
 		},
 		{
-			name:  "disabled_users_and_revoked_devices",
-			users: []userSpec{{name: "dis-cov", disabled: true}, {name: "dis-uncov", disabled: true}, {name: "en-cov"}},
+			name:            "disabled_users_and_revoked_devices",
+			exactAllowMatch: true,
+			users:           []userSpec{{name: "dis-cov", disabled: true}, {name: "dis-uncov", disabled: true}, {name: "en-cov"}},
 			devs: []deviceSpec{
 				{user: "dis-cov", key: "dis-cov-legacy"},
 				{user: "dis-cov", key: "dis-cov-nolegacy"},
@@ -1233,7 +1241,8 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			},
 		},
 		{
-			name: "combined_mixed_population",
+			name:            "combined_mixed_population",
+			exactAllowMatch: true,
 			users: []userSpec{
 				{name: "normal"},
 				{name: "partial-legacy"},
@@ -1299,9 +1308,22 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 		{name: "casbin_disabled", casbinWasDisabled: true},
 	}
 
+	isExpectedDenyReason := func(reason string) bool {
+		switch reason {
+		case service.DenyReasonRevoked,
+			service.DenyReasonUserDisabled,
+			service.DenyReasonPolicyDenied,
+			service.DenyReasonNotRegistered:
+			return true
+		default:
+			return false
+		}
+	}
+
 	for _, mode := range modes {
 		beforeAllowedTotal := 0
 		beforeDeniedTotal := 0
+		afterAllowedTotal := 0
 		for _, tc := range states {
 			t.Run(mode.name+"/"+tc.name, func(t *testing.T) {
 				dbURL := "sqlite://" + filepath.Join(t.TempDir(), "upgrade.db")
@@ -1365,6 +1387,7 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 				// Compute BEFORE decisions using the REAL OLD Casbin model over raw casbin_rule rows.
 				oldEnf := aBuildOldEnforcer(t, dbConn, mode.casbinWasDisabled)
 				before := make(map[uuid.UUID]bool, len(devs))
+				stateBeforeAllowed := 0
 				for _, d := range devs {
 					var owner model.User
 					for _, u := range usersByName {
@@ -1377,6 +1400,7 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 					before[d.ID] = b
 					if b {
 						beforeAllowedTotal++
+						stateBeforeAllowed++
 					} else {
 						beforeDeniedTotal++
 					}
@@ -1408,32 +1432,45 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 				}
 
 				// Compare AFTER decision for every device via Service.Verify: must NEVER loosen (false -> true).
+				stateAfterAllowed := 0
 				for _, d := range devs {
 					body := aBuildVerifyBody(t, d.NodeKey)
-					afterDefault, _ := application.Service.Verify(context.Background(), policy.BuiltinRelay, body)
+					afterDefault, reason := application.Service.Verify(context.Background(), policy.BuiltinRelay, body)
+					if afterDefault {
+						afterAllowedTotal++
+						stateAfterAllowed++
+					} else if !isExpectedDenyReason(reason) {
+						t.Errorf("device %s (key=%s) denied on default with unexpected reason=%q", d.ID, d.NodeKey, reason)
+					}
 					if !before[d.ID] && afterDefault {
 						t.Errorf("upgrade loosened access for device %s (key=%s): before=DENY after=ALLOW", d.ID, d.NodeKey)
 					}
 					// In casbin_disabled mode, every device allowed before must remain allowed after on default.
 					if mode.casbinWasDisabled && before[d.ID] && !afterDefault {
-						t.Errorf("casbin_disabled upgrade unexpectedly denied device %s (key=%s): before=ALLOW after=DENY", d.ID, d.NodeKey)
+						t.Errorf("casbin_disabled upgrade unexpectedly denied device %s (key=%s): before=ALLOW after=DENY (reason=%q)", d.ID, d.NodeKey, reason)
 					}
 					// A2: in enforced mode, every device denied before because it had no canonical legacy rule
 					// must stay denied on EVERY registered relay after the upgrade.
 					if !mode.casbinWasDisabled && !before[d.ID] && !hasCanonicalLegacyRule[d.ID] {
 						for _, relay := range registeredRelays {
-							afterRelay, _ := application.Service.Verify(context.Background(), relay.Name, body)
+							afterRelay, relayReason := application.Service.Verify(context.Background(), relay.Name, body)
 							if afterRelay {
 								t.Errorf("device %s without legacy rule was allowed on relay %q after enforced upgrade", d.ID, relay.Name)
+							} else if !isExpectedDenyReason(relayReason) {
+								t.Errorf("device %s denied on relay %q with unexpected reason=%q", d.ID, relay.Name, relayReason)
 							}
 						}
 					}
 				}
+				if tc.exactAllowMatch && stateAfterAllowed != stateBeforeAllowed {
+					t.Errorf("state %s: allowed count changed before=%d after=%d (properly registered devices must stay allowed)",
+						tc.name, stateBeforeAllowed, stateAfterAllowed)
+				}
 			})
 		}
-		if beforeAllowedTotal == 0 || beforeDeniedTotal == 0 {
-			t.Fatalf("mode %s sanity check failed: beforeAllowed=%d beforeDenied=%d (both must be > 0)",
-				mode.name, beforeAllowedTotal, beforeDeniedTotal)
+		if beforeAllowedTotal == 0 || beforeDeniedTotal == 0 || afterAllowedTotal == 0 {
+			t.Fatalf("mode %s sanity check failed: beforeAllowed=%d beforeDenied=%d afterAllowed=%d (all must be > 0)",
+				mode.name, beforeAllowedTotal, beforeDeniedTotal, afterAllowedTotal)
 		}
 	}
 

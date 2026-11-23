@@ -150,7 +150,7 @@ The system MUST refuse to revoke a key of tier `admin` when it is the only activ
 - **THEN** the key is revoked and the service returns HTTP `200`
 
 ### Requirement: Admin API is rate limited per client IP before authentication
-The system MUST apply an independent token bucket, configured by `ADMIN_RATE_LIMIT_RPS` and `ADMIN_RATE_LIMIT_BURST`, to each client IP calling `/admin`, before the key is checked. The client IP MUST be the TCP peer address; forwarded-for headers MUST NOT be trusted.
+The system MUST apply an independent token bucket, configured by `ADMIN_RATE_LIMIT_RPS` and `ADMIN_RATE_LIMIT_BURST`, to each client IP calling `/admin`, before the key is checked. The client IP MUST be the TCP peer address; forwarded-for headers MUST NOT be trusted. IPv6 peers MUST be grouped by their /64 prefix, so that all addresses in one /64 share one bucket.
 
 #### Scenario: One client exceeds its budget
 - **WHEN** a client IP sends `/admin` requests faster than the configured rate and burst allow
@@ -163,3 +163,7 @@ The system MUST apply an independent token bucket, configured by `ADMIN_RATE_LIM
 #### Scenario: Callers behind one reverse proxy
 - **WHEN** several admin callers reach the service through the same reverse proxy
 - **THEN** they share the proxy's address and therefore one bucket
+
+#### Scenario: IPv6 addresses in one /64 share a bucket
+- **WHEN** `/admin` requests arrive from different IPv6 addresses inside the same /64 prefix
+- **THEN** they are counted against one bucket, and an address in a different /64 has its own bucket

@@ -37,6 +37,23 @@ A revoked device MUST keep its node key bound and refused at `POST /register` un
 - **WHEN** an admin deletes a device and `POST /register` is then called for the same node key with a valid token
 - **THEN** the service creates a new device row for that node key and returns HTTP `200`
 
+## MODIFIED Requirements
+
+### Requirement: Register endpoint is rate limited per client IP
+The system MUST apply an independent rate limit, configured by `REGISTER_RATE_LIMIT_RPS` and `REGISTER_RATE_LIMIT_BURST`, to each client IP calling `POST /register`, and MUST take the client IP from the TCP peer address without trusting forwarded-for headers. IPv6 peers MUST be grouped by their /64 prefix, so that all addresses in one /64 share one bucket.
+
+#### Scenario: One client exceeds its budget
+- **WHEN** a client IP sends `POST /register` requests faster than the configured rate and burst allow
+- **THEN** that client's excess requests receive HTTP `429` and no device record is created or updated for them
+
+#### Scenario: Other clients are unaffected
+- **WHEN** one client IP has exhausted its register budget
+- **THEN** requests from a different client IP are still evaluated against their own budget
+
+#### Scenario: IPv6 addresses in one /64 share a bucket
+- **WHEN** `POST /register` requests arrive from different IPv6 addresses inside the same /64 prefix
+- **THEN** they are counted against one bucket, and an address in a different /64 has its own bucket
+
 ## REMOVED Requirements
 
 ### Requirement: Register endpoint enforces device ownership and idempotency

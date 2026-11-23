@@ -1,6 +1,5 @@
 addr: ":8080"
 log_level: "info"
-enable_casbin: true
 
 # Set to enable the authenticated /admin lifecycle API (>= 16 chars).
 # Prefer the ADMIN_API_KEY env var over committing a secret here.

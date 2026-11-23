@@ -73,17 +73,21 @@ die() { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 # ---------------------------------------------------------------- tools ----
 
 dc() { docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"; }
-tool() { dc exec -T tools e2etool "$@"; }
+# Commands that do not read stdin get </dev/null: "docker compose exec" and
+# "orb run" forward stdin and would otherwise swallow a surrounding pipe.
+tool() { dc exec -T tools e2etool "$@" </dev/null; }
 api() { tool api "$@"; }
 tmpl() { dc exec -T tools e2etool tmpl "$1"; }        # JSON on stdin
-hs() { dc exec -T headscale headscale "$@"; }
-now() { dc exec -T tools date -u +%s; }                 # clock of the Docker VM
-iso() { dc exec -T tools date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+hs() { dc exec -T headscale headscale "$@" </dev/null; }
+now() { dc exec -T tools date -u +%s </dev/null; }      # clock of the Docker VM
+iso() { dc exec -T tools date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ </dev/null; }
 
 # Run a command as root inside an OrbStack machine. Working directory "/" so
 # no macOS path is ever involved; scripts are passed as argv, data via stdin.
-m() { local name=$1; shift; orb run -m "$name" -u root -w / "$@"; }
+m() { local name=$1; shift; orb run -m "$name" -u root -w / "$@" </dev/null; }
+m_in() { local name=$1; shift; orb run -m "$name" -u root -w / "$@"; }   # keeps stdin
 mbash() { local name=$1 script=$2; shift 2; m "$name" bash -c "$script" e2e "$@"; }
+mbash_in() { local name=$1 script=$2; shift 2; m_in "$name" bash -c "$script" e2e "$@"; }
 
 retry() { # retry TRIES DELAY cmd...
   local n=$1 d=$2 i; shift 2
@@ -305,7 +309,7 @@ done
 ip4of() { local i; for i in 0 1 2; do if [ "${MACHINES[i]}" = "$1" ]; then echo "${IP4S[i]}"; fi; done; }
 ip6of() { local i; for i in 0 1 2; do if [ "${MACHINES[i]}" = "$1" ]; then echo "${IP6S[i]}"; fi; done; }
 
-CA_PEM=$(dc exec -T tools cat /pki/ca.crt)
+CA_PEM=$(dc exec -T tools cat /pki/ca.crt </dev/null)
 for n in "${MACHINES[@]}"; do
   v4="" v6=""
   for p in "${MACHINES[@]}"; do
@@ -314,7 +318,7 @@ for n in "${MACHINES[@]}"; do
     p6=$(ip6of "$p")
     if [ -n "$p6" ]; then v6="${v6:+$v6, }${p6//,/, }"; fi
   done
-  printf '%s\n' "$CA_PEM" | mbash "$n" "$RESET_SCRIPT" "$v4" "$v6" | sed "s/^/   $n: /"
+  printf '%s\n' "$CA_PEM" | mbash_in "$n" "$RESET_SCRIPT" "$v4" "$v6" | sed "s/^/   $n: /"
 done
 
 # ------------------------------------------------------------ provision ----
@@ -471,7 +475,7 @@ TSIP_B=$(tsip "$MB")
 info "$MB $KEY_B $TSIP_B (not registered)"
 wait_until 60 derper_rejected_since "$MARK_B" "$KEY_B" || true
 # The "Relay server unavailable" health warning needs 10s to become visible.
-wait_until 30 sh -c "orb run -m $MB -u root -w / tailscale status --json | grep -q 'could not connect to the'" || true
+wait_until 30 sh -c "orb run -m $MB -u root -w / tailscale status --json </dev/null | grep -q 'could not connect to the'" || true
 rej=$(derper_rejected_since "$MARK_B" "$KEY_B" | tail -2 || true)
 row=$(AUDIT_LIMIT=1 audit "$KEY_B" "$MARK_B")
 conn=$(derp_connected_since "$MB" "$MARK_B" || true)
@@ -576,7 +580,9 @@ evidence "$MC journal: 'derp-$REGION connected' since the reconnect" "$conn"
 if [ -n "$rej" ] && grep -q 'allowed=false reason="policy denied"' <<<"$row" && [ -z "$conn" ]; then f1=1; else f1=0; fi
 
 MARK_F2=$(now)
-evidence "PUT /admin/users/<carol>/roles {\"roles\":[\"standard\",\"$ROLE\"]}" "$(api PUT "/admin/users/$CAROL/roles" "{\"roles\":[\"standard\",\"$ROLE\"]}")"
+# Body in a variable: bash 3.2 brace-expands "{a,b}" inside "$(...)" inside quotes.
+body="{\"roles\":[\"standard\",\"$ROLE\"]}"
+evidence "PUT /admin/users/<carol>/roles $body" "$(api PUT "/admin/users/$CAROL/roles" "$body")"
 wait_until 60 derp_connected_since "$MC" "$MARK_F2" || true
 wait_until 30 audit_newest_is "$KEY_C" "$MARK_F2" true || true
 conn=$(derp_connected_since "$MC" "$MARK_F2" | tail -1 || true)

@@ -624,12 +624,14 @@ wait_until 60 sh -c "docker inspect -f '{{.State.Health.Status}}' \$(docker comp
 wait_until 60 derp_connected_since "$MC" "$MARK_G2" || true
 wait_until 30 audit_newest_is "$KEY_C" "$MARK_G2" true || true
 conn=$(derp_connected_since "$MC" "$MARK_G2" | tail -1 || true)
+reg=$(derper_registered_since "$MARK_G2" "$KEY_C" | tail -1 || true)
 row=$(AUDIT_LIMIT=1 audit "$KEY_C" "$MARK_G2")
 p=$(ts_ping "$MA" "$TSIP_C" || true)
 evidence "$MC journal after the verifier is back" "$conn"
+evidence "derper log ($(shortkey "$KEY_C") = $MC)" "$reg"
 evidence "verify audit, newest row for $MC" "$row"
 evidence "$MA: tailscale ping $TSIP_C" "$p"
-if [ "$g1" = 1 ] && [ -n "$conn" ] && grep -q 'allowed=true' <<<"$row" && relayed_ok "$p"; then
+if [ "$g1" = 1 ] && [ -n "$conn" ] && [ -n "$reg" ] && grep -q 'allowed=true' <<<"$row" && relayed_ok "$p"; then
   result G PASS "verifier down: derper refused $MC; verifier back: admitted"
 else
   result G FAIL "verifier-down behaviour not shown (down-part=$g1)"

@@ -66,16 +66,23 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (int, error) {
 	// locked rows, so an admin revoke/disable landing after the fast-path
 	// checks cannot still produce an enrolled device.
 	txErr := s.db.WithContext(dbCtx).Transaction(func(tx *gorm.DB) error {
-		lockQuery := tx
-		if tx.Dialector.Name() != "sqlite" {
-			// sqlite has no SELECT ... FOR UPDATE; its write transactions are
-			// serialized whole-database via the _txlock=immediate DSN option.
-			lockQuery = tx.Clauses(clause.Locking{Strength: "UPDATE"})
+		// locked returns a fresh query each time. A *gorm.DB returned by
+		// Clauses keeps accumulating conditions when it is reused, so sharing
+		// one for the token and the user lookups made the second one search
+		// for "id = <token id> AND id = <user id>" and never find the user.
+		locked := func() *gorm.DB {
+			if tx.Dialector.Name() == "sqlite" {
+				// sqlite has no SELECT ... FOR UPDATE; its write transactions
+				// are serialized whole-database via the _txlock=immediate DSN
+				// option.
+				return tx
+			}
+			return tx.Clauses(clause.Locking{Strength: "UPDATE"})
 		}
 
 		now := time.Now().UTC()
 		var token model.EnrollToken
-		if err := lockQuery.First(&token, "id = ?", enroll.ID).Error; err != nil {
+		if err := locked().First(&token, "id = ?", enroll.ID).Error; err != nil {
 			return fmt.Errorf("lock token: %w", err)
 		}
 		if token.RevokedAt != nil || (token.ExpiresAt != nil && token.ExpiresAt.Before(now)) {
@@ -83,7 +90,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (int, error) {
 		}
 
 		var user model.User
-		if err := lockQuery.First(&user, "id = ?", token.UserID).Error; err != nil {
+		if err := locked().First(&user, "id = ?", token.UserID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return errRegisterForbidden
 			}

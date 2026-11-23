@@ -11,6 +11,7 @@ import (
 	"derp-admit/internel/app/derp_admit/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 //go:embed migrations/*.sql
@@ -18,12 +19,20 @@ var migrationsFS embed.FS
 
 func ApplyMigrations(ctx context.Context, gormDB *gorm.DB, databaseURL string) error {
 	if strings.HasPrefix(databaseURL, "sqlite://") {
-		return gormDB.WithContext(ctx).AutoMigrate(
+		if err := gormDB.WithContext(ctx).AutoMigrate(
 			&model.User{},
 			&model.EnrollToken{},
 			&model.Device{},
 			&model.AuditLog{},
-		)
+			&model.Role{},
+			&model.Relay{},
+			&model.PolicyState{},
+			&model.AdminKey{},
+			&model.AdminAuditLog{},
+		); err != nil {
+			return fmt.Errorf("auto-migrate sqlite schema: %w", err)
+		}
+		return seedPolicyState(ctx, gormDB)
 	}
 
 	if err := gormDB.WithContext(ctx).Exec(`
@@ -77,5 +86,14 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		}
 	}
 
+	return seedPolicyState(ctx, gormDB)
+}
+
+func seedPolicyState(ctx context.Context, gormDB *gorm.DB) error {
+	if err := gormDB.WithContext(ctx).
+		Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&model.PolicyState{ID: model.PolicyStateRowID}).Error; err != nil {
+		return fmt.Errorf("seed policy_state: %w", err)
+	}
 	return nil
 }

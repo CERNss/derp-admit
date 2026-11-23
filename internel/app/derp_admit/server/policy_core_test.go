@@ -134,4 +134,22 @@ func TestAdminCreateUserRolesDefaultExplicitAndUnknown(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("u-unknown-role count=%d want=0", count)
 	}
+
+	// 5. SQL-inserted role with an invalid name ("Ops") is rejected with 400 and creates no user.
+	if err := gormDB.Create(&model.Role{Name: "Ops"}).Error; err != nil {
+		t.Fatalf("insert invalid SQL role Ops: %v", err)
+	}
+	status, _ = doAdminRequest(t, router, http.MethodPost, "/admin/users", testAdminKey, map[string]any{
+		"username": "u-invalid-sql-role",
+		"roles":    []string{"Ops"},
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("invalid SQL role Ops create status=%d want=%d", status, http.StatusBadRequest)
+	}
+	if err := gormDB.Model(&model.User{}).Where("username = ?", "u-invalid-sql-role").Count(&count).Error; err != nil {
+		t.Fatalf("count u-invalid-sql-role: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("u-invalid-sql-role count=%d want=0", count)
+	}
 }

@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"sync"
@@ -70,24 +71,39 @@ func NewEngine(db *gorm.DB, _ bool) (*Engine, error) {
 	return e, nil
 }
 
-// Reload reads the role/relay registries and casbin_rule rows from the database,
-// filters them down to managed shapes, expands all_relays roles over registered
-// relays in memory, and atomically swaps in a brand-new read-only enforcer.
+// Reload reads the role/relay registries and casbin_rule rows from the database
+// within a single read-only transaction snapshot, filters them down to managed
+// shapes, expands all_relays roles over registered relays in memory, and
+// atomically swaps in a brand-new read-only enforcer.
 func (e *Engine) Reload(ctx context.Context) error {
 	e.reloadMu.Lock()
 	defer e.reloadMu.Unlock()
 
 	var roles []model.Role
-	if err := e.db.WithContext(ctx).Find(&roles).Error; err != nil {
-		return fmt.Errorf("load roles: %w", err)
-	}
 	var relays []model.Relay
-	if err := e.db.WithContext(ctx).Find(&relays).Error; err != nil {
-		return fmt.Errorf("load relays: %w", err)
-	}
 	var rules []model.CasbinRule
-	if err := e.db.WithContext(ctx).Find(&rules).Error; err != nil {
-		return fmt.Errorf("load casbin rules: %w", err)
+
+	txOpts := &sql.TxOptions{ReadOnly: true}
+	if e.db.Dialector.Name() != "sqlite" {
+		// PostgreSQL defaults to READ COMMITTED, where separate SELECTs can see
+		// different commits; REPEATABLE READ pins one MVCC snapshot across all
+		// three queries. SQLite transactions are already serializable snapshots
+		// and mattn/go-sqlite3 rejects non-default sql.IsolationLevel values.
+		txOpts.Isolation = sql.LevelRepeatableRead
+	}
+	if err := e.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Find(&roles).Error; err != nil {
+			return fmt.Errorf("load roles: %w", err)
+		}
+		if err := tx.Find(&relays).Error; err != nil {
+			return fmt.Errorf("load relays: %w", err)
+		}
+		if err := tx.Find(&rules).Error; err != nil {
+			return fmt.Errorf("load casbin rules: %w", err)
+		}
+		return nil
+	}, txOpts); err != nil {
+		return err
 	}
 
 	validRoles := make(map[string]model.Role, len(roles))
@@ -119,7 +135,7 @@ func (e *Engine) Reload(ctx context.Context) error {
 				continue
 			}
 			uid, err := uuid.Parse(uidRaw)
-			if err != nil {
+			if err != nil || uidRaw != uid.String() {
 				continue
 			}
 			roleName, ok := strings.CutPrefix(rule.V1, rolePrefix)

@@ -73,9 +73,15 @@ func SeedBuiltins(tx *gorm.DB) (created bool, err error) {
 }
 
 // SetUserRoles replaces a user's managed role bindings inside tx. Every role
-// in roles must exist in the roles registry or ErrUnknownRole is returned.
+// in roles must match NamePattern and exist in the roles registry or
+// ErrUnknownRole is returned.
 func SetUserRoles(tx *gorm.DB, userID uuid.UUID, roles []string) error {
 	unique := dedupeSorted(roles)
+	for _, name := range unique {
+		if !NamePattern.MatchString(name) {
+			return fmt.Errorf("%w: %s", ErrUnknownRole, name)
+		}
+	}
 	if len(unique) > 0 {
 		var existing []string
 		if err := tx.Model(&model.Role{}).Where("name IN ?", unique).Pluck("name", &existing).Error; err != nil {
@@ -83,7 +89,9 @@ func SetUserRoles(tx *gorm.DB, userID uuid.UUID, roles []string) error {
 		}
 		found := make(map[string]struct{}, len(existing))
 		for _, name := range existing {
-			found[name] = struct{}{}
+			if NamePattern.MatchString(name) {
+				found[name] = struct{}{}
+			}
 		}
 		for _, name := range unique {
 			if _, ok := found[name]; !ok {
@@ -122,7 +130,9 @@ func UserRoles(ctx context.Context, db *gorm.DB, ids []uuid.UUID) (map[uuid.UUID
 	}
 	validRoles := make(map[string]struct{}, len(registered))
 	for _, r := range registered {
-		validRoles[r] = struct{}{}
+		if NamePattern.MatchString(r) {
+			validRoles[r] = struct{}{}
+		}
 	}
 
 	subjects := make([]string, 0, len(ids))
@@ -178,6 +188,9 @@ func UserRoles(ctx context.Context, db *gorm.DB, ids []uuid.UUID) (map[uuid.UUID
 // Otherwise roles.all_relays is set to false and named grants are replaced
 // after verifying every relay is registered.
 func SetRoleGrants(tx *gorm.DB, role string, relays []string) error {
+	if !NamePattern.MatchString(role) {
+		return fmt.Errorf("%w: %s", ErrUnknownRole, role)
+	}
 	var roleRow model.Role
 	if err := tx.First(&roleRow, "name = ?", role).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -208,6 +221,11 @@ func SetRoleGrants(tx *gorm.DB, role string, relays []string) error {
 	}
 
 	unique := dedupeSorted(relays)
+	for _, name := range unique {
+		if !NamePattern.MatchString(name) {
+			return fmt.Errorf("%w: %s", ErrUnknownRelay, name)
+		}
+	}
 	if len(unique) > 0 {
 		var existing []string
 		if err := tx.Model(&model.Relay{}).Where("name IN ?", unique).Pluck("name", &existing).Error; err != nil {
@@ -215,7 +233,9 @@ func SetRoleGrants(tx *gorm.DB, role string, relays []string) error {
 		}
 		found := make(map[string]struct{}, len(existing))
 		for _, name := range existing {
-			found[name] = struct{}{}
+			if NamePattern.MatchString(name) {
+				found[name] = struct{}{}
+			}
 		}
 		for _, name := range unique {
 			if _, ok := found[name]; !ok {
@@ -266,6 +286,9 @@ func RoleGrants(ctx context.Context, db *gorm.DB, roles []string) (map[string][]
 	namedSubjects := make([]string, 0, len(roleRows))
 	subToRole := make(map[string]string, len(roleRows))
 	for _, r := range roleRows {
+		if !NamePattern.MatchString(r.Name) {
+			continue
+		}
 		if r.AllRelays {
 			result[r.Name] = []string{"*"}
 			continue
@@ -285,7 +308,9 @@ func RoleGrants(ctx context.Context, db *gorm.DB, roles []string) (map[string][]
 	}
 	validRelays := make(map[string]struct{}, len(registeredRelays))
 	for _, r := range registeredRelays {
-		validRelays[r] = struct{}{}
+		if NamePattern.MatchString(r) {
+			validRelays[r] = struct{}{}
+		}
 	}
 
 	var rows []model.CasbinRule

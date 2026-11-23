@@ -5,7 +5,10 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"derp-admit/internel/app/derp_admit/db"
 	"derp-admit/internel/app/derp_admit/model"
@@ -279,6 +282,270 @@ func TestEnforceIgnoresStoredWildcardRule(t *testing.T) {
 	}
 }
 
+func TestEnforceIgnoresNonCanonicalUserBinding(t *testing.T) {
+	userID := uuid.MustParse("3f2504e0-4f89-11d3-9a0c-0305e82c3301")
+	canon := userID.String()
+	spellings := []struct {
+		name string
+		raw  string
+	}{
+		{name: "uppercase", raw: strings.ToUpper(canon)},
+		{name: "braces", raw: "{" + canon + "}"},
+		{name: "urn", raw: "urn:uuid:" + canon},
+		{name: "no_hyphens", raw: strings.ReplaceAll(canon, "-", "")},
+	}
+
+	for _, sp := range spellings {
+		t.Run(sp.name, func(t *testing.T) {
+			dbConn := openPolicyTestDB(t)
+			seedBuiltins(t, dbConn)
+
+			if err := dbConn.Create(&model.CasbinRule{
+				Ptype: "g",
+				V0:    "user:" + sp.raw,
+				V1:    "role:standard",
+			}).Error; err != nil {
+				t.Fatalf("insert non-canonical g row: %v", err)
+			}
+
+			engine, err := policy.NewEngine(dbConn, true)
+			if err != nil {
+				t.Fatalf("NewEngine: %v", err)
+			}
+			allowed, err := engine.Enforce(policy.Request{UserID: userID, Relay: "default"})
+			if err != nil || allowed {
+				t.Fatalf("non-canonical %s allowed=%v err=%v want false, nil", sp.name, allowed, err)
+			}
+			rolesMap, err := policy.UserRoles(context.Background(), dbConn, []uuid.UUID{userID})
+			if err != nil {
+				t.Fatalf("UserRoles: %v", err)
+			}
+			if len(rolesMap[userID]) != 0 {
+				t.Fatalf("UserRoles reported %v for non-canonical binding, want []", rolesMap[userID])
+			}
+
+			// Canonical bind allows, then clearing via SetUserRoles(tx, id, nil) denies again.
+			if err := dbConn.Transaction(func(tx *gorm.DB) error {
+				return policy.SetUserRoles(tx, userID, []string{policy.BuiltinRole})
+			}); err != nil {
+				t.Fatalf("SetUserRoles standard: %v", err)
+			}
+			if err := engine.Reload(context.Background()); err != nil {
+				t.Fatalf("Reload after bind: %v", err)
+			}
+			allowed, err = engine.Enforce(policy.Request{UserID: userID, Relay: "default"})
+			if err != nil || !allowed {
+				t.Fatalf("canonical bind allowed=%v err=%v want true, nil", allowed, err)
+			}
+
+			if err := dbConn.Transaction(func(tx *gorm.DB) error {
+				return policy.SetUserRoles(tx, userID, nil)
+			}); err != nil {
+				t.Fatalf("SetUserRoles clear: %v", err)
+			}
+			if err := engine.Reload(context.Background()); err != nil {
+				t.Fatalf("Reload after clear: %v", err)
+			}
+			allowed, err = engine.Enforce(policy.Request{UserID: userID, Relay: "default"})
+			if err != nil || allowed {
+				t.Fatalf("after clearing canonical binding allowed=%v err=%v want false, nil", allowed, err)
+			}
+
+			// The unmanaged non-canonical row remains untouched in casbin_rule.
+			var nonCanonCount int64
+			if err := dbConn.Model(&model.CasbinRule{}).Where("ptype = ? AND v0 = ?", "g", "user:"+sp.raw).Count(&nonCanonCount).Error; err != nil {
+				t.Fatalf("count non-canonical row: %v", err)
+			}
+			if nonCanonCount != 1 {
+				t.Fatalf("non-canonical row count=%d want=1", nonCanonCount)
+			}
+		})
+	}
+}
+
+func TestReloadSeesOneConsistentSnapshot(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "snapshot.db")
+	dbURL := "sqlite://" + dbPath
+
+	conn1, err := db.OpenDatabase(dbURL)
+	if err != nil {
+		t.Fatalf("open conn1: %v", err)
+	}
+	if err := db.ApplyMigrations(context.Background(), conn1, dbURL); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	conn2, err := db.OpenDatabase(dbURL)
+	if err != nil {
+		t.Fatalf("open conn2: %v", err)
+	}
+
+	seedBuiltins(t, conn1)
+	if err := conn1.Create(&model.Relay{Name: "eu-1"}).Error; err != nil {
+		t.Fatalf("create relay eu-1: %v", err)
+	}
+	if err := conn1.Create(&model.Role{Name: "ops"}).Error; err != nil {
+		t.Fatalf("create role ops: %v", err)
+	}
+
+	u1, u2 := uuid.New(), uuid.New()
+	// OLD state: ops has all_relays=true, u1 bound to ops, u2 unbound.
+	// Neither OLD nor NEW state ever allows (u2, eu-1).
+	if err := conn1.Transaction(func(tx *gorm.DB) error {
+		if err := policy.SetRoleGrants(tx, "ops", []string{"*"}); err != nil {
+			return err
+		}
+		return policy.SetUserRoles(tx, u1, []string{"ops"})
+	}); err != nil {
+		t.Fatalf("seed old state: %v", err)
+	}
+
+	engine, err := policy.NewEngine(conn1, true)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	// Hook after the roles read inside Reload to race a competing transaction on
+	// conn2 that atomically replaces ops=["*"] with ops=["default"] and binds u2->ops.
+	// Without a single-snapshot read transaction, conn2 commits immediately during
+	// the pause and Reload mixes old roles (all_relays=true) with new casbin_rule
+	// (u2->ops), allowing (u2, eu-1).
+	var fired atomic.Bool
+	writerErrCh := make(chan error, 1)
+	writerDone := make(chan struct{})
+	if err := conn1.Callback().Query().After("gorm:query").Register("test_interleave_reload", func(tx *gorm.DB) {
+		if tx.Statement == nil || tx.Statement.Table != "roles" || !fired.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			defer close(writerDone)
+			writerErrCh <- conn2.Transaction(func(wtx *gorm.DB) error {
+				if err := policy.SetRoleGrants(wtx, "ops", []string{policy.BuiltinRelay}); err != nil {
+					return err
+				}
+				return policy.SetUserRoles(wtx, u2, []string{"ops"})
+			})
+		}()
+		select {
+		case <-writerDone:
+		case <-time.After(50 * time.Millisecond):
+		}
+	}); err != nil {
+		t.Fatalf("register query callback: %v", err)
+	}
+	defer func() {
+		_ = conn1.Callback().Query().Remove("test_interleave_reload")
+	}()
+
+	if err := engine.Reload(context.Background()); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if !fired.Load() {
+		t.Fatalf("interleaving hook did not fire")
+	}
+
+	// Wait for the competing write transaction to finish cleanly.
+	<-writerDone
+	if wErr := <-writerErrCh; wErr != nil {
+		t.Fatalf("competing writer failed: %v", wErr)
+	}
+
+	// Snapshot published by Reload must be either the complete OLD state or the
+	// complete NEW state — never a mix where (u2, eu-1) is allowed.
+	type matrix [4]bool
+	eval := func() matrix {
+		reqs := [4]policy.Request{
+			{UserID: u1, Relay: "default"},
+			{UserID: u1, Relay: "eu-1"},
+			{UserID: u2, Relay: "default"},
+			{UserID: u2, Relay: "eu-1"},
+		}
+		var out matrix
+		for i, r := range reqs {
+			ok, err := engine.Enforce(r)
+			if err != nil {
+				t.Fatalf("Enforce(%+v): %v", r, err)
+			}
+			out[i] = ok
+		}
+		return out
+	}
+
+	oldState := matrix{true, true, false, false}
+	newState := matrix{true, false, true, false}
+	got := eval()
+	if got != oldState && got != newState {
+		t.Fatalf("Reload published inconsistent mixed snapshot: got=%v want old=%v or new=%v", got, oldState, newState)
+	}
+
+	// A follow-up Reload after the competing transaction committed must see newState.
+	if err := engine.Reload(context.Background()); err != nil {
+		t.Fatalf("second Reload: %v", err)
+	}
+	if got2 := eval(); got2 != newState {
+		t.Fatalf("post-commit Reload got=%v want new=%v", got2, newState)
+	}
+}
+
+func TestRuleFunctionsRejectInvalidRegistryNames(t *testing.T) {
+	dbConn := openPolicyTestDB(t)
+	seedBuiltins(t, dbConn)
+
+	// Insert registry rows that violate NamePattern directly via SQL/GORM.
+	if err := dbConn.Create(&model.Role{Name: "Ops", AllRelays: true}).Error; err != nil {
+		t.Fatalf("insert invalid role Ops: %v", err)
+	}
+	if err := dbConn.Create(&model.Relay{Name: "EU_1"}).Error; err != nil {
+		t.Fatalf("insert invalid relay EU_1: %v", err)
+	}
+
+	u := uuid.New()
+	if err := dbConn.Transaction(func(tx *gorm.DB) error {
+		return policy.SetUserRoles(tx, u, []string{"Ops"})
+	}); !errors.Is(err, policy.ErrUnknownRole) {
+		t.Fatalf("SetUserRoles invalid registry role err=%v want ErrUnknownRole", err)
+	}
+
+	if err := dbConn.Transaction(func(tx *gorm.DB) error {
+		return policy.SetRoleGrants(tx, policy.BuiltinRole, []string{"EU_1"})
+	}); !errors.Is(err, policy.ErrUnknownRelay) {
+		t.Fatalf("SetRoleGrants invalid registry relay err=%v want ErrUnknownRelay", err)
+	}
+
+	if err := dbConn.Transaction(func(tx *gorm.DB) error {
+		return policy.SetRoleGrants(tx, "Ops", []string{policy.BuiltinRelay})
+	}); !errors.Is(err, policy.ErrUnknownRole) {
+		t.Fatalf("SetRoleGrants on invalid registry role err=%v want ErrUnknownRole", err)
+	}
+
+	// Even when raw rules exist in casbin_rule, UserRoles and RoleGrants report
+	// only what the engine would honour.
+	if err := dbConn.Create(&[]model.CasbinRule{
+		{Ptype: "g", V0: policy.UserSubject(u), V1: "role:Ops"},
+		{Ptype: "p", V0: "role:standard", V1: "derp:EU_1", V2: "connect"},
+	}).Error; err != nil {
+		t.Fatalf("insert raw rules with invalid names: %v", err)
+	}
+
+	rolesMap, err := policy.UserRoles(context.Background(), dbConn, []uuid.UUID{u})
+	if err != nil {
+		t.Fatalf("UserRoles: %v", err)
+	}
+	if len(rolesMap[u]) != 0 {
+		t.Fatalf("UserRoles reported invalid role: %v want []", rolesMap[u])
+	}
+
+	grantsMap, err := policy.RoleGrants(context.Background(), dbConn, []string{policy.BuiltinRole, "Ops"})
+	if err != nil {
+		t.Fatalf("RoleGrants: %v", err)
+	}
+	if !reflect.DeepEqual(grantsMap[policy.BuiltinRole], []string{policy.BuiltinRelay}) {
+		t.Fatalf("RoleGrants standard=%v want=[default]", grantsMap[policy.BuiltinRole])
+	}
+	if len(grantsMap["Ops"]) != 0 {
+		t.Fatalf("RoleGrants Ops=%v want=[]", grantsMap["Ops"])
+	}
+}
+
 func TestRuleFunctions(t *testing.T) {
 	dbConn := openPolicyTestDB(t)
 	seedBuiltins(t, dbConn)
@@ -333,9 +600,12 @@ func TestRuleFunctions(t *testing.T) {
 		t.Fatalf("ops wildcard grants=%v want=[*]", grants["ops"])
 	}
 
-	// Switch back to named grants for DeleteRelayGrants check.
+	// Switch ops back to named grants and also give eng grants on both eu-1 and default.
 	if err := dbConn.Transaction(func(tx *gorm.DB) error {
-		return policy.SetRoleGrants(tx, "ops", []string{"eu-1", "us-1"})
+		if err := policy.SetRoleGrants(tx, "ops", []string{"eu-1", "us-1"}); err != nil {
+			return err
+		}
+		return policy.SetRoleGrants(tx, "eng", []string{"eu-1", policy.BuiltinRelay})
 	}); err != nil {
 		t.Fatalf("SetRoleGrants switch back: %v", err)
 	}
@@ -351,7 +621,7 @@ func TestRuleFunctions(t *testing.T) {
 		if err := policy.SetUserRoles(tx, u1, []string{"ops", "eng"}); err != nil {
 			return err
 		}
-		return policy.SetUserRoles(tx, u2, []string{"ops"})
+		return policy.SetUserRoles(tx, u2, []string{"ops", "eng"})
 	}); err != nil {
 		t.Fatalf("SetUserRoles valid: %v", err)
 	}
@@ -359,11 +629,11 @@ func TestRuleFunctions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UserRoles: %v", err)
 	}
-	if !reflect.DeepEqual(rolesMap[u1], []string{"eng", "ops"}) || !reflect.DeepEqual(rolesMap[u2], []string{"ops"}) {
+	if !reflect.DeepEqual(rolesMap[u1], []string{"eng", "ops"}) || !reflect.DeepEqual(rolesMap[u2], []string{"eng", "ops"}) {
 		t.Fatalf("UserRoles got=%v", rolesMap)
 	}
 
-	// DeleteRelayGrants refuses builtin and deletes named relay grants.
+	// DeleteRelayGrants refuses builtin, deletes eu-1 grants, and preserves grants on other relays.
 	if err := dbConn.Transaction(func(tx *gorm.DB) error {
 		return policy.DeleteRelayGrants(tx, policy.BuiltinRelay)
 	}); !errors.Is(err, policy.ErrBuiltin) {
@@ -374,15 +644,22 @@ func TestRuleFunctions(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("DeleteRelayGrants eu-1: %v", err)
 	}
-	grants, err = policy.RoleGrants(context.Background(), dbConn, []string{"ops"})
+	grants, err = policy.RoleGrants(context.Background(), dbConn, []string{"ops", "eng", policy.BuiltinRole})
 	if err != nil {
 		t.Fatalf("RoleGrants after DeleteRelayGrants: %v", err)
 	}
 	if !reflect.DeepEqual(grants["ops"], []string{"us-1"}) {
 		t.Fatalf("ops grants after eu-1 delete=%v want=[us-1]", grants["ops"])
 	}
+	if !reflect.DeepEqual(grants["eng"], []string{policy.BuiltinRelay}) {
+		t.Fatalf("eng grants after eu-1 delete=%v want=[default]", grants["eng"])
+	}
+	if !reflect.DeepEqual(grants[policy.BuiltinRole], []string{policy.BuiltinRelay}) {
+		t.Fatalf("standard grants after eu-1 delete=%v want=[default]", grants[policy.BuiltinRole])
+	}
 
-	// DeleteRoleRules refuses builtin and returns binding count (2 users bound to ops).
+	// DeleteRoleRules refuses builtin, returns binding count (2 users bound to ops),
+	// and preserves eng's grants and user bindings.
 	if err := dbConn.Transaction(func(tx *gorm.DB) error {
 		_, err := policy.DeleteRoleRules(tx, policy.BuiltinRole)
 		return err
@@ -400,13 +677,32 @@ func TestRuleFunctions(t *testing.T) {
 	if removed != 2 {
 		t.Fatalf("DeleteRoleRules removed=%d want=2", removed)
 	}
+	grants, err = policy.RoleGrants(context.Background(), dbConn, []string{"ops", "eng"})
+	if err != nil {
+		t.Fatalf("RoleGrants after DeleteRoleRules: %v", err)
+	}
+	if len(grants["ops"]) != 0 {
+		t.Fatalf("ops grants after delete=%v want=[]", grants["ops"])
+	}
+	if !reflect.DeepEqual(grants["eng"], []string{policy.BuiltinRelay}) {
+		t.Fatalf("eng grants damaged by DeleteRoleRules(ops): got=%v want=[default]", grants["eng"])
+	}
+	rolesMap, err = policy.UserRoles(context.Background(), dbConn, []uuid.UUID{u1, u2})
+	if err != nil {
+		t.Fatalf("UserRoles after DeleteRoleRules: %v", err)
+	}
+	if !reflect.DeepEqual(rolesMap[u1], []string{"eng"}) || !reflect.DeepEqual(rolesMap[u2], []string{"eng"}) {
+		t.Fatalf("other role bindings damaged by DeleteRoleRules(ops): got=%v", rolesMap)
+	}
 
-	// DeleteLegacyDeviceRule & DeleteUserRules.
+	// DeleteLegacyDeviceRule & DeleteUserRules: verify isolation across devices and users.
 	nk1 := "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	nk2 := "nodekey:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	nk3 := "nodekey:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	if err := dbConn.Create(&[]model.CasbinRule{
 		{Ptype: "g", V0: "device:" + nk1, V1: policy.UserSubject(u1)},
 		{Ptype: "g", V0: "device:" + nk2, V1: policy.UserSubject(u1)},
+		{Ptype: "g", V0: "device:" + nk3, V1: policy.UserSubject(u2)},
 	}).Error; err != nil {
 		t.Fatalf("seed legacy device rules: %v", err)
 	}
@@ -423,6 +719,19 @@ func TestRuleFunctions(t *testing.T) {
 	if legacyCount != 0 {
 		t.Fatalf("legacy rule nk1 still exists")
 	}
+	// Other device of u1 (nk2) and device of u2 (nk3) must still exist.
+	if err := dbConn.Model(&model.CasbinRule{}).Where("ptype = ? AND v0 = ? AND v1 = ?", "g", "device:"+nk2, policy.UserSubject(u1)).Count(&legacyCount).Error; err != nil {
+		t.Fatalf("count legacy nk2: %v", err)
+	}
+	if legacyCount != 1 {
+		t.Fatalf("legacy rule nk2 count=%d want=1 (must not be deleted by DeleteLegacyDeviceRule(nk1))", legacyCount)
+	}
+	if err := dbConn.Model(&model.CasbinRule{}).Where("ptype = ? AND v0 = ? AND v1 = ?", "g", "device:"+nk3, policy.UserSubject(u2)).Count(&legacyCount).Error; err != nil {
+		t.Fatalf("count legacy nk3: %v", err)
+	}
+	if legacyCount != 1 {
+		t.Fatalf("legacy rule nk3 count=%d want=1 (must not be deleted by DeleteLegacyDeviceRule(nk1))", legacyCount)
+	}
 
 	if err := dbConn.Transaction(func(tx *gorm.DB) error {
 		return policy.DeleteUserRules(tx, u1, []string{nk2})
@@ -436,6 +745,23 @@ func TestRuleFunctions(t *testing.T) {
 	}
 	if legacyCount != 0 {
 		t.Fatalf("remaining u1 rules=%d want=0", legacyCount)
+	}
+	// u2 must keep both its role bindings and its legacy device rule.
+	rolesMap, err = policy.UserRoles(context.Background(), dbConn, []uuid.UUID{u1, u2})
+	if err != nil {
+		t.Fatalf("UserRoles after DeleteUserRules: %v", err)
+	}
+	if len(rolesMap[u1]) != 0 {
+		t.Fatalf("u1 roles after delete=%v want=[]", rolesMap[u1])
+	}
+	if !reflect.DeepEqual(rolesMap[u2], []string{"eng"}) {
+		t.Fatalf("u2 roles damaged by DeleteUserRules(u1): got=%v want=[eng]", rolesMap[u2])
+	}
+	if err := dbConn.Model(&model.CasbinRule{}).Where("ptype = ? AND v0 = ? AND v1 = ?", "g", "device:"+nk3, policy.UserSubject(u2)).Count(&legacyCount).Error; err != nil {
+		t.Fatalf("count u2 legacy nk3: %v", err)
+	}
+	if legacyCount != 1 {
+		t.Fatalf("u2 legacy rule nk3 count=%d want=1 (must not be deleted by DeleteUserRules(u1))", legacyCount)
 	}
 }
 

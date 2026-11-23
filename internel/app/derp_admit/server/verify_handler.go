@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"derp-admit/internel/app/derp_admit/derp"
+	"derp-admit/internel/app/derp_admit/metrics"
 	"derp-admit/internel/app/derp_admit/service"
 
 	"github.com/gin-gonic/gin"
@@ -12,10 +13,11 @@ import (
 	"golang.org/x/time/rate"
 )
 
-func verifyHandler(svc *service.Service, verifyLimiter *rate.Limiter, logger *zap.Logger) gin.HandlerFunc {
+func verifyHandler(svc *service.Service, verifyLimiter *rate.Limiter, logger *zap.Logger, rec metrics.Recorder) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !verifyLimiter.Allow() {
 			logWithTrace(logger, c.Request.Context()).Warn("verify request rate limited")
+			rec.RateLimited(metrics.EndpointVerify)
 			resp := derp.BuildResponse(false, "rate limited")
 			c.JSON(http.StatusOK, resp)
 			return
@@ -31,7 +33,7 @@ func verifyHandler(svc *service.Service, verifyLimiter *rate.Limiter, logger *za
 			return
 		}
 
-		allow, denyReason := svc.Verify(c.Request.Context(), raw)
+		allow, denyReason := svc.Verify(c.Request.Context(), "default", raw)
 		resp := derp.BuildResponse(allow, denyReason)
 		c.JSON(http.StatusOK, resp)
 	}

@@ -114,8 +114,8 @@ func (r *Relay) BeforeCreate(_ *gorm.DB) error {
 const PolicyStateRowID = 1
 
 type PolicyState struct {
-	ID         int        `gorm:"primaryKey;autoIncrement:false;not null;check:id = 1"`
-	Version    int64      `gorm:"not null;default:0"`
+	ID         int   `gorm:"primaryKey;autoIncrement:false;not null;check:id = 1"`
+	Version    int64 `gorm:"not null;default:0"`
 	UpgradedAt *time.Time
 }
 

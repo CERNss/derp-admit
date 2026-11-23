@@ -3,7 +3,9 @@ package server_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -14,12 +16,11 @@ import (
 	"time"
 
 	"derp-admit/config"
+	"derp-admit/internel/app/derp_admit/actor"
+	"derp-admit/internel/app/derp_admit/app"
 	"derp-admit/internel/app/derp_admit/db"
 	"derp-admit/internel/app/derp_admit/derp"
 	"derp-admit/internel/app/derp_admit/model"
-	"derp-admit/internel/app/derp_admit/policy"
-	"derp-admit/internel/app/derp_admit/server"
-	"derp-admit/internel/app/derp_admit/service"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -42,21 +43,15 @@ func newTestRouter(t *testing.T, opts ...func(*config.Config)) (http.Handler, *g
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	if err := db.ApplyMigrations(context.Background(), gormDB, dbURL); err != nil {
-		t.Fatalf("apply migrations: %v", err)
-	}
-
-	policyEngine, err := policy.NewEngine(gormDB, true)
-	if err != nil {
-		t.Fatalf("new policy: %v", err)
-	}
-	if err := policyEngine.Bootstrap(context.Background()); err != nil {
-		t.Fatalf("bootstrap policy: %v", err)
-	}
 
 	logger := zap.NewNop()
 	cfg := config.Config{
+		DatabaseURL:          dbURL,
+		TokenPepper:          "test-pepper",
+		EnableCasbin:         true,
+		MetricsEnabled:       true,
 		DBTimeout:            2 * time.Second,
+		PolicySyncInterval:   2 * time.Second,
 		VerifyRateLimitRPS:   1000,
 		VerifyRateBurst:      1000,
 		RegisterRateLimitRPS: 1000,
@@ -67,10 +62,34 @@ func newTestRouter(t *testing.T, opts ...func(*config.Config)) (http.Handler, *g
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	svc := service.New(gormDB, policyEngine, "test-pepper", 2*time.Second, service.NewVerifyCache(cfg.VerifyCacheTTL), logger)
-	router := server.NewRouter(svc, cfg, logger)
+	application, err := app.Build(context.Background(), gormDB, cfg, logger)
+	if err != nil {
+		t.Fatalf("build app: %v", err)
+	}
+	t.Cleanup(application.Close)
 
-	return router, gormDB
+	return application.Router, gormDB
+}
+
+func insertAdminKey(t *testing.T, dbConn *gorm.DB, name string, tier actor.Tier) string {
+	t.Helper()
+
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		t.Fatalf("generate admin key: %v", err)
+	}
+	plain := "dak_" + base64.RawURLEncoding.EncodeToString(raw)
+
+	entry := model.AdminKey{
+		ID:      uuid.New(),
+		Name:    name,
+		Tier:    tier.String(),
+		KeyHash: hashToken(plain, "test-pepper"),
+	}
+	if err := dbConn.Create(&entry).Error; err != nil {
+		t.Fatalf("insert admin key: %v", err)
+	}
+	return plain
 }
 
 func createUser(t *testing.T, dbConn *gorm.DB, username string) model.User {

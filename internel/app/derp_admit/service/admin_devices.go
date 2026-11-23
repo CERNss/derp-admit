@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"derp-admit/internel/app/derp_admit/model"
@@ -28,34 +29,37 @@ func (s *Service) ListDevices(ctx context.Context, userID *uuid.UUID) ([]model.D
 	return devices, nil
 }
 
-// SetDeviceRevoked toggles a device's revoked state and invalidates its cached
-// decision so the change takes effect immediately.
+// SetDeviceRevoked toggles a device's revoked state and purges cached
+// decisions so the change takes effect immediately.
 func (s *Service) SetDeviceRevoked(ctx context.Context, id uuid.UUID, revoked bool) error {
-	dbCtx, cancel := context.WithTimeout(ctx, s.dbTimeout)
-	defer cancel()
-
-	var device model.Device
-	if err := s.db.WithContext(dbCtx).First(&device, "id = ?", id).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ErrAdminNotFound
+	return s.Mutate(ctx, EffectCache, http.StatusOK, func(tx *gorm.DB, ch *Change) error {
+		var device model.Device
+		if err := tx.First(&device, "id = ?", id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrAdminNotFound
+			}
+			return fmt.Errorf("lookup device: %w", err)
 		}
-		return fmt.Errorf("lookup device: %w", err)
-	}
-	if revoked == (device.RevokedAt != nil) {
-		// Already in the requested state; keep the original timestamp.
+
+		ch.TargetID = id.String()
+		ch.Summary = map[string]any{"revoked": revoked}
+		if revoked == (device.RevokedAt != nil) {
+			// Already in the requested state; keep the original timestamp.
+			ch.Changed = false
+			return nil
+		}
+
+		var revokedAt *time.Time
+		if revoked {
+			now := time.Now().UTC()
+			revokedAt = &now
+		}
+		if err := tx.Model(&model.Device{}).
+			Where("id = ?", id).Update("revoked_at", revokedAt).Error; err != nil {
+			return fmt.Errorf("update device: %w", err)
+		}
+
+		ch.Changed = true
 		return nil
-	}
-
-	var revokedAt *time.Time
-	if revoked {
-		now := time.Now().UTC()
-		revokedAt = &now
-	}
-	if err := s.db.WithContext(dbCtx).Model(&model.Device{}).
-		Where("id = ?", id).Update("revoked_at", revokedAt).Error; err != nil {
-		return fmt.Errorf("update device: %w", err)
-	}
-
-	s.cache.Invalidate(device.NodeKey)
-	return nil
+	})
 }

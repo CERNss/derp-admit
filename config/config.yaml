@@ -20,3 +20,5 @@ verify_rate_limit_burst: 200
 register_rate_limit_rps: 5
 register_rate_limit_burst: 10
 verify_cache_ttl: "0s"
+policy_sync_interval: "2s"
+metrics_enabled: true

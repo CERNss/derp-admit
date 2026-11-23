@@ -19,7 +19,7 @@ Configuration is loaded in this order (later overrides earlier):
 
 - `ADDR` (default `:8080`)
 - `ADMIN_API_KEY` (enables the `/admin` API when set; must be ≥ 16 chars)
-- `ADMIN_RATE_LIMIT_RPS` (default `10`, applied per client IP before authentication on `/admin`, including key guessing; client IP is the TCP peer address, so callers behind one reverse proxy share one bucket)
+- `ADMIN_RATE_LIMIT_RPS` (default `10`, applied per client IP before authentication on `/admin`, including key guessing; client IP is the TCP peer address with IPv6 clients grouped by /64 prefix, so callers behind one reverse proxy share one bucket)
 - `ADMIN_RATE_LIMIT_BURST` (default `20`)
 - `LOG_LEVEL` (default `info`)
 - `ENABLE_CASBIN` (default `true`)
@@ -31,7 +31,7 @@ Configuration is loaded in this order (later overrides earlier):
 - `DB_TIMEOUT` (default `2s`)
 - `VERIFY_RATE_LIMIT_RPS` (default `100`)
 - `VERIFY_RATE_LIMIT_BURST` (default `200`)
-- `REGISTER_RATE_LIMIT_RPS` (default `5`, applied per client IP so one abusive client cannot starve other registrations; throttles enroll-token guessing on `/register`)
+- `REGISTER_RATE_LIMIT_RPS` (default `5`, applied per client IP with IPv6 clients grouped by /64 prefix so one abusive client cannot starve other registrations; throttles enroll-token guessing on `/register`)
 - `REGISTER_RATE_LIMIT_BURST` (default `10`)
 - `VERIFY_CACHE_TTL` (default `0s`, disabled)
 

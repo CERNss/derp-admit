@@ -23,7 +23,7 @@ func OpenDatabase(databaseURL string) (*gorm.DB, error) {
 		if strings.Contains(path, "?") {
 			sep = "&"
 		}
-		return gorm.Open(sqlite.Open(path+sep+"_txlock=immediate"), &gorm.Config{
+		return gorm.Open(sqlite.Open(path+sep+"_txlock=immediate&_busy_timeout=5000"), &gorm.Config{
 			Logger:         logger.Default.LogMode(logger.Silent),
 			TranslateError: true,
 		})

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"derp-admit/internel/app/derp_admit/metrics"
 	"derp-admit/internel/app/derp_admit/policy"
 
 	"go.opentelemetry.io/otel/trace"
@@ -14,24 +15,61 @@ import (
 	"gorm.io/gorm"
 )
 
-type Service struct {
-	db          *gorm.DB
-	policy      *policy.Engine
-	tokenPepper string
-	dbTimeout   time.Duration
-	cache       *VerifyCache
-	logger      *zap.Logger
+type Option func(*Service)
+
+func WithAdminAPIKey(key string) Option {
+	return func(s *Service) {
+		s.adminAPIKey = key
+	}
 }
 
-func New(db *gorm.DB, policyEngine *policy.Engine, tokenPepper string, dbTimeout time.Duration, cache *VerifyCache, logger *zap.Logger) *Service {
-	return &Service{
-		db:          db,
-		policy:      policyEngine,
-		tokenPepper: tokenPepper,
-		dbTimeout:   dbTimeout,
-		cache:       cache,
-		logger:      logger,
+func WithMetrics(r metrics.Recorder) Option {
+	return func(s *Service) {
+		if r != nil {
+			s.metrics = r
+		}
 	}
+}
+
+func WithPolicySyncInterval(d time.Duration) Option {
+	return func(s *Service) {
+		if d > 0 {
+			s.policySyncInterval = d
+		}
+	}
+}
+
+type Service struct {
+	db                 *gorm.DB
+	policy             *policy.Engine
+	tokenPepper        string
+	adminAPIKey        string
+	dbTimeout          time.Duration
+	policySyncInterval time.Duration
+	cache              *VerifyCache
+	logger             *zap.Logger
+	metrics            metrics.Recorder
+	sync               *syncer
+}
+
+func New(db *gorm.DB, policyEngine *policy.Engine, tokenPepper string, dbTimeout time.Duration, cache *VerifyCache, logger *zap.Logger, opts ...Option) *Service {
+	s := &Service{
+		db:                 db,
+		policy:             policyEngine,
+		tokenPepper:        tokenPepper,
+		dbTimeout:          dbTimeout,
+		policySyncInterval: 2 * time.Second,
+		cache:              cache,
+		logger:             logger,
+		metrics:            metrics.Nop,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	s.sync = newSyncer()
+	return s
 }
 
 func loggerWithTrace(logger *zap.Logger, ctx context.Context) *zap.Logger {

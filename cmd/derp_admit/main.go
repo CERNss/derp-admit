@@ -11,10 +11,8 @@ import (
 	"time"
 
 	"derp-admit/config"
+	"derp-admit/internel/app/derp_admit/app"
 	"derp-admit/internel/app/derp_admit/db"
-	"derp-admit/internel/app/derp_admit/policy"
-	"derp-admit/internel/app/derp_admit/server"
-	"derp-admit/internel/app/derp_admit/service"
 	"derp-admit/internel/app/derp_admit/telemetry"
 
 	"go.uber.org/zap"
@@ -53,30 +51,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	mCtx, mCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer mCancel()
-	if err := db.ApplyMigrations(mCtx, gormDB, cfg.DatabaseURL); err != nil {
-		logger.Error("apply migrations", zap.Error(err))
-		os.Exit(1)
-	}
-
-	policyEngine, err := policy.NewEngine(gormDB, cfg.EnableCasbin)
+	buildCtx, buildCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	application, err := app.Build(buildCtx, gormDB, cfg, logger)
+	buildCancel()
 	if err != nil {
-		logger.Error("init policy", zap.Error(err))
+		logger.Error("build application", zap.Error(err))
 		os.Exit(1)
 	}
-	if err := policyEngine.Bootstrap(context.Background()); err != nil {
-		logger.Error("bootstrap policy", zap.Error(err))
-		os.Exit(1)
-	}
-
-	verifyCache := service.NewVerifyCache(cfg.VerifyCacheTTL)
-	svc := service.New(gormDB, policyEngine, cfg.TokenPepper, cfg.DBTimeout, verifyCache, logger)
-	router := server.NewRouter(svc, cfg, logger)
+	defer application.Close()
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           router,
+		Handler:           application.Router,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,

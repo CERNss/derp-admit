@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -30,19 +31,8 @@ type CreateTokenResult struct {
 }
 
 func (s *Service) CreateToken(ctx context.Context, in CreateTokenInput) (CreateTokenResult, error) {
-	dbCtx, cancel := context.WithTimeout(ctx, s.dbTimeout)
-	defer cancel()
-
 	if in.MaxDevices < 0 {
 		return CreateTokenResult{}, fmt.Errorf("%w: maxDevices must be >= 0", ErrAdminInvalid)
-	}
-
-	var user model.User
-	if err := s.db.WithContext(dbCtx).First(&user, "id = ?", in.UserID).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return CreateTokenResult{}, ErrAdminNotFound
-		}
-		return CreateTokenResult{}, fmt.Errorf("lookup user: %w", err)
 	}
 
 	plain, err := generateToken()
@@ -50,15 +40,44 @@ func (s *Service) CreateToken(ctx context.Context, in CreateTokenInput) (CreateT
 		return CreateTokenResult{}, fmt.Errorf("generate token: %w", err)
 	}
 
-	token := model.EnrollToken{
-		UserID:     in.UserID,
-		TokenHash:  s.hashToken(plain),
-		ExpiresAt:  in.ExpiresAt,
-		MaxDevices: in.MaxDevices,
-		Note:       strings.TrimSpace(in.Note),
-	}
-	if err := s.db.WithContext(dbCtx).Create(&token).Error; err != nil {
-		return CreateTokenResult{}, fmt.Errorf("create token: %w", err)
+	var token model.EnrollToken
+	err = s.Mutate(ctx, EffectNone, http.StatusCreated, func(tx *gorm.DB, ch *Change) error {
+		var user model.User
+		if err := tx.First(&user, "id = ?", in.UserID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrAdminNotFound
+			}
+			return fmt.Errorf("lookup user: %w", err)
+		}
+
+		note := strings.TrimSpace(in.Note)
+		t := model.EnrollToken{
+			UserID:     in.UserID,
+			TokenHash:  s.hashToken(plain),
+			ExpiresAt:  in.ExpiresAt,
+			MaxDevices: in.MaxDevices,
+			Note:       note,
+		}
+		if err := tx.Create(&t).Error; err != nil {
+			return fmt.Errorf("create token: %w", err)
+		}
+
+		token = t
+		ch.Changed = true
+		ch.TargetID = t.ID.String()
+		summary := map[string]any{
+			"userId":     in.UserID.String(),
+			"maxDevices": in.MaxDevices,
+			"note":       note,
+		}
+		if in.ExpiresAt != nil {
+			summary["expiresAt"] = in.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		ch.Summary = summary
+		return nil
+	})
+	if err != nil {
+		return CreateTokenResult{}, err
 	}
 
 	return CreateTokenResult{Token: token, Plain: plain}, nil
@@ -76,26 +95,31 @@ func (s *Service) ListTokens(ctx context.Context) ([]model.EnrollToken, error) {
 }
 
 func (s *Service) RevokeToken(ctx context.Context, id uuid.UUID) error {
-	dbCtx, cancel := context.WithTimeout(ctx, s.dbTimeout)
-	defer cancel()
-
-	var token model.EnrollToken
-	if err := s.db.WithContext(dbCtx).First(&token, "id = ?", id).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ErrAdminNotFound
+	return s.Mutate(ctx, EffectNone, http.StatusOK, func(tx *gorm.DB, ch *Change) error {
+		var token model.EnrollToken
+		if err := tx.First(&token, "id = ?", id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrAdminNotFound
+			}
+			return fmt.Errorf("lookup token: %w", err)
 		}
-		return fmt.Errorf("lookup token: %w", err)
-	}
-	if token.RevokedAt != nil {
-		return nil
-	}
 
-	now := time.Now().UTC()
-	if err := s.db.WithContext(dbCtx).Model(&model.EnrollToken{}).
-		Where("id = ?", id).Update("revoked_at", now).Error; err != nil {
-		return fmt.Errorf("revoke token: %w", err)
-	}
-	return nil
+		ch.TargetID = id.String()
+		ch.Summary = map[string]any{"revoked": true}
+		if token.RevokedAt != nil {
+			ch.Changed = false
+			return nil
+		}
+
+		now := time.Now().UTC()
+		if err := tx.Model(&model.EnrollToken{}).
+			Where("id = ?", id).Update("revoked_at", now).Error; err != nil {
+			return fmt.Errorf("revoke token: %w", err)
+		}
+
+		ch.Changed = true
+		return nil
+	})
 }
 
 func generateToken() (string, error) {

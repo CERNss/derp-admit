@@ -37,6 +37,8 @@ type Config struct {
 	AdminRateLimitRPS    float64
 	AdminRateBurst       int
 	VerifyCacheTTL       time.Duration
+	PolicySyncInterval   time.Duration
+	MetricsEnabled       bool
 }
 
 type fileConfig struct {
@@ -59,6 +61,8 @@ type fileConfig struct {
 	AdminRateLimitRPS    *float64 `yaml:"admin_rate_limit_rps"`
 	AdminRateBurst       *int     `yaml:"admin_rate_limit_burst"`
 	VerifyCacheTTL       *string  `yaml:"verify_cache_ttl"`
+	PolicySyncInterval   *string  `yaml:"policy_sync_interval"`
+	MetricsEnabled       *bool    `yaml:"metrics_enabled"`
 }
 
 func LoadFromEnv() (Config, error) {
@@ -103,6 +107,8 @@ func defaultConfig() Config {
 		AdminRateLimitRPS:    10,
 		AdminRateBurst:       20,
 		VerifyCacheTTL:       0,
+		PolicySyncInterval:   2 * time.Second,
+		MetricsEnabled:       true,
 	}
 }
 
@@ -185,6 +191,16 @@ func mergeFromYAMLFile(cfg *Config, path string) error {
 			return fmt.Errorf("invalid verify_cache_ttl in config file: %w", err)
 		}
 		cfg.VerifyCacheTTL = parsed
+	}
+	if fc.PolicySyncInterval != nil {
+		parsed, err := time.ParseDuration(*fc.PolicySyncInterval)
+		if err != nil {
+			return fmt.Errorf("invalid policy_sync_interval in config file: %w", err)
+		}
+		cfg.PolicySyncInterval = parsed
+	}
+	if fc.MetricsEnabled != nil {
+		cfg.MetricsEnabled = *fc.MetricsEnabled
 	}
 
 	return nil
@@ -337,6 +353,20 @@ func mergeFromEnv(cfg *Config, fileVars map[string]string) error {
 		}
 		cfg.VerifyCacheTTL = parsed
 	}
+	if v, ok := getEnv("POLICY_SYNC_INTERVAL", fileVars); ok {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid POLICY_SYNC_INTERVAL: %w", err)
+		}
+		cfg.PolicySyncInterval = parsed
+	}
+	if v, ok := getEnv("METRICS_ENABLED", fileVars); ok {
+		parsed, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid METRICS_ENABLED: %w", err)
+		}
+		cfg.MetricsEnabled = parsed
+	}
 
 	return nil
 }
@@ -371,6 +401,9 @@ func validate(cfg Config) error {
 	}
 	if cfg.DBTimeout <= 0 {
 		return fmt.Errorf("DB_TIMEOUT must be > 0")
+	}
+	if cfg.PolicySyncInterval <= 0 {
+		return fmt.Errorf("POLICY_SYNC_INTERVAL must be > 0")
 	}
 	if cfg.OTELSampleRatio < 0 || cfg.OTELSampleRatio > 1 {
 		return fmt.Errorf("OTEL_TRACE_SAMPLE_RATIO must be between 0 and 1")

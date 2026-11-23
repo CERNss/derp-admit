@@ -22,19 +22,48 @@ const (
 	DenyReasonInternal      = "internal error"
 )
 
-func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
+type verifyDecision struct {
+	allow    bool
+	reason   string
+	nodeKey  string
+	deviceID *uuid.UUID
+	cache    bool
+	epoch    uint64
+}
+
+func (s *Service) Verify(ctx context.Context, relay string, body []byte) (bool, string) {
+	dec := s.decide(ctx, relay, body)
+	s.finish(relay, dec)
+	return dec.allow, dec.reason
+}
+
+func (s *Service) decide(ctx context.Context, _ string, body []byte) verifyDecision {
 	logger := loggerWithTrace(s.logger, ctx)
 
 	_, nodeKey, err := derp.ParseRequest(body)
 	if err != nil {
 		logger.Warn("invalid verify request", zap.Error(err))
-		s.writeAudit(context.Background(), nil, "", false, DenyReasonInvalidReq)
-		return false, DenyReasonInvalidReq
+		return verifyDecision{allow: false, reason: DenyReasonInvalidReq}
+	}
+
+	if s.sync.Stale() {
+		logger.Error("policy sync stale, denying verify request",
+			zap.String("node_key", nodeKey),
+		)
+		return verifyDecision{allow: false, reason: DenyReasonInternal, nodeKey: nodeKey}
 	}
 
 	if cached, ok := s.cache.Get(nodeKey); ok {
-		s.writeAudit(context.Background(), cached.DeviceID, nodeKey, cached.Allow, cached.Reason)
-		return cached.Allow, cached.Reason
+		s.metrics.CacheLookup(true)
+		return verifyDecision{
+			allow:    cached.Allow,
+			reason:   cached.Reason,
+			nodeKey:  nodeKey,
+			deviceID: cached.DeviceID,
+		}
+	}
+	if s.cache.Enabled() {
+		s.metrics.CacheLookup(false)
 	}
 
 	// Snapshot before the DB reads: if a revoke/disable/registration
@@ -48,23 +77,31 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 	var device model.Device
 	if err := s.db.WithContext(dbCtx).Where("node_key = ?", nodeKey).First(&device).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			s.writeAudit(context.Background(), nil, nodeKey, false, DenyReasonNotRegistered)
-			s.cache.Set(nodeKey, epoch, false, DenyReasonNotRegistered, nil)
-			return false, DenyReasonNotRegistered
+			return verifyDecision{
+				allow:   false,
+				reason:  DenyReasonNotRegistered,
+				nodeKey: nodeKey,
+				cache:   true,
+				epoch:   epoch,
+			}
 		}
 		logger.Error("lookup device during verify",
 			zap.Error(err),
 			zap.String("node_key", nodeKey),
 		)
-		s.writeAudit(context.Background(), nil, nodeKey, false, DenyReasonInternal)
-		return false, DenyReasonInternal
+		return verifyDecision{allow: false, reason: DenyReasonInternal, nodeKey: nodeKey}
 	}
 
+	deviceID := device.ID
 	if device.RevokedAt != nil {
-		deviceID := device.ID
-		s.writeAudit(context.Background(), &deviceID, nodeKey, false, DenyReasonRevoked)
-		s.cache.Set(nodeKey, epoch, false, DenyReasonRevoked, &deviceID)
-		return false, DenyReasonRevoked
+		return verifyDecision{
+			allow:    false,
+			reason:   DenyReasonRevoked,
+			nodeKey:  nodeKey,
+			deviceID: &deviceID,
+			cache:    true,
+			epoch:    epoch,
+		}
 	}
 
 	var user model.User
@@ -74,15 +111,17 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 			zap.String("node_key", nodeKey),
 			zap.String("user_id", device.UserID.String()),
 		)
-		deviceID := device.ID
-		s.writeAudit(context.Background(), &deviceID, nodeKey, false, DenyReasonInternal)
-		return false, DenyReasonInternal
+		return verifyDecision{allow: false, reason: DenyReasonInternal, nodeKey: nodeKey, deviceID: &deviceID}
 	}
 	if user.DisabledAt != nil {
-		deviceID := device.ID
-		s.writeAudit(context.Background(), &deviceID, nodeKey, false, DenyReasonUserDisabled)
-		s.cache.Set(nodeKey, epoch, false, DenyReasonUserDisabled, &deviceID)
-		return false, DenyReasonUserDisabled
+		return verifyDecision{
+			allow:    false,
+			reason:   DenyReasonUserDisabled,
+			nodeKey:  nodeKey,
+			deviceID: &deviceID,
+			cache:    true,
+			epoch:    epoch,
+		}
 	}
 
 	allowed, err := s.policy.EnforceConnect(nodeKey)
@@ -91,15 +130,17 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 			zap.Error(err),
 			zap.String("node_key", nodeKey),
 		)
-		deviceID := device.ID
-		s.writeAudit(context.Background(), &deviceID, nodeKey, false, DenyReasonInternal)
-		return false, DenyReasonInternal
+		return verifyDecision{allow: false, reason: DenyReasonInternal, nodeKey: nodeKey, deviceID: &deviceID}
 	}
 	if !allowed {
-		deviceID := device.ID
-		s.writeAudit(context.Background(), &deviceID, nodeKey, false, DenyReasonPolicyDenied)
-		s.cache.Set(nodeKey, epoch, false, DenyReasonPolicyDenied, &deviceID)
-		return false, DenyReasonPolicyDenied
+		return verifyDecision{
+			allow:    false,
+			reason:   DenyReasonPolicyDenied,
+			nodeKey:  nodeKey,
+			deviceID: &deviceID,
+			cache:    true,
+			epoch:    epoch,
+		}
 	}
 
 	now := time.Now().UTC()
@@ -116,10 +157,22 @@ func (s *Service) Verify(ctx context.Context, body []byte) (bool, string) {
 		)
 	}
 
-	deviceID := device.ID
-	s.writeAudit(context.Background(), &deviceID, nodeKey, true, "")
-	s.cache.Set(nodeKey, epoch, true, "", &deviceID)
-	return true, ""
+	return verifyDecision{
+		allow:    true,
+		reason:   "",
+		nodeKey:  nodeKey,
+		deviceID: &deviceID,
+		cache:    true,
+		epoch:    epoch,
+	}
+}
+
+func (s *Service) finish(relay string, dec verifyDecision) {
+	s.writeAudit(context.Background(), dec.deviceID, dec.nodeKey, dec.allow, dec.reason)
+	if dec.cache {
+		s.cache.Set(dec.nodeKey, dec.epoch, dec.allow, dec.reason, dec.deviceID)
+	}
+	s.metrics.VerifyDecision(relay, dec.allow, dec.reason)
 }
 
 func (s *Service) writeAudit(ctx context.Context, deviceID *uuid.UUID, nodeKey string, allowed bool, reason string) {

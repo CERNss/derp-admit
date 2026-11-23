@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"derp-admit/config"
+	"derp-admit/internel/app/derp_admit/metrics"
 	"derp-admit/internel/app/derp_admit/service"
 
 	"github.com/gin-gonic/gin"
@@ -20,7 +21,29 @@ import (
 // path from large-payload memory pressure.
 const maxRequestBodyBytes = 1 << 20 // 1 MiB
 
-func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger) *gin.Engine {
+type RouterOption func(*routerOptions)
+
+type routerOptions struct {
+	metrics metrics.Recorder
+}
+
+func WithMetrics(r metrics.Recorder) RouterOption {
+	return func(o *routerOptions) {
+		if r != nil {
+			o.metrics = r
+		}
+	}
+}
+
+func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger, opts ...RouterOption) *gin.Engine {
+	ro := routerOptions{metrics: metrics.Nop}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&ro)
+		}
+	}
+	rec := ro.metrics
+
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	// Trust no proxy headers: ClientIP is the TCP peer address, so the per-IP
@@ -46,20 +69,33 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger) *gin
 			c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false})
 			return
 		}
+		if svc.SyncStale() {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"ok": false})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
+
+	if cfg.MetricsEnabled {
+		if h := rec.Handler(); h != nil {
+			router.GET("/metrics", gin.WrapH(h))
+		}
+	}
 
 	router.POST("/register", func(c *gin.Context) {
 		if !registerLimiter.Allow(c.ClientIP()) {
 			logWithTrace(logger, c.Request.Context()).Warn("register request rate limited",
 				zap.String("client_ip", c.ClientIP()),
 			)
+			rec.RateLimited(metrics.EndpointRegister)
+			rec.RegisterOutcome(http.StatusTooManyRequests)
 			c.JSON(http.StatusTooManyRequests, gin.H{"ok": false, "error": "rate limited"})
 			return
 		}
 
 		var req service.RegisterInput
 		if !bindJSON(c, &req) {
+			rec.RegisterOutcome(c.Writer.Status())
 			return
 		}
 
@@ -68,10 +104,12 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger) *gin
 			logWithTrace(logger, c.Request.Context()).Error("register failed",
 				zap.Error(err),
 			)
+			rec.RegisterOutcome(http.StatusInternalServerError)
 			c.JSON(http.StatusInternalServerError, gin.H{"ok": false})
 			return
 		}
 
+		rec.RegisterOutcome(status)
 		if status == http.StatusOK {
 			c.JSON(http.StatusOK, gin.H{"ok": true})
 			return
@@ -79,7 +117,7 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger) *gin
 		c.JSON(status, gin.H{"ok": false})
 	})
 
-	router.POST("/verify", verifyHandler(svc, verifyLimiter, logger))
+	router.POST("/verify", verifyHandler(svc, verifyLimiter, logger, rec))
 
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
@@ -90,7 +128,7 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger) *gin
 
 	if cfg.AdminAPIKey != "" {
 		adminLimiter := newIPRateLimiter(cfg.AdminRateLimitRPS, cfg.AdminRateBurst)
-		registerAdminRoutes(router, svc, cfg.AdminAPIKey, adminLimiter, logger)
+		registerAdminRoutes(router, svc, adminLimiter, logger, rec)
 		logger.Info("admin API enabled", zap.String("prefix", "/admin"))
 	} else {
 		logger.Warn("admin API disabled: ADMIN_API_KEY not set (provision via SQL)")

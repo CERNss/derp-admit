@@ -76,3 +76,54 @@ func TestLoadFromEnv_RequiresDatabaseURLAndTokenPepper(t *testing.T) {
 		t.Fatalf("expected error when DATABASE_URL and TOKEN_PEPPER are missing")
 	}
 }
+
+func TestLoadFromEnv_PolicySyncInterval(t *testing.T) {
+	baseEnv := func(t *testing.T) {
+		t.Helper()
+		tempDir := t.TempDir()
+		t.Setenv("CONFIG_FILE", filepath.Join(tempDir, "missing.yaml"))
+		t.Setenv("ENV_FILE", filepath.Join(tempDir, "missing.env"))
+		t.Setenv("DATABASE_URL", "sqlite://"+filepath.Join(tempDir, "cfg.db"))
+		t.Setenv("TOKEN_PEPPER", "pepper")
+	}
+
+	t.Run("default", func(t *testing.T) {
+		baseEnv(t)
+		cfg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv: %v", err)
+		}
+		if cfg.PolicySyncInterval.String() != "2s" {
+			t.Fatalf("PolicySyncInterval=%s want=2s", cfg.PolicySyncInterval)
+		}
+		if !cfg.MetricsEnabled {
+			t.Fatalf("MetricsEnabled=false want=true")
+		}
+	})
+
+	t.Run("custom valid", func(t *testing.T) {
+		baseEnv(t)
+		t.Setenv("POLICY_SYNC_INTERVAL", "500ms")
+		t.Setenv("METRICS_ENABLED", "false")
+		cfg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv: %v", err)
+		}
+		if cfg.PolicySyncInterval.String() != "500ms" {
+			t.Fatalf("PolicySyncInterval=%s want=500ms", cfg.PolicySyncInterval)
+		}
+		if cfg.MetricsEnabled {
+			t.Fatalf("MetricsEnabled=true want=false")
+		}
+	})
+
+	for _, bad := range []string{"0s", "-1s", "soon"} {
+		t.Run("invalid_"+bad, func(t *testing.T) {
+			baseEnv(t)
+			t.Setenv("POLICY_SYNC_INTERVAL", bad)
+			if _, err := LoadFromEnv(); err == nil {
+				t.Fatalf("expected error for POLICY_SYNC_INTERVAL=%q", bad)
+			}
+		})
+	}
+}

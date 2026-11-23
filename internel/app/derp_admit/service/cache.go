@@ -108,6 +108,23 @@ func (c *VerifyCache) Invalidate(nodeKey string) {
 	delete(c.items, nodeKey)
 }
 
+// Purge clears all cached decisions and advances the epoch so decisions
+// computed from pre-purge state cannot be stored afterwards.
+func (c *VerifyCache) Purge() {
+	if !c.enabled {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.epoch++
+	clear(c.items)
+}
+
+// Enabled reports whether caching is active (TTL > 0).
+func (c *VerifyCache) Enabled() bool {
+	return c.enabled
+}
+
 // evictLocked reclaims space when the cache is full, touching at most a
 // bounded batch of entries per call: expired entries in the batch are
 // dropped; if none were expired the whole batch is shed so the map cannot

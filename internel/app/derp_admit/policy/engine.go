@@ -9,6 +9,7 @@ import (
 	"github.com/casbin/casbin/v3/model"
 	gormadapter "github.com/casbin/gorm-adapter/v3"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
 
@@ -155,5 +156,23 @@ func (e *Engine) ensureGrouping(child, parent string) error {
 	if !ok {
 		return fmt.Errorf("failed to add grouping policy %s -> %s", child, parent)
 	}
+	return nil
+}
+
+// Reload refreshes the in-memory Casbin policy snapshot from the database.
+func (e *Engine) Reload(_ context.Context) error {
+	if !e.enabled {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.enforcer.LoadPolicy(); err != nil {
+		return fmt.Errorf("reload policy: %w", err)
+	}
+	return nil
+}
+
+// RunUpgrade is the stub for the one-time policy upgrade (Track A).
+func RunUpgrade(_ context.Context, _ *gorm.DB, _ bool, _ *zap.Logger) error {
 	return nil
 }

@@ -52,7 +52,6 @@ func newTestRouter(t *testing.T, opts ...func(*config.Config)) (http.Handler, *g
 	cfg := config.Config{
 		DatabaseURL:          dbURL,
 		TokenPepper:          "test-pepper",
-		EnableCasbin:         true,
 		MetricsEnabled:       true,
 		DBTimeout:            2 * time.Second,
 		PolicySyncInterval:   2 * time.Second,

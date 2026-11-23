@@ -18,12 +18,17 @@ const (
 )
 
 type Config struct {
-	Addr                 string
-	DatabaseURL          string
-	TokenPepper          string
-	AdminAPIKey          string
-	LogLevel             string
+	Addr        string
+	DatabaseURL string
+	TokenPepper string
+	AdminAPIKey string
+	LogLevel    string
+	// EnableCasbin is unused and retained temporarily only so read-only
+	// server/postgres_e2e_test.go compiles until the integrator removes its
+	// struct literal field. Policy is always enforced.
 	EnableCasbin         bool
+	LegacyCasbinDisabled bool
+	Warnings             []string
 	OTELEnabled          bool
 	OTELServiceName      string
 	OTLPEndpoint         string
@@ -47,7 +52,6 @@ type fileConfig struct {
 	TokenPepper          *string  `yaml:"token_pepper"`
 	AdminAPIKey          *string  `yaml:"admin_api_key"`
 	LogLevel             *string  `yaml:"log_level"`
-	EnableCasbin         *bool    `yaml:"enable_casbin"`
 	OTELEnabled          *bool    `yaml:"otel_enabled"`
 	OTELServiceName      *string  `yaml:"otel_service_name"`
 	OTLPEndpoint         *string  `yaml:"otel_exporter_otlp_endpoint"`
@@ -65,12 +69,19 @@ type fileConfig struct {
 	MetricsEnabled       *bool    `yaml:"metrics_enabled"`
 }
 
+const legacyEnableCasbinWarning = "ENABLE_CASBIN / enable_casbin is deprecated and ignored for enforcement; policy is always enforced (its value is read only by the one-time upgrade)"
+
 func LoadFromEnv() (Config, error) {
 	cfg := defaultConfig()
+	legacyCasbinSeen := false
 
 	configFilePath := getEnvOrDefault("CONFIG_FILE", nil, defaultConfigFilePath)
-	if err := mergeFromYAMLFile(&cfg, configFilePath); err != nil {
+	yamlCasbinSeen, err := mergeFromYAMLFile(&cfg, configFilePath)
+	if err != nil {
 		return Config{}, err
+	}
+	if yamlCasbinSeen {
+		legacyCasbinSeen = true
 	}
 
 	envFileVars, err := loadEnvFile(getEnvOrDefault("ENV_FILE", nil, defaultEnvFilePath))
@@ -78,8 +89,16 @@ func LoadFromEnv() (Config, error) {
 		return Config{}, err
 	}
 
-	if err := mergeFromEnv(&cfg, envFileVars); err != nil {
+	envCasbinSeen, err := mergeFromEnv(&cfg, envFileVars)
+	if err != nil {
 		return Config{}, err
+	}
+	if envCasbinSeen {
+		legacyCasbinSeen = true
+	}
+
+	if legacyCasbinSeen {
+		cfg.Warnings = append(cfg.Warnings, legacyEnableCasbinWarning)
 	}
 
 	if err := validate(cfg); err != nil {
@@ -93,7 +112,6 @@ func defaultConfig() Config {
 	return Config{
 		Addr:                 ":8080",
 		LogLevel:             "info",
-		EnableCasbin:         true,
 		OTELEnabled:          false,
 		OTELServiceName:      "derp-admit",
 		OTLPEndpoint:         "",
@@ -112,20 +130,21 @@ func defaultConfig() Config {
 	}
 }
 
-func mergeFromYAMLFile(cfg *Config, path string) error {
+func mergeFromYAMLFile(cfg *Config, path string) (bool, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("read config file %q: %w", path, err)
+		return false, fmt.Errorf("read config file %q: %w", path, err)
 	}
 
 	var fc fileConfig
 	if err := yaml.Unmarshal(content, &fc); err != nil {
-		return fmt.Errorf("parse config file %q: %w", path, err)
+		return false, fmt.Errorf("parse config file %q: %w", path, err)
 	}
 
+	legacyCasbinSeen := false
 	if fc.Addr != nil {
 		cfg.Addr = *fc.Addr
 	}
@@ -141,8 +160,10 @@ func mergeFromYAMLFile(cfg *Config, path string) error {
 	if fc.LogLevel != nil {
 		cfg.LogLevel = *fc.LogLevel
 	}
-	if fc.EnableCasbin != nil {
-		cfg.EnableCasbin = *fc.EnableCasbin
+	if node, present := extractYAMLKey(content, "enable_casbin"); present {
+		legacyCasbinSeen = true
+		parsed, ok := parseYAMLBoolNode(node)
+		cfg.LegacyCasbinDisabled = ok && !parsed
 	}
 	if fc.OTELEnabled != nil {
 		cfg.OTELEnabled = *fc.OTELEnabled
@@ -181,21 +202,21 @@ func mergeFromYAMLFile(cfg *Config, path string) error {
 	if fc.DBTimeout != nil {
 		parsed, err := time.ParseDuration(*fc.DBTimeout)
 		if err != nil {
-			return fmt.Errorf("invalid db_timeout in config file: %w", err)
+			return false, fmt.Errorf("invalid db_timeout in config file: %w", err)
 		}
 		cfg.DBTimeout = parsed
 	}
 	if fc.VerifyCacheTTL != nil {
 		parsed, err := time.ParseDuration(*fc.VerifyCacheTTL)
 		if err != nil {
-			return fmt.Errorf("invalid verify_cache_ttl in config file: %w", err)
+			return false, fmt.Errorf("invalid verify_cache_ttl in config file: %w", err)
 		}
 		cfg.VerifyCacheTTL = parsed
 	}
 	if fc.PolicySyncInterval != nil {
 		parsed, err := time.ParseDuration(*fc.PolicySyncInterval)
 		if err != nil {
-			return fmt.Errorf("invalid policy_sync_interval in config file: %w", err)
+			return false, fmt.Errorf("invalid policy_sync_interval in config file: %w", err)
 		}
 		cfg.PolicySyncInterval = parsed
 	}
@@ -203,7 +224,46 @@ func mergeFromYAMLFile(cfg *Config, path string) error {
 		cfg.MetricsEnabled = *fc.MetricsEnabled
 	}
 
-	return nil
+	return legacyCasbinSeen, nil
+}
+
+func extractYAMLKey(content []byte, key string) (*yaml.Node, bool) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(content, &doc); err != nil {
+		return nil, false
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return nil, false
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil, false
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == key {
+			return root.Content[i+1], true
+		}
+	}
+	return nil, false
+}
+
+func parseYAMLBoolNode(node *yaml.Node) (bool, bool) {
+	if node == nil || node.Kind != yaml.ScalarNode {
+		return false, false
+	}
+	if node.Tag == "!!bool" {
+		var b bool
+		if err := node.Decode(&b); err == nil {
+			return b, true
+		}
+	}
+	if node.Tag == "!!str" {
+		b, err := strconv.ParseBool(strings.TrimSpace(node.Value))
+		if err == nil {
+			return b, true
+		}
+	}
+	return false, false
 }
 
 func loadEnvFile(path string) (map[string]string, error) {
@@ -247,7 +307,8 @@ func loadEnvFile(path string) (map[string]string, error) {
 	return result, nil
 }
 
-func mergeFromEnv(cfg *Config, fileVars map[string]string) error {
+func mergeFromEnv(cfg *Config, fileVars map[string]string) (bool, error) {
+	legacyCasbinSeen := false
 	if v := getEnvOrDefault("ADDR", fileVars, ""); v != "" {
 		cfg.Addr = v
 	}
@@ -264,16 +325,14 @@ func mergeFromEnv(cfg *Config, fileVars map[string]string) error {
 		cfg.LogLevel = v
 	}
 	if v, ok := getEnv("ENABLE_CASBIN", fileVars); ok {
-		parsed, err := strconv.ParseBool(v)
-		if err != nil {
-			return fmt.Errorf("invalid ENABLE_CASBIN: %w", err)
-		}
-		cfg.EnableCasbin = parsed
+		legacyCasbinSeen = true
+		parsed, err := strconv.ParseBool(strings.TrimSpace(v))
+		cfg.LegacyCasbinDisabled = err == nil && !parsed
 	}
 	if v, ok := getEnv("OTEL_ENABLED", fileVars); ok {
 		parsed, err := strconv.ParseBool(v)
 		if err != nil {
-			return fmt.Errorf("invalid OTEL_ENABLED: %w", err)
+			return false, fmt.Errorf("invalid OTEL_ENABLED: %w", err)
 		}
 		cfg.OTELEnabled = parsed
 	}
@@ -286,89 +345,89 @@ func mergeFromEnv(cfg *Config, fileVars map[string]string) error {
 	if v, ok := getEnv("OTEL_EXPORTER_OTLP_INSECURE", fileVars); ok {
 		parsed, err := strconv.ParseBool(v)
 		if err != nil {
-			return fmt.Errorf("invalid OTEL_EXPORTER_OTLP_INSECURE: %w", err)
+			return false, fmt.Errorf("invalid OTEL_EXPORTER_OTLP_INSECURE: %w", err)
 		}
 		cfg.OTLPInsecure = parsed
 	}
 	if v, ok := getEnv("OTEL_TRACE_SAMPLE_RATIO", fileVars); ok {
 		parsed, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return fmt.Errorf("invalid OTEL_TRACE_SAMPLE_RATIO: %w", err)
+			return false, fmt.Errorf("invalid OTEL_TRACE_SAMPLE_RATIO: %w", err)
 		}
 		cfg.OTELSampleRatio = parsed
 	}
 	if v, ok := getEnv("DB_TIMEOUT", fileVars); ok {
 		parsed, err := time.ParseDuration(v)
 		if err != nil {
-			return fmt.Errorf("invalid DB_TIMEOUT: %w", err)
+			return false, fmt.Errorf("invalid DB_TIMEOUT: %w", err)
 		}
 		cfg.DBTimeout = parsed
 	}
 	if v, ok := getEnv("VERIFY_RATE_LIMIT_RPS", fileVars); ok {
 		parsed, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return fmt.Errorf("invalid VERIFY_RATE_LIMIT_RPS: %w", err)
+			return false, fmt.Errorf("invalid VERIFY_RATE_LIMIT_RPS: %w", err)
 		}
 		cfg.VerifyRateLimitRPS = parsed
 	}
 	if v, ok := getEnv("VERIFY_RATE_LIMIT_BURST", fileVars); ok {
 		parsed, err := strconv.Atoi(v)
 		if err != nil {
-			return fmt.Errorf("invalid VERIFY_RATE_LIMIT_BURST: %w", err)
+			return false, fmt.Errorf("invalid VERIFY_RATE_LIMIT_BURST: %w", err)
 		}
 		cfg.VerifyRateBurst = parsed
 	}
 	if v, ok := getEnv("REGISTER_RATE_LIMIT_RPS", fileVars); ok {
 		parsed, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return fmt.Errorf("invalid REGISTER_RATE_LIMIT_RPS: %w", err)
+			return false, fmt.Errorf("invalid REGISTER_RATE_LIMIT_RPS: %w", err)
 		}
 		cfg.RegisterRateLimitRPS = parsed
 	}
 	if v, ok := getEnv("REGISTER_RATE_LIMIT_BURST", fileVars); ok {
 		parsed, err := strconv.Atoi(v)
 		if err != nil {
-			return fmt.Errorf("invalid REGISTER_RATE_LIMIT_BURST: %w", err)
+			return false, fmt.Errorf("invalid REGISTER_RATE_LIMIT_BURST: %w", err)
 		}
 		cfg.RegisterRateBurst = parsed
 	}
 	if v, ok := getEnv("ADMIN_RATE_LIMIT_RPS", fileVars); ok {
 		parsed, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			return fmt.Errorf("invalid ADMIN_RATE_LIMIT_RPS: %w", err)
+			return false, fmt.Errorf("invalid ADMIN_RATE_LIMIT_RPS: %w", err)
 		}
 		cfg.AdminRateLimitRPS = parsed
 	}
 	if v, ok := getEnv("ADMIN_RATE_LIMIT_BURST", fileVars); ok {
 		parsed, err := strconv.Atoi(v)
 		if err != nil {
-			return fmt.Errorf("invalid ADMIN_RATE_LIMIT_BURST: %w", err)
+			return false, fmt.Errorf("invalid ADMIN_RATE_LIMIT_BURST: %w", err)
 		}
 		cfg.AdminRateBurst = parsed
 	}
 	if v, ok := getEnv("VERIFY_CACHE_TTL", fileVars); ok {
 		parsed, err := time.ParseDuration(v)
 		if err != nil {
-			return fmt.Errorf("invalid VERIFY_CACHE_TTL: %w", err)
+			return false, fmt.Errorf("invalid VERIFY_CACHE_TTL: %w", err)
 		}
 		cfg.VerifyCacheTTL = parsed
 	}
 	if v, ok := getEnv("POLICY_SYNC_INTERVAL", fileVars); ok {
 		parsed, err := time.ParseDuration(v)
 		if err != nil {
-			return fmt.Errorf("invalid POLICY_SYNC_INTERVAL: %w", err)
+			return false, fmt.Errorf("invalid POLICY_SYNC_INTERVAL: %w", err)
 		}
 		cfg.PolicySyncInterval = parsed
 	}
 	if v, ok := getEnv("METRICS_ENABLED", fileVars); ok {
 		parsed, err := strconv.ParseBool(v)
 		if err != nil {
-			return fmt.Errorf("invalid METRICS_ENABLED: %w", err)
+			return false, fmt.Errorf("invalid METRICS_ENABLED: %w", err)
 		}
 		cfg.MetricsEnabled = parsed
 	}
 
-	return nil
+	return legacyCasbinSeen, nil
 }
 
 func validate(cfg Config) error {

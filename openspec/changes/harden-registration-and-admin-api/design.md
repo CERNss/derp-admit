@@ -53,4 +53,6 @@ The verifier decides which devices may use a private DERP relay. Before commit `
 ## Open Questions
 
 - Should a revoked device be reactivated by `POST /register`? The original enrollment spec requires it, and the code still does it. Now that `POST /admin/devices/:id/enable` exists, anyone holding a valid token for the same user can undo an admin's device revocation unless the token is revoked as well. Options: keep as is and document that a revoke must be paired with a token revoke; or make `/register` refuse revoked devices and leave re-enabling to the admin API.
+  - Decided by the owner on 2026-11-23: `/register` refuses revoked devices, and re-enabling is left to the admin API. Implemented by change `rework-access-control-and-admin`.
 - Should the pre-auth admin limiter be per client IP, like the register limiter, so unauthenticated traffic cannot starve authenticated admin calls?
+  - Decided by the owner on 2026-11-23: the admin limiter becomes per client IP and still runs before authentication. Implemented by change `rework-access-control-and-admin`.

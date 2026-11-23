@@ -71,8 +71,15 @@ func aSeedBuiltins(t *testing.T, dbConn *gorm.DB) {
 	}
 }
 
+func aBoolPtr(v bool) *bool { return &v }
+
 func aNewObservedLogger() (*zap.Logger, *observer.ObservedLogs) {
 	core, logs := observer.New(zap.WarnLevel)
+	return zap.New(core), logs
+}
+
+func aNewInfoObservedLogger() (*zap.Logger, *observer.ObservedLogs) {
+	core, logs := observer.New(zap.InfoLevel)
 	return zap.New(core), logs
 }
 
@@ -262,7 +269,7 @@ func TestUpgradeKeepsDeviceUserRoleRules(t *testing.T) {
 
 	aSeedBuiltins(t, dbConn)
 	logger, _ := aNewObservedLogger()
-	if err := policy.RunUpgrade(context.Background(), dbConn, false, logger); err != nil {
+	if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger); err != nil {
 		t.Fatalf("RunUpgrade: %v", err)
 	}
 
@@ -297,7 +304,7 @@ func TestUpgradeCasbinDisabledBindsAllUnbound(t *testing.T) {
 
 	aSeedBuiltins(t, dbConn)
 	logger, _ := aNewObservedLogger()
-	if err := policy.RunUpgrade(context.Background(), dbConn, true, logger); err != nil {
+	if err := policy.RunUpgrade(context.Background(), dbConn, aBoolPtr(false), logger); err != nil {
 		t.Fatalf("RunUpgrade: %v", err)
 	}
 
@@ -332,7 +339,7 @@ func TestUpgradeCasbinDisabledBindsUserWithRoleLackingDefaultGrant(t *testing.T)
 
 	aSeedBuiltins(t, dbConn)
 	logger, _ := aNewObservedLogger()
-	if err := policy.RunUpgrade(context.Background(), dbConn, true, logger); err != nil {
+	if err := policy.RunUpgrade(context.Background(), dbConn, aBoolPtr(false), logger); err != nil {
 		t.Fatalf("RunUpgrade: %v", err)
 	}
 
@@ -359,7 +366,7 @@ func TestUpgradeEnforcedBindsUnboundUserWithoutDevices(t *testing.T) {
 
 	aSeedBuiltins(t, dbConn)
 	logger, logs := aNewObservedLogger()
-	if err := policy.RunUpgrade(context.Background(), dbConn, false, logger); err != nil {
+	if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger); err != nil {
 		t.Fatalf("RunUpgrade: %v", err)
 	}
 
@@ -382,7 +389,7 @@ func TestUpgradeEnforcedLeavesUnboundUserWithDevices(t *testing.T) {
 
 	aSeedBuiltins(t, dbConn)
 	logger, logs := aNewObservedLogger()
-	if err := policy.RunUpgrade(context.Background(), dbConn, false, logger); err != nil {
+	if err := policy.RunUpgrade(context.Background(), dbConn, aBoolPtr(true), logger); err != nil {
 		t.Fatalf("RunUpgrade: %v", err)
 	}
 
@@ -394,13 +401,13 @@ func TestUpgradeEnforcedLeavesUnboundUserWithDevices(t *testing.T) {
 		t.Fatalf("frank roles=%v want=[]", rolesMap[u.ID])
 	}
 
-	// Device stays unrevoked, but verify is denied by policy.
+	// Under U2, a device without a canonical registration rule is revoked even when its owner has no roles.
 	var reloaded model.Device
 	if err := dbConn.First(&reloaded, "id = ?", d.ID).Error; err != nil {
 		t.Fatalf("reload device: %v", err)
 	}
-	if reloaded.RevokedAt != nil {
-		t.Fatalf("expected uncovered user's device not to be revoked")
+	if reloaded.RevokedAt == nil {
+		t.Fatalf("expected uncovered user's unregistered device to be revoked")
 	}
 
 	eng, err := policy.NewEngine(dbConn)
@@ -408,7 +415,7 @@ func TestUpgradeEnforcedLeavesUnboundUserWithDevices(t *testing.T) {
 		t.Fatalf("NewEngine: %v", err)
 	}
 	if aEvalNewVerify(t, dbConn, eng, d.ID) {
-		t.Fatalf("expected frank's device to be policy denied")
+		t.Fatalf("expected frank's device to be denied")
 	}
 
 	if logs.Len() != 1 {
@@ -421,6 +428,9 @@ func TestUpgradeEnforcedLeavesUnboundUserWithDevices(t *testing.T) {
 	gotIDs, _ := ctxMap["uncovered_user_ids"].([]any)
 	if len(gotIDs) != 1 || gotIDs[0] != u.ID.String() {
 		t.Fatalf("uncovered_user_ids=%v want=[%s]", ctxMap["uncovered_user_ids"], u.ID)
+	}
+	if ctxMap["revoked_device_count"] != int64(1) {
+		t.Fatalf("revoked_device_count=%v want=1", ctxMap["revoked_device_count"])
 	}
 }
 
@@ -437,7 +447,7 @@ func TestUpgradeEnforcedLeavesUserWithRoleLackingDefaultGrant(t *testing.T) {
 
 	aSeedBuiltins(t, dbConn)
 	logger, logs := aNewObservedLogger()
-	if err := policy.RunUpgrade(context.Background(), dbConn, false, logger); err != nil {
+	if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger); err != nil {
 		t.Fatalf("RunUpgrade: %v", err)
 	}
 
@@ -480,7 +490,7 @@ func TestUpgradeEnforcedRevokesDeviceWithoutLegacyRule(t *testing.T) {
 
 	aSeedBuiltins(t, dbConn)
 	logger, logs := aNewObservedLogger()
-	if err := policy.RunUpgrade(context.Background(), dbConn, false, logger); err != nil {
+	if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger); err != nil {
 		t.Fatalf("RunUpgrade: %v", err)
 	}
 
@@ -498,15 +508,24 @@ func TestUpgradeEnforcedRevokesDeviceWithoutLegacyRule(t *testing.T) {
 		t.Fatalf("dMissing should be revoked")
 	}
 
-	// Verify system admin audit row.
+	// Verify system admin audit rows (device.revoke + upgrade.run).
 	var audits []model.AdminAuditLog
-	if err := dbConn.Find(&audits).Error; err != nil {
+	if err := dbConn.Order("id asc").Find(&audits).Error; err != nil {
 		t.Fatalf("query admin_audit_logs: %v", err)
 	}
-	if len(audits) != 1 {
-		t.Fatalf("audit rows=%d want=1", len(audits))
+	if len(audits) != 2 {
+		t.Fatalf("audit rows=%d want=2 (device.revoke + upgrade.run)", len(audits))
 	}
-	row := audits[0]
+	var revokeRows []model.AdminAuditLog
+	for _, a := range audits {
+		if a.Action == "device.revoke" {
+			revokeRows = append(revokeRows, a)
+		}
+	}
+	if len(revokeRows) != 1 {
+		t.Fatalf("device.revoke audit rows=%d want=1", len(revokeRows))
+	}
+	row := revokeRows[0]
 	if row.ActorKeyID != nil || row.ActorName != actor.System.Name || row.ActorTier != actor.System.Tier.String() {
 		t.Fatalf("unexpected actor: keyID=%v name=%q tier=%q", row.ActorKeyID, row.ActorName, row.ActorTier)
 	}
@@ -574,7 +593,7 @@ func TestUpgradeImportsRolesAndRelays(t *testing.T) {
 
 	aSeedBuiltins(t, dbConn)
 	logger, _ := aNewObservedLogger()
-	if err := policy.RunUpgrade(context.Background(), dbConn, false, logger); err != nil {
+	if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger); err != nil {
 		t.Fatalf("RunUpgrade: %v", err)
 	}
 
@@ -641,7 +660,7 @@ func TestUpgradeUnmanagedRulesGrantNothing(t *testing.T) {
 	beforeRules := aCountRules(t, dbConn)
 
 	logger, logs := aNewObservedLogger()
-	if err := policy.RunUpgrade(context.Background(), dbConn, false, logger); err != nil {
+	if err := policy.RunUpgrade(context.Background(), dbConn, aBoolPtr(true), logger); err != nil {
 		t.Fatalf("RunUpgrade: %v", err)
 	}
 
@@ -663,9 +682,16 @@ func TestUpgradeUnmanagedRulesGrantNothing(t *testing.T) {
 		if aEvalNewVerify(t, dbConn, eng, dev.ID) {
 			t.Fatalf("%s was unexpectedly allowed after upgrade", name)
 		}
+		var reloaded model.Device
+		if err := dbConn.First(&reloaded, "id = ?", dev.ID).Error; err != nil {
+			t.Fatalf("reload %s: %v", name, err)
+		}
+		if reloaded.RevokedAt == nil {
+			t.Fatalf("expected %s (no canonical device rule) to be revoked under U2", name)
+		}
 	}
 
-	// One warning log counting the 3 unmanaged rules; none of these devices is revoked/listed.
+	// One warning log counting the 3 unmanaged rules and 3 revoked devices (U2).
 	if logs.Len() != 1 {
 		t.Fatalf("warning log count=%d want=1", logs.Len())
 	}
@@ -673,15 +699,15 @@ func TestUpgradeUnmanagedRulesGrantNothing(t *testing.T) {
 	if ctxMap["unmanaged_rule_count"] != int64(3) {
 		t.Fatalf("unmanaged_rule_count=%v want=3", ctxMap["unmanaged_rule_count"])
 	}
-	if ctxMap["revoked_device_count"] != int64(0) {
-		t.Fatalf("revoked_device_count=%v want=0", ctxMap["revoked_device_count"])
+	if ctxMap["revoked_device_count"] != int64(3) {
+		t.Fatalf("revoked_device_count=%v want=3", ctxMap["revoked_device_count"])
 	}
 	var auditCount int64
 	if err := dbConn.Model(&model.AdminAuditLog{}).Count(&auditCount).Error; err != nil {
 		t.Fatalf("count admin_audit_logs: %v", err)
 	}
-	if auditCount != 0 {
-		t.Fatalf("admin_audit_logs count=%d want=0", auditCount)
+	if auditCount != 4 {
+		t.Fatalf("admin_audit_logs count=%d want=4 (3 device.revoke + 1 upgrade.run)", auditCount)
 	}
 }
 
@@ -690,7 +716,7 @@ func TestUpgradeRunsOnlyOnce(t *testing.T) {
 	aSeedBuiltins(t, dbConn)
 
 	logger1, _ := aNewObservedLogger()
-	if err := policy.RunUpgrade(context.Background(), dbConn, false, logger1); err != nil {
+	if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger1); err != nil {
 		t.Fatalf("RunUpgrade #1: %v", err)
 	}
 
@@ -711,7 +737,7 @@ func TestUpgradeRunsOnlyOnce(t *testing.T) {
 	}
 
 	logger2, logs2 := aNewObservedLogger()
-	if err := policy.RunUpgrade(context.Background(), dbConn, true, logger2); err != nil {
+	if err := policy.RunUpgrade(context.Background(), dbConn, aBoolPtr(false), logger2); err != nil {
 		t.Fatalf("RunUpgrade #2: %v", err)
 	}
 
@@ -759,7 +785,7 @@ func TestUpgradeBumpsVersionOnlyWhenChanged(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadVersion before: %v", err)
 		}
-		if err := policy.RunUpgrade(context.Background(), dbConn, false, zap.NewNop()); err != nil {
+		if err := policy.RunUpgrade(context.Background(), dbConn, nil, zap.NewNop()); err != nil {
 			t.Fatalf("RunUpgrade: %v", err)
 		}
 		verAfter, err := policy.ReadVersion(context.Background(), dbConn)
@@ -787,7 +813,7 @@ func TestUpgradeBumpsVersionOnlyWhenChanged(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadVersion before: %v", err)
 		}
-		if err := policy.RunUpgrade(context.Background(), dbConn, false, zap.NewNop()); err != nil {
+		if err := policy.RunUpgrade(context.Background(), dbConn, nil, zap.NewNop()); err != nil {
 			t.Fatalf("RunUpgrade: %v", err)
 		}
 		verAfter, err := policy.ReadVersion(context.Background(), dbConn)
@@ -1301,11 +1327,12 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 	}
 
 	modes := []struct {
-		name              string
-		casbinWasDisabled bool
+		name                string
+		casbinWasDisabled   bool
+		legacyCasbinEnabled *bool
 	}{
-		{name: "enforced", casbinWasDisabled: false},
-		{name: "casbin_disabled", casbinWasDisabled: true},
+		{name: "enforced", casbinWasDisabled: false, legacyCasbinEnabled: aBoolPtr(true)},
+		{name: "casbin_disabled", casbinWasDisabled: true, legacyCasbinEnabled: aBoolPtr(false)},
 	}
 
 	isExpectedDenyReason := func(reason string) bool {
@@ -1411,7 +1438,7 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 				application, err := app.Build(context.Background(), dbConn, config.Config{
 					DatabaseURL:          dbURL,
 					TokenPepper:          "upgrade-test-pepper",
-					LegacyCasbinDisabled: mode.casbinWasDisabled,
+					LegacyCasbinEnabled:  mode.legacyCasbinEnabled,
 					DBTimeout:            5 * time.Second,
 					PolicySyncInterval:   2 * time.Second,
 					VerifyRateLimitRPS:   1000,
@@ -1449,15 +1476,22 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 					if mode.casbinWasDisabled && before[d.ID] && !afterDefault {
 						t.Errorf("casbin_disabled upgrade unexpectedly denied device %s (key=%s): before=ALLOW after=DENY (reason=%q)", d.ID, d.NodeKey, reason)
 					}
-					// A2: in enforced mode, every device denied before because it had no canonical legacy rule
-					// must stay denied on EVERY registered relay after the upgrade.
-					if !mode.casbinWasDisabled && !before[d.ID] && !hasCanonicalLegacyRule[d.ID] {
+					// A2 + U2: in enforced mode, every non-revoked device without a canonical legacy rule
+					// must be revoked (regardless of owner bindings) and stay denied on EVERY registered relay.
+					if !mode.casbinWasDisabled && !hasCanonicalLegacyRule[d.ID] {
+						var reloadedDev model.Device
+						if err := dbConn.First(&reloadedDev, "id = ?", d.ID).Error; err != nil {
+							t.Fatalf("reload device %s: %v", d.ID, err)
+						}
+						if reloadedDev.RevokedAt == nil {
+							t.Errorf("device %s without canonical legacy rule was not revoked in enforced mode", d.ID)
+						}
 						for _, relay := range registeredRelays {
 							afterRelay, relayReason := application.Service.Verify(context.Background(), relay.Name, body)
 							if afterRelay {
 								t.Errorf("device %s without legacy rule was allowed on relay %q after enforced upgrade", d.ID, relay.Name)
-							} else if !isExpectedDenyReason(relayReason) {
-								t.Errorf("device %s denied on relay %q with unexpected reason=%q", d.ID, relay.Name, relayReason)
+							} else if relayReason != service.DenyReasonRevoked {
+								t.Errorf("device %s without legacy rule denied on relay %q with reason=%q want=%q", d.ID, relay.Name, relayReason, service.DenyReasonRevoked)
 							}
 						}
 					}
@@ -1485,4 +1519,520 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			t.Fatalf("duplicate state name: %s", names[i])
 		}
 	}
+}
+
+func TestUpgradeRefusesAmbiguousDatabase(t *testing.T) {
+	seedAmbiguous := func(t *testing.T) (*gorm.DB, model.User, model.User, model.Device, model.Device, model.Device) {
+		t.Helper()
+		dbConn := aOpenDB(t)
+		u1 := aCreateUser(t, dbConn, "alice", false)
+		u2 := aCreateUser(t, dbConn, "bob", false)
+		d1 := aCreateDevice(t, dbConn, u1.ID, "nodekey:alice-1", false)
+		d2 := aCreateDevice(t, dbConn, u1.ID, "nodekey:alice-2", false)
+		dRevoked := aCreateDevice(t, dbConn, u2.ID, "nodekey:bob-revoked", true)
+		// Include an unrelated role/relay rule (no g, device:, user: rule) to prove nothing is imported on refusal.
+		aInsertRules(t, dbConn,
+			model.CasbinRule{Ptype: "p", V0: "role:ops", V1: "derp:eu-1", V2: "connect"},
+		)
+		aSeedBuiltins(t, dbConn)
+		return dbConn, u1, u2, d1, d2, dRevoked
+	}
+
+	t.Run("refuses_then_false_binds_and_allows", func(t *testing.T) {
+		dbConn, u1, u2, d1, d2, _ := seedAmbiguous(t)
+		verBefore, err := policy.ReadVersion(context.Background(), dbConn)
+		if err != nil {
+			t.Fatalf("ReadVersion before: %v", err)
+		}
+
+		logger, _ := aNewInfoObservedLogger()
+		err = policy.RunUpgrade(context.Background(), dbConn, nil, logger)
+		if err == nil {
+			t.Fatalf("expected RunUpgrade to refuse ambiguous database")
+		}
+		msg := err.Error()
+		for _, want := range []string{"2", "0", "disabled", "ENABLE_CASBIN=false", "ENABLE_CASBIN=true"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("error %q missing expected substring %q", msg, want)
+			}
+		}
+
+		// No marker written, nothing changed.
+		var state model.PolicyState
+		if err := dbConn.First(&state, "id = ?", model.PolicyStateRowID).Error; err != nil {
+			t.Fatalf("read policy_state: %v", err)
+		}
+		if state.UpgradedAt != nil {
+			t.Fatalf("upgraded_at must stay nil on refusal")
+		}
+		if state.Version != verBefore {
+			t.Fatalf("version=%d want=%d (unchanged on refusal)", state.Version, verBefore)
+		}
+		var opsRoleCount, euRelayCount, auditCount int64
+		_ = dbConn.Model(&model.Role{}).Where("name = ?", "ops").Count(&opsRoleCount).Error
+		_ = dbConn.Model(&model.Relay{}).Where("name = ?", "eu-1").Count(&euRelayCount).Error
+		_ = dbConn.Model(&model.AdminAuditLog{}).Count(&auditCount).Error
+		if opsRoleCount != 0 || euRelayCount != 0 || auditCount != 0 {
+			t.Fatalf("unexpected side effects on refusal: opsRole=%d euRelay=%d audits=%d", opsRoleCount, euRelayCount, auditCount)
+		}
+		rolesMap, err := policy.UserRoles(context.Background(), dbConn, []uuid.UUID{u1.ID, u2.ID})
+		if err != nil {
+			t.Fatalf("UserRoles: %v", err)
+		}
+		if len(rolesMap[u1.ID]) != 0 || len(rolesMap[u2.ID]) != 0 {
+			t.Fatalf("expected no user bindings on refusal, got %v", rolesMap)
+		}
+		for _, id := range []uuid.UUID{d1.ID, d2.ID} {
+			var dev model.Device
+			if err := dbConn.First(&dev, "id = ?", id).Error; err != nil {
+				t.Fatalf("reload device: %v", err)
+			}
+			if dev.RevokedAt != nil {
+				t.Fatalf("device %s must not be revoked on refusal", id)
+			}
+		}
+
+		// Second start with explicit false binds everyone and allows active devices.
+		if err := policy.RunUpgrade(context.Background(), dbConn, aBoolPtr(false), logger); err != nil {
+			t.Fatalf("RunUpgrade(false): %v", err)
+		}
+		if err := dbConn.First(&state, "id = ?", model.PolicyStateRowID).Error; err != nil {
+			t.Fatalf("read policy_state after false: %v", err)
+		}
+		if state.UpgradedAt == nil {
+			t.Fatalf("expected upgraded_at to be set after explicit false")
+		}
+		rolesMap, err = policy.UserRoles(context.Background(), dbConn, []uuid.UUID{u1.ID, u2.ID})
+		if err != nil {
+			t.Fatalf("UserRoles after false: %v", err)
+		}
+		for _, id := range []uuid.UUID{u1.ID, u2.ID} {
+			if !reflect.DeepEqual(rolesMap[id], []string{policy.BuiltinRole}) {
+				t.Fatalf("user %s roles=%v want=[standard]", id, rolesMap[id])
+			}
+		}
+		eng, err := policy.NewEngine(dbConn)
+		if err != nil {
+			t.Fatalf("NewEngine: %v", err)
+		}
+		for _, id := range []uuid.UUID{d1.ID, d2.ID} {
+			if !aEvalNewVerify(t, dbConn, eng, id) {
+				t.Fatalf("expected device %s to be allowed after explicit false upgrade", id)
+			}
+		}
+	})
+
+	t.Run("refuses_then_true_proceeds_as_enforced", func(t *testing.T) {
+		dbConn, u1, u2, d1, d2, _ := seedAmbiguous(t)
+		logger, _ := aNewInfoObservedLogger()
+		if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger); err == nil {
+			t.Fatalf("expected RunUpgrade to refuse ambiguous database")
+		}
+
+		// Second start with explicit true proceeds as enforced: users with devices are left uncovered,
+		// active devices without registration rules are revoked and denied.
+		if err := policy.RunUpgrade(context.Background(), dbConn, aBoolPtr(true), logger); err != nil {
+			t.Fatalf("RunUpgrade(true): %v", err)
+		}
+		var state model.PolicyState
+		if err := dbConn.First(&state, "id = ?", model.PolicyStateRowID).Error; err != nil {
+			t.Fatalf("read policy_state after true: %v", err)
+		}
+		if state.UpgradedAt == nil {
+			t.Fatalf("expected upgraded_at to be set after explicit true")
+		}
+		rolesMap, err := policy.UserRoles(context.Background(), dbConn, []uuid.UUID{u1.ID, u2.ID})
+		if err != nil {
+			t.Fatalf("UserRoles after true: %v", err)
+		}
+		if len(rolesMap[u1.ID]) != 0 || len(rolesMap[u2.ID]) != 0 {
+			t.Fatalf("expected users with devices to stay unbound in enforced mode, got %v", rolesMap)
+		}
+		eng, err := policy.NewEngine(dbConn)
+		if err != nil {
+			t.Fatalf("NewEngine: %v", err)
+		}
+		for _, id := range []uuid.UUID{d1.ID, d2.ID} {
+			var dev model.Device
+			if err := dbConn.First(&dev, "id = ?", id).Error; err != nil {
+				t.Fatalf("reload device: %v", err)
+			}
+			if dev.RevokedAt == nil {
+				t.Fatalf("expected device %s to be revoked under explicit true enforced upgrade", id)
+			}
+			if aEvalNewVerify(t, dbConn, eng, id) {
+				t.Fatalf("expected device %s to be denied under explicit true enforced upgrade", id)
+			}
+		}
+	})
+}
+
+func TestUpgradeProceedsWithoutSettingWhenDeviceRulesExist(t *testing.T) {
+	dbConn := aOpenDB(t)
+	u := aCreateUser(t, dbConn, "carol", false)
+	d := aCreateDevice(t, dbConn, u.ID, "nodekey:carol-1", false)
+	aInsertRules(t, dbConn,
+		model.CasbinRule{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
+		model.CasbinRule{Ptype: "g", V0: policy.UserSubject(u.ID), V1: "role:standard"},
+		model.CasbinRule{Ptype: "g", V0: "device:" + d.NodeKey, V1: policy.UserSubject(u.ID)},
+	)
+	aSeedBuiltins(t, dbConn)
+
+	logger, _ := aNewInfoObservedLogger()
+	if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger); err != nil {
+		t.Fatalf("RunUpgrade with device rules and absent setting: %v", err)
+	}
+
+	var state model.PolicyState
+	if err := dbConn.First(&state, "id = ?", model.PolicyStateRowID).Error; err != nil {
+		t.Fatalf("read policy_state: %v", err)
+	}
+	if state.UpgradedAt == nil {
+		t.Fatalf("expected upgraded_at to be set")
+	}
+
+	eng, err := policy.NewEngine(dbConn)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	if !aEvalNewVerify(t, dbConn, eng, d.ID) {
+		t.Fatalf("expected carol's device to stay allowed")
+	}
+}
+
+func TestUpgradeProceedsOnEmptyDatabase(t *testing.T) {
+	t.Run("no_users_no_devices", func(t *testing.T) {
+		dbConn := aOpenDB(t)
+		aSeedBuiltins(t, dbConn)
+
+		logger, _ := aNewInfoObservedLogger()
+		if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger); err != nil {
+			t.Fatalf("RunUpgrade on empty database: %v", err)
+		}
+
+		var state model.PolicyState
+		if err := dbConn.First(&state, "id = ?", model.PolicyStateRowID).Error; err != nil {
+			t.Fatalf("read policy_state: %v", err)
+		}
+		if state.UpgradedAt == nil {
+			t.Fatalf("expected upgraded_at to be set")
+		}
+		var auditCount int64
+		if err := dbConn.Model(&model.AdminAuditLog{}).Count(&auditCount).Error; err != nil {
+			t.Fatalf("count audits: %v", err)
+		}
+		if auditCount != 0 {
+			t.Fatalf("expected 0 audit rows on empty database, got %d", auditCount)
+		}
+	})
+
+	t.Run("only_revoked_devices_proceeds_as_default_enforced", func(t *testing.T) {
+		dbConn := aOpenDB(t)
+		u := aCreateUser(t, dbConn, "only-revoked", false)
+		_ = aCreateDevice(t, dbConn, u.ID, "nodekey:rev-1", true)
+		aSeedBuiltins(t, dbConn)
+
+		logger, _ := aNewInfoObservedLogger()
+		if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger); err != nil {
+			t.Fatalf("RunUpgrade with only revoked devices: %v", err)
+		}
+
+		var state model.PolicyState
+		if err := dbConn.First(&state, "id = ?", model.PolicyStateRowID).Error; err != nil {
+			t.Fatalf("read policy_state: %v", err)
+		}
+		if state.UpgradedAt == nil {
+			t.Fatalf("expected upgraded_at to be set")
+		}
+	})
+}
+
+func TestUpgradeEnforcedRevokesUnregisteredDeviceOfUncoveredUser(t *testing.T) {
+	dbConn := aOpenDB(t)
+	u := aCreateUser(t, dbConn, "uncovered-owner", false)
+	dRegistered := aCreateDevice(t, dbConn, u.ID, "nodekey:uncov-reg", false)
+	dUnregistered := aCreateDevice(t, dbConn, u.ID, "nodekey:uncov-unreg", false)
+
+	// User has no role bindings at all; only dRegistered has a canonical registration rule.
+	aInsertRules(t, dbConn,
+		model.CasbinRule{Ptype: "g", V0: "device:" + dRegistered.NodeKey, V1: policy.UserSubject(u.ID)},
+	)
+	aSeedBuiltins(t, dbConn)
+
+	logger, logs := aNewObservedLogger()
+	if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger); err != nil {
+		t.Fatalf("RunUpgrade: %v", err)
+	}
+
+	var regReloaded, unregReloaded model.Device
+	if err := dbConn.First(&regReloaded, "id = ?", dRegistered.ID).Error; err != nil {
+		t.Fatalf("reload dRegistered: %v", err)
+	}
+	if err := dbConn.First(&unregReloaded, "id = ?", dUnregistered.ID).Error; err != nil {
+		t.Fatalf("reload dUnregistered: %v", err)
+	}
+	if regReloaded.RevokedAt != nil {
+		t.Fatalf("registered device should not be revoked")
+	}
+	if unregReloaded.RevokedAt == nil {
+		t.Fatalf("unregistered device of uncovered user must be revoked")
+	}
+
+	// User stays unbound.
+	rolesMap, err := policy.UserRoles(context.Background(), dbConn, []uuid.UUID{u.ID})
+	if err != nil {
+		t.Fatalf("UserRoles: %v", err)
+	}
+	if len(rolesMap[u.ID]) != 0 {
+		t.Fatalf("uncovered user roles=%v want=[]", rolesMap[u.ID])
+	}
+
+	// System device.revoke audit row recorded for dUnregistered.
+	var revokeAudits []model.AdminAuditLog
+	if err := dbConn.Where("action = ? AND target_id = ?", "device.revoke", dUnregistered.ID.String()).Find(&revokeAudits).Error; err != nil {
+		t.Fatalf("query revoke audit: %v", err)
+	}
+	if len(revokeAudits) != 1 || revokeAudits[0].ActorName != actor.System.Name || revokeAudits[0].ActorKeyID != nil {
+		t.Fatalf("expected 1 system device.revoke audit row for %s, got %+v", dUnregistered.ID, revokeAudits)
+	}
+
+	// Warning log reports both uncovered user and revoked device.
+	if logs.Len() != 1 {
+		t.Fatalf("warn log count=%d want=1", logs.Len())
+	}
+	ctxMap := logs.All()[0].ContextMap()
+	if ctxMap["uncovered_user_count"] != int64(1) || ctxMap["revoked_device_count"] != int64(1) {
+		t.Fatalf("unexpected warn log fields: %v", ctxMap)
+	}
+}
+
+func TestUpgradeBindingUncoveredUserLaterAdmitsOnlyRegisteredDevices(t *testing.T) {
+	dbURL := "sqlite://" + filepath.Join(t.TempDir(), "bind-later.db")
+	dbConn, err := db.OpenDatabase(dbURL)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := dbConn.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	if err := db.ApplyMigrations(context.Background(), dbConn, dbURL); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	u := aCreateUser(t, dbConn, "bind-later-user", false)
+	nkReg := aNewRealNodeKey(t)
+	nkUnreg := aNewRealNodeKey(t)
+	_ = aCreateDevice(t, dbConn, u.ID, nkReg, false)
+	_ = aCreateDevice(t, dbConn, u.ID, nkUnreg, false)
+
+	// User has no role binding; only nkReg has its registration rule.
+	aInsertRules(t, dbConn,
+		model.CasbinRule{Ptype: "g", V0: "device:" + nkReg, V1: policy.UserSubject(u.ID)},
+	)
+
+	application, err := app.Build(context.Background(), dbConn, config.Config{
+		DatabaseURL:          dbURL,
+		TokenPepper:          "bind-later-pepper",
+		DBTimeout:            5 * time.Second,
+		PolicySyncInterval:   2 * time.Second,
+		VerifyRateLimitRPS:   1000,
+		VerifyRateBurst:      1000,
+		RegisterRateLimitRPS: 1000,
+		RegisterRateBurst:    1000,
+		AdminRateLimitRPS:    1000,
+		AdminRateBurst:       1000,
+	}, zap.NewNop())
+	if err != nil {
+		t.Fatalf("app.Build: %v", err)
+	}
+	t.Cleanup(application.Close)
+
+	// Before binding: registered device is policy-denied; unregistered device is already revoked.
+	if allow, reason := application.Service.Verify(context.Background(), policy.BuiltinRelay, aBuildVerifyBody(t, nkReg)); allow || reason != service.DenyReasonPolicyDenied {
+		t.Fatalf("before bind nkReg = (%v, %q) want (false, %q)", allow, reason, service.DenyReasonPolicyDenied)
+	}
+	if allow, reason := application.Service.Verify(context.Background(), policy.BuiltinRelay, aBuildVerifyBody(t, nkUnreg)); allow || reason != service.DenyReasonRevoked {
+		t.Fatalf("before bind nkUnreg = (%v, %q) want (false, %q)", allow, reason, service.DenyReasonRevoked)
+	}
+
+	// Operator later binds the uncovered user to standard.
+	adminCtx := actor.With(context.Background(), actor.System)
+	if _, err := application.Service.SetUserRoles(adminCtx, u.ID, []string{policy.BuiltinRole}); err != nil {
+		t.Fatalf("SetUserRoles: %v", err)
+	}
+
+	// Registered device is now allowed; unregistered device stays revoked.
+	if allow, reason := application.Service.Verify(context.Background(), policy.BuiltinRelay, aBuildVerifyBody(t, nkReg)); !allow {
+		t.Fatalf("after bind nkReg = (false, %q) want allow=true", reason)
+	}
+	if allow, reason := application.Service.Verify(context.Background(), policy.BuiltinRelay, aBuildVerifyBody(t, nkUnreg)); allow || reason != service.DenyReasonRevoked {
+		t.Fatalf("after bind nkUnreg = (%v, %q) want (false, %q)", allow, reason, service.DenyReasonRevoked)
+	}
+}
+
+func TestUpgradeAuditsRunSummary(t *testing.T) {
+	t.Run("enforced_default_records_info_log_and_audit_summary_without_ids", func(t *testing.T) {
+		dbConn := aOpenDB(t)
+		uNoDev := aCreateUser(t, dbConn, "no-dev-user", false)
+		uUncov := aCreateUser(t, dbConn, "uncovered-user", false)
+		uCov := aCreateUser(t, dbConn, "covered-user", false)
+
+		dUncovMissing := aCreateDevice(t, dbConn, uUncov.ID, "nodekey:uncov-missing", false)
+		dCovGood := aCreateDevice(t, dbConn, uCov.ID, "nodekey:cov-good", false)
+		dCovMissing := aCreateDevice(t, dbConn, uCov.ID, "nodekey:cov-missing", false)
+
+		aInsertRules(t, dbConn,
+			model.CasbinRule{Ptype: "p", V0: "role:ops", V1: "derp:default", V2: "connect"},
+			model.CasbinRule{Ptype: "p", V0: "role:ops", V1: "derp:eu-1", V2: "connect"},
+			model.CasbinRule{Ptype: "g", V0: policy.UserSubject(uCov.ID), V1: "role:ops"},
+			model.CasbinRule{Ptype: "g", V0: "device:" + dCovGood.NodeKey, V1: policy.UserSubject(uCov.ID)},
+			model.CasbinRule{Ptype: "p", V0: "role:ops", V1: "derp:*", V2: "connect"},
+		)
+		aSeedBuiltins(t, dbConn)
+
+		logger, logs := aNewInfoObservedLogger()
+		if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger); err != nil {
+			t.Fatalf("RunUpgrade: %v", err)
+		}
+
+		// Expect 2 device.revoke rows and 1 upgrade.run row.
+		var audits []model.AdminAuditLog
+		if err := dbConn.Order("id asc").Find(&audits).Error; err != nil {
+			t.Fatalf("query admin_audit_logs: %v", err)
+		}
+		var runRows, revokeRows []model.AdminAuditLog
+		for _, a := range audits {
+			if a.ActorKeyID != nil || a.ActorName != actor.System.Name || a.ActorTier != actor.System.Tier.String() {
+				t.Fatalf("unexpected actor in audit row: %+v", a)
+			}
+			switch a.Action {
+			case "upgrade.run":
+				runRows = append(runRows, a)
+			case "device.revoke":
+				revokeRows = append(revokeRows, a)
+			default:
+				t.Fatalf("unexpected audit action %q", a.Action)
+			}
+		}
+		if len(revokeRows) != 2 {
+			t.Fatalf("device.revoke rows=%d want=2", len(revokeRows))
+		}
+		if len(runRows) != 1 {
+			t.Fatalf("upgrade.run rows=%d want=1", len(runRows))
+		}
+		runRow := runRows[0]
+		if runRow.Outcome != "success" || runRow.HTTPStatus != nil || runRow.TargetID != "" {
+			t.Fatalf("unexpected upgrade.run row metadata: %+v", runRow)
+		}
+
+		// Verify summary contains NO user/device IDs.
+		for _, forbidden := range []string{
+			uNoDev.ID.String(), uUncov.ID.String(), uCov.ID.String(),
+			dUncovMissing.ID.String(), dCovGood.ID.String(), dCovMissing.ID.String(),
+		} {
+			if strings.Contains(runRow.Summary, forbidden) {
+				t.Fatalf("upgrade.run summary must not contain ID %s: %s", forbidden, runRow.Summary)
+			}
+		}
+
+		var summary map[string]any
+		if err := json.Unmarshal([]byte(runRow.Summary), &summary); err != nil {
+			t.Fatalf("unmarshal upgrade.run summary: %v", err)
+		}
+		wantFields := map[string]any{
+			"mode":                    "enforced",
+			"mode_source":             "default",
+			"users_bound_standard":    float64(1),
+			"users_uncovered_default": float64(1),
+			"devices_revoked":         float64(2),
+			"unmanaged_rules":         float64(2), // 1 legacy device rule + 1 wildcard rule
+			"roles_imported":          float64(1), // ops
+			"relays_imported":         float64(1), // eu-1
+		}
+		for k, want := range wantFields {
+			if summary[k] != want {
+				t.Fatalf("summary[%q]=%v (%T) want=%v (%T) (full: %s)", k, summary[k], summary[k], want, want, runRow.Summary)
+			}
+		}
+
+		// Expect exactly 1 info log line and 1 warn log line.
+		infoLogs := logs.FilterLevelExact(zap.InfoLevel).All()
+		warnLogs := logs.FilterLevelExact(zap.WarnLevel).All()
+		if len(infoLogs) != 1 {
+			t.Fatalf("info log count=%d want=1", len(infoLogs))
+		}
+		if len(warnLogs) != 1 {
+			t.Fatalf("warn log count=%d want=1", len(warnLogs))
+		}
+		infoCtx := infoLogs[0].ContextMap()
+		if infoCtx["mode"] != "enforced" || infoCtx["mode_source"] != "default" ||
+			infoCtx["users_bound_standard"] != int64(1) ||
+			infoCtx["users_uncovered_default"] != int64(1) ||
+			infoCtx["devices_revoked"] != int64(2) ||
+			infoCtx["unmanaged_rules"] != int64(2) ||
+			infoCtx["roles_imported"] != int64(1) ||
+			infoCtx["relays_imported"] != int64(1) {
+			t.Fatalf("unexpected info log fields: %v", infoCtx)
+		}
+	})
+
+	t.Run("disabled_setting_records_mode_and_setting_source", func(t *testing.T) {
+		dbConn := aOpenDB(t)
+		u := aCreateUser(t, dbConn, "legacy-user", false)
+		_ = aCreateDevice(t, dbConn, u.ID, "nodekey:legacy-1", false)
+		aSeedBuiltins(t, dbConn)
+
+		logger, logs := aNewInfoObservedLogger()
+		if err := policy.RunUpgrade(context.Background(), dbConn, aBoolPtr(false), logger); err != nil {
+			t.Fatalf("RunUpgrade(false): %v", err)
+		}
+
+		var runRows []model.AdminAuditLog
+		if err := dbConn.Where("action = ?", "upgrade.run").Find(&runRows).Error; err != nil {
+			t.Fatalf("query upgrade.run: %v", err)
+		}
+		if len(runRows) != 1 {
+			t.Fatalf("upgrade.run rows=%d want=1", len(runRows))
+		}
+		var summary map[string]any
+		if err := json.Unmarshal([]byte(runRows[0].Summary), &summary); err != nil {
+			t.Fatalf("unmarshal summary: %v", err)
+		}
+		if summary["mode"] != "disabled" || summary["mode_source"] != "setting" ||
+			summary["users_bound_standard"] != float64(1) ||
+			summary["users_uncovered_default"] != float64(0) ||
+			summary["devices_revoked"] != float64(0) {
+			t.Fatalf("unexpected disabled summary: %v", summary)
+		}
+		if len(logs.FilterLevelExact(zap.InfoLevel).All()) != 1 {
+			t.Fatalf("expected 1 info log line")
+		}
+	})
+
+	t.Run("fresh_empty_db_writes_marker_and_no_upgrade_run_row", func(t *testing.T) {
+		dbConn := aOpenDB(t)
+		aSeedBuiltins(t, dbConn)
+
+		logger, _ := aNewInfoObservedLogger()
+		if err := policy.RunUpgrade(context.Background(), dbConn, nil, logger); err != nil {
+			t.Fatalf("RunUpgrade on fresh db: %v", err)
+		}
+
+		var state model.PolicyState
+		if err := dbConn.First(&state, "id = ?", model.PolicyStateRowID).Error; err != nil {
+			t.Fatalf("read policy_state: %v", err)
+		}
+		if state.UpgradedAt == nil {
+			t.Fatalf("expected upgraded_at marker to be set")
+		}
+		var runCount int64
+		if err := dbConn.Model(&model.AdminAuditLog{}).Where("action = ?", "upgrade.run").Count(&runCount).Error; err != nil {
+			t.Fatalf("count upgrade.run: %v", err)
+		}
+		if runCount != 0 {
+			t.Fatalf("expected 0 upgrade.run rows on fresh database with no users, got %d", runCount)
+		}
+	})
 }

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -153,14 +154,31 @@ func aAssertConcurrentStartupOutcome(t *testing.T, checkDB *gorm.DB, apps []*app
 	}
 
 	var audits []model.AdminAuditLog
-	if err := checkDB.Find(&audits).Error; err != nil {
+	if err := checkDB.Order("id asc").Find(&audits).Error; err != nil {
 		t.Fatalf("load admin_audit_logs: %v", err)
 	}
-	if len(audits) != 1 {
-		t.Fatalf("admin_audit_logs count=%d want=1 (upgrade must run once)", len(audits))
+	if len(audits) != 2 {
+		t.Fatalf("admin_audit_logs count=%d want=2 (device.revoke + upgrade.run, upgrade must run once)", len(audits))
 	}
-	if audits[0].ActorName != actor.System.Name || audits[0].TargetID != revokedDevID.String() {
-		t.Fatalf("audit row actor=%q target=%q want system / %s", audits[0].ActorName, audits[0].TargetID, revokedDevID)
+	var revokeRows, runRows []model.AdminAuditLog
+	for _, a := range audits {
+		if a.ActorName != actor.System.Name || a.ActorKeyID != nil {
+			t.Fatalf("unexpected non-system audit row: %+v", a)
+		}
+		switch a.Action {
+		case "device.revoke":
+			revokeRows = append(revokeRows, a)
+		case "upgrade.run":
+			runRows = append(runRows, a)
+		default:
+			t.Fatalf("unexpected system audit action %q", a.Action)
+		}
+	}
+	if len(revokeRows) != 1 || revokeRows[0].TargetID != revokedDevID.String() {
+		t.Fatalf("device.revoke rows=%+v want 1 row targeting %s", revokeRows, revokedDevID)
+	}
+	if len(runRows) != 1 {
+		t.Fatalf("upgrade.run rows=%d want=1", len(runRows))
 	}
 
 	for i, instance := range apps {
@@ -425,5 +443,73 @@ func TestBuildLogsConfigWarnings(t *testing.T) {
 		if !found {
 			t.Fatalf("expected warning %q to be logged at warn level; got %v", want, got)
 		}
+	}
+}
+
+func TestBuildFailsOnAmbiguousUpgrade(t *testing.T) {
+	dbURL := "sqlite://" + filepath.Join(t.TempDir(), "ambiguous.db")
+	gormDB, err := db.OpenDatabase(dbURL)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := gormDB.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	if err := db.ApplyMigrations(context.Background(), gormDB, dbURL); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	u := model.User{ID: uuid.New(), Username: "ambiguous-user"}
+	if err := gormDB.Create(&u).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	nk := aNewNodeKey(t)
+	d := model.Device{ID: uuid.New(), UserID: u.ID, NodeKey: nk, Label: "laptop"}
+	if err := gormDB.Create(&d).Error; err != nil {
+		t.Fatalf("create device: %v", err)
+	}
+
+	// Absent legacy setting on a DB with active devices and zero device rules must fail app.Build.
+	cfg := aTestConfig(dbURL)
+	if _, err := app.Build(context.Background(), gormDB, cfg, zap.NewNop()); err == nil {
+		t.Fatalf("expected app.Build to fail on ambiguous upgrade")
+	} else {
+		msg := err.Error()
+		for _, want := range []string{"1", "0", "ENABLE_CASBIN=false", "ENABLE_CASBIN=true"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("error %q missing expected substring %q", msg, want)
+			}
+		}
+	}
+
+	// Marker must not be set and device must remain unrevoked.
+	var state model.PolicyState
+	if err := gormDB.First(&state, "id = ?", model.PolicyStateRowID).Error; err != nil {
+		t.Fatalf("read policy_state: %v", err)
+	}
+	if state.UpgradedAt != nil {
+		t.Fatalf("expected upgraded_at to stay nil after refused upgrade")
+	}
+	var reloadedDev model.Device
+	if err := gormDB.First(&reloadedDev, "id = ?", d.ID).Error; err != nil {
+		t.Fatalf("reload device: %v", err)
+	}
+	if reloadedDev.RevokedAt != nil {
+		t.Fatalf("expected device not to be revoked after refused upgrade")
+	}
+
+	// Starting once with explicit ENABLE_CASBIN=false succeeds and keeps the device allowed.
+	disabled := false
+	cfg.LegacyCasbinEnabled = &disabled
+	application, err := app.Build(context.Background(), gormDB, cfg, zap.NewNop())
+	if err != nil {
+		t.Fatalf("app.Build with LegacyCasbinEnabled=false failed: %v", err)
+	}
+	t.Cleanup(application.Close)
+
+	if allow, reason := application.Service.Verify(context.Background(), policy.BuiltinRelay, aVerifyBody(t, nk)); !allow {
+		t.Fatalf("verify after explicit false upgrade: allow=false reason=%q want allow=true", reason)
 	}
 }

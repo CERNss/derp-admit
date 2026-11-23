@@ -2,12 +2,18 @@ package server_test
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"derp-admit/config"
 	"derp-admit/internel/app/derp_admit/model"
+	"derp-admit/internel/app/derp_admit/server"
 	"derp-admit/internel/app/derp_admit/service"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestRegisterInvalidToken(t *testing.T) {
@@ -350,5 +356,33 @@ func TestVerifyDenyDoesNotUpdateLastSeen(t *testing.T) {
 	}
 	if !updated.LastSeenAt.Equal(lastSeen) {
 		t.Fatalf("last_seen_at changed on deny: got=%v want=%v", updated.LastSeenAt, lastSeen)
+	}
+}
+
+func TestRouterAdminDisabledLogMessage(t *testing.T) {
+	core, logs := observer.New(zapcore.WarnLevel)
+	cfg := config.Config{
+		AdminAPIKey:          "",
+		VerifyRateLimitRPS:   100,
+		VerifyRateBurst:      200,
+		RegisterRateLimitRPS: 5,
+		RegisterRateBurst:    10,
+		AdminRateLimitRPS:    10,
+		AdminRateBurst:       20,
+	}
+	_ = server.NewRouter(nil, cfg, zap.New(core))
+
+	entries := logs.FilterLevelExact(zapcore.WarnLevel).All()
+	if len(entries) != 1 {
+		t.Fatalf("warn log count=%d want=1 (%v)", len(entries), entries)
+	}
+	msg := entries[0].Message
+	if strings.Contains(strings.ToLower(msg), "sql") {
+		t.Fatalf("admin disabled warning should not mention SQL: %q", msg)
+	}
+	for _, want := range []string{"admin API disabled", "ADMIN_API_KEY", "users", "roles", "relays"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("admin disabled warning %q missing %q", msg, want)
+		}
 	}
 }

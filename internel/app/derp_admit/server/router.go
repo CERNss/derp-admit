@@ -132,7 +132,7 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger, opts
 		registerAdminRoutes(router, svc, adminLimiter, logger, rec)
 		logger.Info("admin API enabled", zap.String("prefix", "/admin"))
 	} else {
-		logger.Warn("admin API disabled: ADMIN_API_KEY not set (provision via SQL)")
+		logger.Warn("admin API disabled: ADMIN_API_KEY not set; users, roles, and relays cannot be managed until ADMIN_API_KEY is set")
 	}
 
 	return router

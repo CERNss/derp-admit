@@ -24,7 +24,7 @@ type Config struct {
 	TokenPepper          string
 	AdminAPIKey          string
 	LogLevel             string
-	LegacyCasbinDisabled bool
+	LegacyCasbinEnabled  *bool
 	Warnings             []string
 	OTELEnabled          bool
 	OTELServiceName      string
@@ -159,8 +159,11 @@ func mergeFromYAMLFile(cfg *Config, path string) (bool, error) {
 	}
 	if node, present := extractYAMLKey(content, "enable_casbin"); present {
 		legacyCasbinSeen = true
-		parsed, ok := parseYAMLBoolNode(node)
-		cfg.LegacyCasbinDisabled = ok && !parsed
+		if parsed, ok := parseYAMLBoolNode(node); ok {
+			cfg.LegacyCasbinEnabled = &parsed
+		} else {
+			cfg.LegacyCasbinEnabled = nil
+		}
 	}
 	if fc.OTELEnabled != nil {
 		cfg.OTELEnabled = *fc.OTELEnabled
@@ -318,8 +321,11 @@ func mergeFromEnv(cfg *Config, fileVars map[string]string) (bool, error) {
 	}
 	if v, ok := getEnv("ENABLE_CASBIN", fileVars); ok {
 		legacyCasbinSeen = true
-		parsed, err := strconv.ParseBool(strings.TrimSpace(v))
-		cfg.LegacyCasbinDisabled = err == nil && !parsed
+		if parsed, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			cfg.LegacyCasbinEnabled = &parsed
+		} else {
+			cfg.LegacyCasbinEnabled = nil
+		}
 	}
 	if v, ok := getEnv("OTEL_ENABLED", fileVars); ok {
 		parsed, err := strconv.ParseBool(v)

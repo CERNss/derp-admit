@@ -84,7 +84,7 @@ func Build(ctx context.Context, gormDB *gorm.DB, cfg config.Config, logger *zap.
 			return fmt.Errorf("seed policy built-ins: %w", err)
 		}
 
-		if err := policy.RunUpgrade(ctx, gormDB, cfg.LegacyCasbinDisabled, logger); err != nil {
+		if err := policy.RunUpgrade(ctx, gormDB, cfg.LegacyCasbinEnabled, logger); err != nil {
 			return fmt.Errorf("run policy upgrade: %w", err)
 		}
 

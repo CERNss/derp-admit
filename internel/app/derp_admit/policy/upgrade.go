@@ -20,23 +20,42 @@ import (
 
 const (
 	upgradeAuditActionDeviceRevoke = "device.revoke"
+	upgradeAuditActionRun          = "upgrade.run"
 	upgradeAuditTargetDevice       = "device"
+	upgradeAuditTargetPolicy       = "policy"
 	upgradeAuditOutcomeSuccess     = "success"
 )
+
+type upgradeRunSummary struct {
+	Mode                  string `json:"mode"`
+	ModeSource            string `json:"mode_source"`
+	UsersBoundStandard    int    `json:"users_bound_standard"`
+	UsersUncoveredDefault int    `json:"users_uncovered_default"`
+	DevicesRevoked        int    `json:"devices_revoked"`
+	UnmanagedRules        int    `json:"unmanaged_rules"`
+	RolesImported         int    `json:"roles_imported"`
+	RelaysImported        int    `json:"relays_imported"`
+}
 
 // RunUpgrade executes the one-time policy data upgrade in a single database
 // transaction on both SQLite and PostgreSQL. It is guarded by
 // policy_state.upgraded_at so it executes at most once per database.
 //
+// legacyCasbinEnabled carries the three-state legacy ENABLE_CASBIN /
+// enable_casbin setting: nil when absent or unparsable, *true when explicitly
+// enabled (enforced), *false when explicitly disabled.
+//
 // The upgrade never deletes any casbin_rule row and never loosens access
 // compared to the previous model on relay "default" (design A7, R1, R2, R4, S1, S2).
-func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger *zap.Logger) error {
+func RunUpgrade(ctx context.Context, db *gorm.DB, legacyCasbinEnabled *bool, logger *zap.Logger) error {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 
 	var (
 		ran                bool
+		wroteRunAudit      bool
+		runSummary         upgradeRunSummary
 		uncoveredUserIDs   []string
 		revokedDeviceIDs   []string
 		unmanagedRuleCount int
@@ -76,12 +95,43 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 			return fmt.Errorf("load devices for upgrade: %w", err)
 		}
 
+		activeDeviceCount := 0
+		for _, d := range devices {
+			if d.RevokedAt == nil {
+				activeDeviceCount++
+			}
+		}
+
+		deviceRuleCount := 0
+		for _, rule := range rules {
+			if isAnyDeviceUserRule(rule) {
+				deviceRuleCount++
+			}
+		}
+
+		if activeDeviceCount > 0 && deviceRuleCount == 0 && legacyCasbinEnabled == nil {
+			return fmt.Errorf(
+				"ambiguous one-time policy upgrade: found %d non-revoked device(s) and %d device registration rule(s) (g, device:<...>, user:<...>), which looks like this database ran with policy disabled; start once with ENABLE_CASBIN=false (devices stay allowed) or ENABLE_CASBIN=true (confirm that policy was enforced and these devices were denied)",
+				activeDeviceCount, deviceRuleCount,
+			)
+		}
+
+		casbinWasDisabled := false
+		modeSource := "default"
+		if legacyCasbinEnabled != nil {
+			casbinWasDisabled = !*legacyCasbinEnabled
+			modeSource = "setting"
+		}
+		upgradeMode := "enforced"
+		if casbinWasDisabled {
+			upgradeMode = "disabled"
+		}
+
 		importRoles := make(map[string]struct{})
 		importRelays := make(map[string]struct{})
 		userManagedRoles := make(map[uuid.UUID]map[string]struct{})
 		userHasAnyGRule := make(map[uuid.UUID]bool)
 		roleGrantsDefault := make(map[string]bool)
-		roleGrantsAny := make(map[string]bool)
 		legacyDeviceRules := make(map[[2]string]struct{})
 		unmanagedCount := 0
 
@@ -115,7 +165,6 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 				if roleName, relayName, ok := parseManagedGrantRule(rule); ok {
 					importRoles[roleName] = struct{}{}
 					importRelays[relayName] = struct{}{}
-					roleGrantsAny[roleName] = true
 					if relayName == BuiltinRelay {
 						roleGrantsDefault[roleName] = true
 					}
@@ -142,6 +191,9 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 		}
 
 		changed := false
+		rolesImported := 0
+		relaysImported := 0
+		usersBoundStandard := 0
 
 		for _, roleName := range sortedStringSet(importRoles) {
 			res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&model.Role{Name: roleName})
@@ -150,6 +202,7 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 			}
 			if res.RowsAffected > 0 {
 				changed = true
+				rolesImported++
 			}
 			if _, exists := knownRoles[roleName]; !exists {
 				knownRoles[roleName] = model.Role{Name: roleName}
@@ -163,12 +216,12 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 			}
 			if res.RowsAffected > 0 {
 				changed = true
+				relaysImported++
 			}
 			knownRelays[relayName] = struct{}{}
 		}
 
 		_, hasDefaultRelay := knownRelays[BuiltinRelay]
-		hasAnyRelay := len(knownRelays) > 0
 		roleCoversDefault := func(roleName string) bool {
 			if !hasDefaultRelay {
 				return false
@@ -178,16 +231,6 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 				return false
 			}
 			return r.AllRelays || roleGrantsDefault[roleName]
-		}
-		roleCoversAnyRelay := func(roleName string) bool {
-			r, exists := knownRoles[roleName]
-			if !exists {
-				return false
-			}
-			if r.AllRelays && hasAnyRelay {
-				return true
-			}
-			return roleGrantsAny[roleName]
 		}
 
 		devicesByUser := make(map[uuid.UUID][]model.Device, len(users))
@@ -199,13 +242,10 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 
 		for _, u := range users {
 			coveredDefault := false
-			coveredAny := false
 			for roleName := range userManagedRoles[u.ID] {
 				if roleCoversDefault(roleName) {
 					coveredDefault = true
-				}
-				if roleCoversAnyRelay(roleName) {
-					coveredAny = true
+					break
 				}
 			}
 
@@ -217,13 +257,14 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 					}
 					if bound {
 						changed = true
+						usersBoundStandard++
 					}
 				} else {
 					uncoveredUserIDs = append(uncoveredUserIDs, u.ID.String())
 				}
 			}
 
-			if casbinWasDisabled || !coveredAny {
+			if casbinWasDisabled {
 				continue
 			}
 
@@ -247,6 +288,23 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 			}
 		}
 
+		summary := upgradeRunSummary{
+			Mode:                  upgradeMode,
+			ModeSource:            modeSource,
+			UsersBoundStandard:    usersBoundStandard,
+			UsersUncoveredDefault: len(uncoveredUserIDs),
+			DevicesRevoked:        len(revokedDeviceIDs),
+			UnmanagedRules:        unmanagedCount,
+			RolesImported:         rolesImported,
+			RelaysImported:        relaysImported,
+		}
+		if len(users) > 0 {
+			if err := insertUpgradeRunAudit(tx, summary, now); err != nil {
+				return err
+			}
+			wroteRunAudit = true
+		}
+
 		if err := tx.Model(&model.PolicyState{}).
 			Where("id = ?", model.PolicyStateRowID).
 			Update("upgraded_at", &now).Error; err != nil {
@@ -260,10 +318,24 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 		}
 
 		ran = true
+		runSummary = summary
 		unmanagedRuleCount = unmanagedCount
 		return nil
 	}); err != nil {
 		return err
+	}
+
+	if ran && wroteRunAudit {
+		logger.Info("one-time policy upgrade completed",
+			zap.String("mode", runSummary.Mode),
+			zap.String("mode_source", runSummary.ModeSource),
+			zap.Int("users_bound_standard", runSummary.UsersBoundStandard),
+			zap.Int("users_uncovered_default", runSummary.UsersUncoveredDefault),
+			zap.Int("devices_revoked", runSummary.DevicesRevoked),
+			zap.Int("unmanaged_rules", runSummary.UnmanagedRules),
+			zap.Int("roles_imported", runSummary.RolesImported),
+			zap.Int("relays_imported", runSummary.RelaysImported),
+		)
 	}
 
 	if ran && (len(uncoveredUserIDs) > 0 || len(revokedDeviceIDs) > 0 || unmanagedRuleCount > 0) {
@@ -341,6 +413,15 @@ func parseManagedGrantRule(rule model.CasbinRule) (string, string, bool) {
 		return "", "", false
 	}
 	return roleName, relayName, true
+}
+
+func isAnyDeviceUserRule(rule model.CasbinRule) bool {
+	if rule.Ptype != "g" || rule.V2 != "" || rule.V3 != "" || rule.V4 != "" || rule.V5 != "" {
+		return false
+	}
+	nodeKey, okDev := strings.CutPrefix(rule.V0, devicePrefix)
+	userVal, okUser := strings.CutPrefix(rule.V1, userPrefix)
+	return okDev && nodeKey != "" && okUser && userVal != ""
 }
 
 func parseLegacyDeviceRule(rule model.CasbinRule) (string, uuid.UUID, bool) {
@@ -424,6 +505,31 @@ func insertUpgradeRevokeAudit(tx *gorm.DB, deviceID uuid.UUID, ts time.Time) err
 	}
 	if err := tx.Create(&entry).Error; err != nil {
 		return fmt.Errorf("insert upgrade revoke audit log: %w", err)
+	}
+	return nil
+}
+
+func insertUpgradeRunAudit(tx *gorm.DB, summary upgradeRunSummary, ts time.Time) error {
+	raw, err := json.Marshal(summary)
+	if err != nil {
+		return fmt.Errorf("encode upgrade run audit summary: %w", err)
+	}
+
+	entry := model.AdminAuditLog{
+		TS:         ts,
+		ActorKeyID: nil,
+		ActorName:  actor.System.Name,
+		ActorTier:  actor.System.Tier.String(),
+		Action:     upgradeAuditActionRun,
+		TargetType: upgradeAuditTargetPolicy,
+		TargetID:   "",
+		Outcome:    upgradeAuditOutcomeSuccess,
+		HTTPStatus: nil,
+		ClientIP:   "",
+		Summary:    string(raw),
+	}
+	if err := tx.Create(&entry).Error; err != nil {
+		return fmt.Errorf("insert upgrade run audit log: %w", err)
 	}
 	return nil
 }

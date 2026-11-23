@@ -58,8 +58,8 @@ VERIFY_RATE_LIMIT_BURST=90
 	if cfg.DBTimeout.String() != "5s" {
 		t.Fatalf("db_timeout=%s want=5s", cfg.DBTimeout.String())
 	}
-	if !cfg.LegacyCasbinDisabled {
-		t.Fatalf("LegacyCasbinDisabled=false want=true when config.yaml sets enable_casbin: false")
+	if cfg.LegacyCasbinEnabled == nil || *cfg.LegacyCasbinEnabled {
+		t.Fatalf("LegacyCasbinEnabled=%v want=false when config.yaml sets enable_casbin: false", cfg.LegacyCasbinEnabled)
 	}
 	if len(cfg.Warnings) == 0 {
 		t.Fatalf("expected warning when enable_casbin is configured in config.yaml")
@@ -92,116 +92,145 @@ func TestLoadFromEnv_EnableCasbinIgnored(t *testing.T) {
 		t.Setenv("TOKEN_PEPPER", "pepper")
 	}
 
-	t.Run("unset produces no warning", func(t *testing.T) {
+	t.Run("unset produces no warning and nil LegacyCasbinEnabled", func(t *testing.T) {
 		aBaseEnv(t, "", "")
 		cfg, err := LoadFromEnv()
 		if err != nil {
 			t.Fatalf("LoadFromEnv: %v", err)
 		}
-		if cfg.LegacyCasbinDisabled {
-			t.Fatalf("LegacyCasbinDisabled=true want=false")
+		if cfg.LegacyCasbinEnabled != nil {
+			t.Fatalf("LegacyCasbinEnabled=%v want=nil", *cfg.LegacyCasbinEnabled)
 		}
 		if len(cfg.Warnings) != 0 {
 			t.Fatalf("Warnings=%v want empty", cfg.Warnings)
 		}
 	})
 
-	t.Run("env false warns and sets LegacyCasbinDisabled", func(t *testing.T) {
+	t.Run("env false warns and sets LegacyCasbinEnabled false", func(t *testing.T) {
 		aBaseEnv(t, "", "")
 		t.Setenv("ENABLE_CASBIN", "false")
 		cfg, err := LoadFromEnv()
 		if err != nil {
 			t.Fatalf("LoadFromEnv: %v", err)
 		}
-		if !cfg.LegacyCasbinDisabled {
-			t.Fatalf("LegacyCasbinDisabled=false want=true")
+		if cfg.LegacyCasbinEnabled == nil || *cfg.LegacyCasbinEnabled {
+			t.Fatalf("LegacyCasbinEnabled=%v want=false", cfg.LegacyCasbinEnabled)
 		}
 		if len(cfg.Warnings) != 1 {
 			t.Fatalf("Warnings=%v want 1 warning", cfg.Warnings)
 		}
 	})
 
-	t.Run("env maybe loads with warning and LegacyCasbinDisabled false", func(t *testing.T) {
+	t.Run("env maybe loads with warning and LegacyCasbinEnabled nil", func(t *testing.T) {
 		aBaseEnv(t, "", "")
 		t.Setenv("ENABLE_CASBIN", "maybe")
 		cfg, err := LoadFromEnv()
 		if err != nil {
 			t.Fatalf("LoadFromEnv: %v", err)
 		}
-		if cfg.LegacyCasbinDisabled {
-			t.Fatalf("LegacyCasbinDisabled=true want=false for unparsable value")
+		if cfg.LegacyCasbinEnabled != nil {
+			t.Fatalf("LegacyCasbinEnabled=%v want=nil for unparsable value", *cfg.LegacyCasbinEnabled)
 		}
 		if len(cfg.Warnings) != 1 {
 			t.Fatalf("Warnings=%v want 1 warning", cfg.Warnings)
 		}
 	})
 
-	t.Run("env true loads with warning and LegacyCasbinDisabled false", func(t *testing.T) {
+	t.Run("env true loads with warning and LegacyCasbinEnabled true", func(t *testing.T) {
 		aBaseEnv(t, "", "")
 		t.Setenv("ENABLE_CASBIN", "true")
 		cfg, err := LoadFromEnv()
 		if err != nil {
 			t.Fatalf("LoadFromEnv: %v", err)
 		}
-		if cfg.LegacyCasbinDisabled {
-			t.Fatalf("LegacyCasbinDisabled=true want=false")
+		if cfg.LegacyCasbinEnabled == nil || !*cfg.LegacyCasbinEnabled {
+			t.Fatalf("LegacyCasbinEnabled=%v want=true", cfg.LegacyCasbinEnabled)
 		}
 		if len(cfg.Warnings) != 1 {
 			t.Fatalf("Warnings=%v want 1 warning", cfg.Warnings)
 		}
 	})
 
-	t.Run("dotenv false warns and sets LegacyCasbinDisabled", func(t *testing.T) {
+	t.Run("dotenv false warns and sets LegacyCasbinEnabled false", func(t *testing.T) {
 		aBaseEnv(t, "", "ENABLE_CASBIN=false\n")
 		cfg, err := LoadFromEnv()
 		if err != nil {
 			t.Fatalf("LoadFromEnv: %v", err)
 		}
-		if !cfg.LegacyCasbinDisabled {
-			t.Fatalf("LegacyCasbinDisabled=false want=true")
+		if cfg.LegacyCasbinEnabled == nil || *cfg.LegacyCasbinEnabled {
+			t.Fatalf("LegacyCasbinEnabled=%v want=false", cfg.LegacyCasbinEnabled)
 		}
 		if len(cfg.Warnings) != 1 {
 			t.Fatalf("Warnings=%v want 1 warning", cfg.Warnings)
 		}
 	})
 
-	t.Run("yaml maybe loads with warning and LegacyCasbinDisabled false", func(t *testing.T) {
+	t.Run("dotenv true warns and sets LegacyCasbinEnabled true", func(t *testing.T) {
+		aBaseEnv(t, "", "ENABLE_CASBIN=true\n")
+		cfg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv: %v", err)
+		}
+		if cfg.LegacyCasbinEnabled == nil || !*cfg.LegacyCasbinEnabled {
+			t.Fatalf("LegacyCasbinEnabled=%v want=true", cfg.LegacyCasbinEnabled)
+		}
+		if len(cfg.Warnings) != 1 {
+			t.Fatalf("Warnings=%v want 1 warning", cfg.Warnings)
+		}
+	})
+
+	t.Run("yaml maybe loads with warning and LegacyCasbinEnabled nil", func(t *testing.T) {
 		aBaseEnv(t, "enable_casbin: maybe\n", "")
 		cfg, err := LoadFromEnv()
 		if err != nil {
 			t.Fatalf("LoadFromEnv: %v", err)
 		}
-		if cfg.LegacyCasbinDisabled {
-			t.Fatalf("LegacyCasbinDisabled=true want=false")
+		if cfg.LegacyCasbinEnabled != nil {
+			t.Fatalf("LegacyCasbinEnabled=%v want=nil", *cfg.LegacyCasbinEnabled)
 		}
 		if len(cfg.Warnings) != 1 {
 			t.Fatalf("Warnings=%v want 1 warning", cfg.Warnings)
 		}
 	})
 
-	t.Run("yaml null loads with warning and LegacyCasbinDisabled false", func(t *testing.T) {
+	t.Run("yaml null loads with warning and LegacyCasbinEnabled nil", func(t *testing.T) {
 		aBaseEnv(t, "enable_casbin: null\n", "")
 		cfg, err := LoadFromEnv()
 		if err != nil {
 			t.Fatalf("LoadFromEnv: %v", err)
 		}
-		if cfg.LegacyCasbinDisabled {
-			t.Fatalf("LegacyCasbinDisabled=true want=false")
+		if cfg.LegacyCasbinEnabled != nil {
+			t.Fatalf("LegacyCasbinEnabled=%v want=nil", *cfg.LegacyCasbinEnabled)
 		}
 		if len(cfg.Warnings) != 1 {
 			t.Fatalf("Warnings=%v want 1 warning", cfg.Warnings)
 		}
 	})
 
-	t.Run("env maybe overrides yaml false to not disabled", func(t *testing.T) {
+	t.Run("env maybe overrides yaml false to nil", func(t *testing.T) {
 		aBaseEnv(t, "enable_casbin: false\n", "")
 		t.Setenv("ENABLE_CASBIN", "maybe")
 		cfg, err := LoadFromEnv()
 		if err != nil {
 			t.Fatalf("LoadFromEnv: %v", err)
 		}
-		if cfg.LegacyCasbinDisabled {
-			t.Fatalf("LegacyCasbinDisabled=true want=false when env overrides yaml false")
+		if cfg.LegacyCasbinEnabled != nil {
+			t.Fatalf("LegacyCasbinEnabled=%v want=nil when env overrides yaml false", *cfg.LegacyCasbinEnabled)
+		}
+		if len(cfg.Warnings) != 1 {
+			t.Fatalf("Warnings=%v want 1 deduplicated warning", cfg.Warnings)
+		}
+	})
+
+	t.Run("env true overrides yaml false to true", func(t *testing.T) {
+		aBaseEnv(t, "enable_casbin: false\n", "")
+		t.Setenv("ENABLE_CASBIN", "true")
+		cfg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv: %v", err)
+		}
+		if cfg.LegacyCasbinEnabled == nil || !*cfg.LegacyCasbinEnabled {
+			t.Fatalf("LegacyCasbinEnabled=%v want=true when env overrides yaml false", cfg.LegacyCasbinEnabled)
 		}
 		if len(cfg.Warnings) != 1 {
 			t.Fatalf("Warnings=%v want 1 deduplicated warning", cfg.Warnings)
@@ -216,8 +245,25 @@ func TestLoadFromEnv_EnableCasbinIgnored(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LoadFromEnv: %v", err)
 			}
-			if !cfg.LegacyCasbinDisabled {
-				t.Fatalf("ENABLE_CASBIN=%q: LegacyCasbinDisabled=false want=true", val)
+			if cfg.LegacyCasbinEnabled == nil || *cfg.LegacyCasbinEnabled {
+				t.Fatalf("ENABLE_CASBIN=%q: LegacyCasbinEnabled=%v want=false", val, cfg.LegacyCasbinEnabled)
+			}
+			if len(cfg.Warnings) != 1 {
+				t.Fatalf("ENABLE_CASBIN=%q: Warnings=%v want 1 warning", val, cfg.Warnings)
+			}
+		})
+	}
+
+	for _, val := range []string{"1", "t", "T", "true", "TRUE", "True"} {
+		t.Run("env_true_spelling_"+val, func(t *testing.T) {
+			aBaseEnv(t, "", "")
+			t.Setenv("ENABLE_CASBIN", val)
+			cfg, err := LoadFromEnv()
+			if err != nil {
+				t.Fatalf("LoadFromEnv: %v", err)
+			}
+			if cfg.LegacyCasbinEnabled == nil || !*cfg.LegacyCasbinEnabled {
+				t.Fatalf("ENABLE_CASBIN=%q: LegacyCasbinEnabled=%v want=true", val, cfg.LegacyCasbinEnabled)
 			}
 			if len(cfg.Warnings) != 1 {
 				t.Fatalf("ENABLE_CASBIN=%q: Warnings=%v want 1 warning", val, cfg.Warnings)
@@ -232,8 +278,8 @@ func TestLoadFromEnv_EnableCasbinIgnored(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LoadFromEnv: %v", err)
 			}
-			if !cfg.LegacyCasbinDisabled {
-				t.Fatalf("enable_casbin: %s: LegacyCasbinDisabled=false want=true", val)
+			if cfg.LegacyCasbinEnabled == nil || *cfg.LegacyCasbinEnabled {
+				t.Fatalf("enable_casbin: %s: LegacyCasbinEnabled=%v want=false", val, cfg.LegacyCasbinEnabled)
 			}
 			if len(cfg.Warnings) != 1 {
 				t.Fatalf("enable_casbin: %s: Warnings=%v want 1 warning", val, cfg.Warnings)
@@ -248,8 +294,8 @@ func TestLoadFromEnv_EnableCasbinIgnored(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LoadFromEnv: %v", err)
 			}
-			if cfg.LegacyCasbinDisabled {
-				t.Fatalf("enable_casbin: %s: LegacyCasbinDisabled=true want=false", val)
+			if cfg.LegacyCasbinEnabled == nil || !*cfg.LegacyCasbinEnabled {
+				t.Fatalf("enable_casbin: %s: LegacyCasbinEnabled=%v want=true", val, cfg.LegacyCasbinEnabled)
 			}
 			if len(cfg.Warnings) != 1 {
 				t.Fatalf("enable_casbin: %s: Warnings=%v want 1 warning", val, cfg.Warnings)

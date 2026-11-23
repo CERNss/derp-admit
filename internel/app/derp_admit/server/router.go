@@ -26,7 +26,7 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger) *gin
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	// Trust no proxy headers: ClientIP is the TCP peer address, so the per-IP
-	// register limiter cannot be reset with a spoofed X-Forwarded-For.
+	// register and admin limiters cannot be reset with a spoofed X-Forwarded-For.
 	_ = router.SetTrustedProxies(nil)
 	router.Use(gin.Recovery())
 	router.Use(limitRequestBody(maxRequestBodyBytes))
@@ -112,7 +112,7 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger) *gin
 	})
 
 	if cfg.AdminAPIKey != "" {
-		adminLimiter := rate.NewLimiter(rate.Limit(cfg.AdminRateLimitRPS), cfg.AdminRateBurst)
+		adminLimiter := newIPRateLimiter(cfg.AdminRateLimitRPS, cfg.AdminRateBurst)
 		registerAdminRoutes(router, svc, cfg.AdminAPIKey, adminLimiter, logger)
 		logger.Info("admin API enabled", zap.String("prefix", "/admin"))
 	} else {

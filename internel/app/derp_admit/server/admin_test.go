@@ -227,6 +227,45 @@ func TestAdminDisableUserInvalidatesLiveCache(t *testing.T) {
 	}
 }
 
+func TestAdminRateLimitPerClientIP(t *testing.T) {
+	router, _ := newTestRouter(t, adminKeyOpt, func(c *config.Config) {
+		c.AdminRateLimitRPS = 0.01
+		c.AdminRateBurst = 1
+	})
+
+	// First IP consumes its single burst token and succeeds.
+	if status, _ := doAdminRequestFrom(t, router, http.MethodGet, "/admin/users", testAdminKey, "192.0.2.1:10001", nil); status != http.StatusOK {
+		t.Fatalf("client 1 first request status=%d want=%d", status, http.StatusOK)
+	}
+
+	// First IP's second request (different ephemeral port, same client IP) is throttled.
+	if status, _ := doAdminRequestFrom(t, router, http.MethodGet, "/admin/users", testAdminKey, "192.0.2.1:10002", nil); status != http.StatusTooManyRequests {
+		t.Fatalf("client 1 second request status=%d want=%d", status, http.StatusTooManyRequests)
+	}
+
+	// Second IP has an independent bucket and is still served.
+	if status, _ := doAdminRequestFrom(t, router, http.MethodGet, "/admin/users", testAdminKey, "198.51.100.2:20001", nil); status != http.StatusOK {
+		t.Fatalf("client 2 request status=%d want=%d", status, http.StatusOK)
+	}
+}
+
+func TestAdminRateLimitBeforeAuth(t *testing.T) {
+	router, _ := newTestRouter(t, adminKeyOpt, func(c *config.Config) {
+		c.AdminRateLimitRPS = 0.01
+		c.AdminRateBurst = 1
+	})
+
+	// Exhaust this client IP's bucket with an unauthenticated request (401).
+	if status, _ := doAdminRequestFrom(t, router, http.MethodGet, "/admin/users", "", "192.0.2.10:30001", nil); status != http.StatusUnauthorized {
+		t.Fatalf("first unauthenticated request status=%d want=%d", status, http.StatusUnauthorized)
+	}
+
+	// Now that the bucket is empty, a request without a key must get 429, not 401.
+	if status, _ := doAdminRequestFrom(t, router, http.MethodGet, "/admin/users", "", "192.0.2.10:30002", nil); status != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited unauthenticated request status=%d want=%d", status, http.StatusTooManyRequests)
+	}
+}
+
 // provisionUserAndToken creates a user and mints an enroll token through the
 // admin API, returning the user id and the one-time plaintext token.
 func provisionUserAndToken(t *testing.T, handler http.Handler, username string) (string, string) {
@@ -266,6 +305,34 @@ func doAdminRequest(t *testing.T, handler http.Handler, method, path, apiKey str
 	}
 
 	req := httptest.NewRequest(method, path, reader)
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	var out map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	return rec.Code, out
+}
+
+func doAdminRequestFrom(t *testing.T, handler http.Handler, method, path, apiKey, remoteAddr string, payload any) (int, map[string]any) {
+	t.Helper()
+
+	var reader io.Reader
+	if payload != nil {
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		reader = bytes.NewReader(raw)
+	}
+
+	req := httptest.NewRequest(method, path, reader)
+	req.RemoteAddr = remoteAddr
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

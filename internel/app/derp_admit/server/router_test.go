@@ -143,6 +143,79 @@ func TestRegisterMaxDevicesLimit(t *testing.T) {
 	}
 }
 
+func TestRegisterRevokedDeviceRefused(t *testing.T) {
+	router, testDB := newTestRouter(t)
+	pepper := "test-pepper"
+
+	user := createUser(t, testDB, "u-revoked-refused")
+	createEnrollToken(t, testDB, user.ID, pepper, "token-revoked-refused", nil, nil, 0)
+
+	nodeKey := newNodeKey(t)
+	revokedAt := time.Now().UTC().Add(-10 * time.Minute)
+	device := createDevice(t, testDB, user.ID, nodeKey, "original-label", &revokedAt)
+
+	status, _ := doJSONRequest(t, router, "/register", map[string]any{
+		"token":   "token-revoked-refused",
+		"nodeKey": nodeKey,
+		"label":   "updated-label",
+	})
+	if status != http.StatusForbidden {
+		t.Fatalf("status=%d want=%d", status, http.StatusForbidden)
+	}
+
+	var updated model.Device
+	if err := testDB.Where("id = ?", device.ID).First(&updated).Error; err != nil {
+		t.Fatalf("reload device: %v", err)
+	}
+	if updated.RevokedAt == nil || !updated.RevokedAt.Equal(revokedAt) {
+		t.Fatalf("revoked_at=%v want=%v", updated.RevokedAt, revokedAt)
+	}
+	if updated.Label != "original-label" {
+		t.Fatalf("label=%q want=%q", updated.Label, "original-label")
+	}
+
+	_, payload := doRawRequest(t, router, "/verify", buildVerifyBody(t, nodeKey))
+	if allow, _ := payload["Allow"].(bool); allow {
+		t.Fatalf("expected deny response after refused re-register")
+	}
+	if reason := denyReason(payload); reason != service.DenyReasonRevoked {
+		t.Fatalf("reason=%q want=%q", reason, service.DenyReasonRevoked)
+	}
+}
+
+func TestRegisterRevokedDeviceOfOtherUserConflicts(t *testing.T) {
+	router, testDB := newTestRouter(t)
+	pepper := "test-pepper"
+
+	userA := createUser(t, testDB, "u-conflict-a")
+	userB := createUser(t, testDB, "u-conflict-b")
+	createEnrollToken(t, testDB, userA.ID, pepper, "token-conflict-a", nil, nil, 0)
+
+	sharedKey := newNodeKey(t)
+	revokedAt := time.Now().UTC().Add(-5 * time.Minute)
+	device := createDevice(t, testDB, userB.ID, sharedKey, "user-b-label", &revokedAt)
+
+	status, _ := doJSONRequest(t, router, "/register", map[string]any{
+		"token":   "token-conflict-a",
+		"nodeKey": sharedKey,
+		"label":   "user-a-label",
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("status=%d want=%d", status, http.StatusConflict)
+	}
+
+	var updated model.Device
+	if err := testDB.Where("id = ?", device.ID).First(&updated).Error; err != nil {
+		t.Fatalf("reload device: %v", err)
+	}
+	if updated.UserID != userB.ID {
+		t.Fatalf("user_id=%v want=%v", updated.UserID, userB.ID)
+	}
+	if updated.RevokedAt == nil || !updated.RevokedAt.Equal(revokedAt) {
+		t.Fatalf("revoked_at=%v want=%v", updated.RevokedAt, revokedAt)
+	}
+}
+
 func TestVerifyNotRegistered(t *testing.T) {
 	router, testDB := newTestRouter(t)
 	nodeKey := newNodeKey(t)

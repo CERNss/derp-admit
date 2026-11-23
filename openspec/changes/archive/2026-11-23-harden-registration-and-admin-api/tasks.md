@@ -34,5 +34,5 @@ These tasks record work already shipped in commit `c565b78`, except 5.3, which a
 
 ## 6. Review
 
-- [ ] 6.1 Owner reviews this retroactive spec against the code and corrects any wording
+- [x] 6.1 Owner approved archiving this retroactive spec on 2026-11-23, without a line-by-line review against the code
 - [x] 6.2 Owner decides the two open questions in `design.md`

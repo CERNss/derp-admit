@@ -1,0 +1,82 @@
+# Headscale 0.29.7 configuration for the derp-admit e2e rig.
+# Based on config-example.yaml at tag v0.29.7; only the keys that differ
+# from that file (or matter to the rig) are commented.
+---
+# The machines reach headscale through an /etc/hosts entry run.sh writes.
+server_url: http://headscale.e2e.test:8080
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+trusted_proxies: []
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+
+derp:
+  # No embedded DERP server and no default (public) Tailscale DERP map:
+  # the DERP map served to clients is exactly derp.yaml (one region, our derper).
+  server:
+    enabled: false
+  urls: []
+  paths:
+    - /etc/headscale/derp.yaml
+  auto_update_enabled: false
+  update_frequency: 3h
+
+disable_check_updates: true
+
+node:
+  expiry: 0
+  ephemeral:
+    inactivity_timeout: 30m
+
+database:
+  type: sqlite
+  debug: false
+  gorm:
+    prepare_stmt: true
+    parameterized_queries: true
+    skip_err_record_not_found: true
+    slow_threshold: 1000
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+    write_ahead_log: true
+    wal_autocheckpoint: 1000
+
+tls_cert_path: ""
+tls_key_path: ""
+
+log:
+  level: info
+  format: text
+
+# Empty path: no ACL policy file, every node may reach every other node.
+policy:
+  mode: file
+  path: ""
+
+# No MagicDNS and no DNS override: the machines keep their own resolver.
+dns:
+  magic_dns: false
+  base_domain: ""
+  override_local_dns: false
+  nameservers:
+    global: []
+    split: {}
+  search_domains: []
+  extra_records: []
+
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"
+
+logtail:
+  enabled: false
+
+taildrop:
+  enabled: false

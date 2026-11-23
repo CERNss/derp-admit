@@ -1,0 +1,143 @@
+# End-to-end rig for derp-admit with real Tailscale clients.
+#
+# Always run through e2e/run.sh (project name "derp-admit-e2e"). The three
+# Tailscale clients are OrbStack Linux machines (derp-e2e-a, -b, -c), not
+# services of this file; they reach headscale and derper by container IP on
+# the "edge" network. Nothing here publishes a host port.
+#
+# derper asks the verifier about relay "e2e" (not the built-in "default"):
+# run.sh creates relay "e2e" and role "e2e-access" before any client starts.
+#
+# Every secret below is a throwaway value that exists only for this rig.
+
+name: derp-admit-e2e
+
+x-golang-override: &golang-override
+  # The Dockerfiles say FROM golang:1.24.0 / golang:1.24. On a host that cannot
+  # reach Docker Hub, point E2E_GOLANG_IMAGE / E2E_GOLANG_DERPER_IMAGE at a mirror
+  # of the official image; the defaults change nothing.
+  golang:1.24.0: docker-image://${E2E_GOLANG_IMAGE:-golang:1.24.0}
+
+services:
+  postgres:
+    image: ${E2E_POSTGRES_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_USER: verifier
+      POSTGRES_PASSWORD: e2e-throwaway-db-password
+      POSTGRES_DB: verifier
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verifier -d verifier"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  verifier:
+    image: derp-admit-e2e-verifier:local
+    build:
+      context: ..
+      dockerfile: builder/derp_admit/Dockerfile
+      additional_contexts: *golang-override
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://verifier:e2e-throwaway-db-password@postgres:5432/verifier?sslmode=disable
+      TOKEN_PEPPER: e2e-throwaway-pepper
+      ADMIN_API_KEY: e2e-throwaway-admin-api-key
+      LOG_LEVEL: info
+      # run.sh polls the admin API; keep its own calls well below these.
+      ADMIN_RATE_LIMIT_RPS: "50"
+      ADMIN_RATE_LIMIT_BURST: "100"
+      VERIFY_CACHE_TTL: 0s
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/readyz"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  # Helper container: runs e2etool (PKI generation, admin API calls, JSON
+  # templating). Also creates the throwaway CA and derper certificate once.
+  tools:
+    image: derp-admit-e2e-tools:local
+    build:
+      context: tools
+      additional_contexts: *golang-override
+    command: ["sh", "-c", "e2etool pki /pki derp.e2e.test && exec sleep 2147483647"]
+    environment:
+      API_BASE: http://verifier:8080
+      ADMIN_KEY: e2e-throwaway-admin-api-key
+    volumes:
+      - pki:/pki
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "test", "-s", "/pki/derp.e2e.test.key"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  headscale:
+    image: ${E2E_HEADSCALE_IMAGE:-ghcr.io/juanfont/headscale:0.29.7}
+    command: ["serve"]
+    read_only: true
+    tmpfs:
+      - /var/run/headscale
+    volumes:
+      - ./headscale/config.yaml:/etc/headscale/config.yaml:ro
+      - ./headscale/derp.yaml:/etc/headscale/derp.yaml:ro
+      - headscale-data:/var/lib/headscale
+    networks: [edge]
+    healthcheck:
+      test: ["CMD", "headscale", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  derper:
+    image: derp-admit-e2e-derper:v1.84.3
+    build:
+      context: ../builder/derp_admit
+      dockerfile: derper.Dockerfile
+      args:
+        TAILSCALE_VERSION: v1.84.3
+      additional_contexts:
+        golang:1.24: docker-image://${E2E_GOLANG_DERPER_IMAGE:-golang:1.24}
+    networks: [backend, edge]
+    depends_on:
+      tools:
+        condition: service_healthy
+      verifier:
+        condition: service_healthy
+    environment:
+      # Logs "register single client" / "removed connection" per client
+      # (derp/derp_server.go); without it derper logs only refusals.
+      DERP_DEBUG_LOGS: "true"
+    command:
+      - -a=:8443
+      - --http-port=-1
+      - --stun-port=3478
+      - --certmode=manual
+      - --certdir=/pki
+      - --hostname=derp.e2e.test
+      - -c=/var/lib/derper/derper.json
+      - --verify-client-url=http://verifier:8080/verify/e2e
+      - --verify-client-url-fail-open=false
+    volumes:
+      - pki:/pki:ro
+      - derper-data:/var/lib/derper
+
+networks:
+  # postgres, verifier, tools, derper. No route to the outside.
+  backend:
+    internal: true
+  # headscale and derper: the only services the client machines can reach.
+  edge: {}
+
+volumes:
+  postgres-data:
+  headscale-data:
+  derper-data:
+  pki:

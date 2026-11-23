@@ -1,0 +1,21 @@
+# The only DERP region the clients get (config.yaml sets derp.urls: [] and
+# disables the embedded DERP server). Field names are the lower-cased
+# tailcfg.DERPRegion / tailcfg.DERPNode field names: headscale decodes this
+# file with gopkg.in/yaml.v3 straight into tailcfg.DERPMap.
+#
+# derp.e2e.test must match derper --hostname, the certificate SAN made by
+# e2etool pki, and the /etc/hosts entry run.sh writes inside each machine.
+# No InsecureForTests and no CertName: clients verify the certificate against
+# the throwaway CA installed in their system trust store.
+regions:
+  900:
+    regionid: 900
+    regioncode: e2e-derp
+    regionname: derp-admit e2e relay
+    nodes:
+      - name: 900a
+        regionid: 900
+        hostname: derp.e2e.test
+        ipv6: none
+        derpport: 8443
+        stunport: 3478

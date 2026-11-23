@@ -18,28 +18,44 @@ services:
 
   verifier:
     image: derp-admit:linux-amd64
+    build:
+      context: ../..
+      dockerfile: builder/derp_admit/Dockerfile
     container_name: derp-verifier
     depends_on:
       postgres:
         condition: service_healthy
     env_file:
-      - ../../.env
+      - path: ../../.env
+        required: false
     environment:
       CONFIG_FILE: "/app/config/config.yaml"
     ports:
       - "8080:8080"
 
-  # Example derper wiring:
-  # derper:
-  #   image: tailscale/derper:latest
-  #   depends_on:
-  #     - verifier
-  #   command:
-  #     - derper
-  #     - --verify-client-url=http://verifier:8080/verify
-  #     - --verify-client-url-fail-open=false
-  #   ports:
-  #     - "3478:3478/udp"
+  # derper built from the tailscale version pinned in go.mod (no usable
+  # published image). Plain HTTP on :3340 for local smoke tests: TLS is only
+  # served on :443 or with --certmode=manual; use one of those for real clients.
+  derper:
+    image: derp-admit-derper:v1.84.3
+    build:
+      context: .
+      dockerfile: derper.Dockerfile
+      args:
+        TAILSCALE_VERSION: v1.84.3
+    depends_on:
+      - verifier
+    command:
+      - -a=:3340
+      - -c=/var/lib/derper/derper.key
+      - --verify-client-url=http://verifier:8080/verify/default
+      - --verify-client-url-fail-open=false
+    ports:
+      - "3340:3340"
+      - "3478:3478/udp"
+    volumes:
+      - derper-data:/var/lib/derper
 
 volumes:
   postgres-data:
+  derper-data:

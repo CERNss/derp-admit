@@ -1,5 +1,7 @@
 The groups below are merge units, done in the fixed order 0 to 7. Each lands its own code, tests and README changes, and leaves `go build ./... && go vet ./... && go test -race -count=1 ./...` passing. All of them are released together as one breaking release, with the single upgrade procedure in the Migration Plan of `design.md`. The test names are the ones the group adds or changes. Paths are relative to `internel/app/derp_admit/` unless they start at the repository root.
 
+Execution note (2026-11-23): the owner asked for parallel implementation. The work is done as a schema foundation, then a serial seam step (file splits, the shared mutation/tier/pagination mechanisms, and the policy core of 2.2, 2.3, 2.6 and 2.8), then five parallel tracks (upgrade and startup; verify path, sync and metrics; admin keys; access management API; lifecycle API and audit queries), then a serial integration step for the route-wide tests and the README tasks. The task ids and their acceptance are unchanged; only the order differs from the numbering.
+
 ## 0. Prerequisites
 
 - [x] 0.1 Owner reviews `harden-registration-and-admin-api` and it is archived. This change's deltas on `admin-lifecycle-api`, `device-enrollment` and `derp-client-verification` modify or remove requirements that only that change adds. Verify with `openspec list --specs`, which must list `admin-lifecycle-api`, and with `openspec validate rework-access-control-and-admin --type change --strict --no-interactive`, which must show no "Archive would refuse" INFO lines.

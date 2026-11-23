@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"derp-admit/config"
+	"derp-admit/internel/app/derp_admit/actor"
 	"derp-admit/internel/app/derp_admit/app"
 	"derp-admit/internel/app/derp_admit/db"
 	"derp-admit/internel/app/derp_admit/model"
@@ -234,9 +235,10 @@ func TestPostgresEndToEnd(t *testing.T) {
 		t.Fatalf("verify disabled user nk1 reason=%q want=%q", reason, service.DenyReasonUserDisabled)
 	}
 
-	// 14. Exactly one admin audit row per mutating request (7 mutations) and policy version > 0.
+	// 14. Exactly one admin audit row per mutating request (7 mutations),
+	// one startup system row for bootstrap creation, and policy version > 0.
 	var auditRows []model.AdminAuditLog
-	if err := gormDB.Order("id asc").Find(&auditRows).Error; err != nil {
+	if err := gormDB.Where("actor_name <> ?", actor.System.Name).Order("id asc").Find(&auditRows).Error; err != nil {
 		t.Fatalf("query admin_audit_logs: %v", err)
 	}
 	const wantMutations = 7
@@ -247,6 +249,14 @@ func TestPostgresEndToEnd(t *testing.T) {
 		if row.Outcome != service.AuditOutcomeSuccess {
 			t.Fatalf("audit row %d outcome=%q want=%q", i, row.Outcome, service.AuditOutcomeSuccess)
 		}
+	}
+
+	var systemRows []model.AdminAuditLog
+	if err := gormDB.Where("actor_name = ?", actor.System.Name).Order("id asc").Find(&systemRows).Error; err != nil {
+		t.Fatalf("query system admin_audit_logs: %v", err)
+	}
+	if len(systemRows) != 1 || systemRows[0].Action != "bootstrap.create" {
+		t.Fatalf("system audit rows=%+v want exactly 1 bootstrap.create row", systemRows)
 	}
 
 	ver, err := policy.ReadVersion(context.Background(), gormDB)

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -106,6 +108,14 @@ func TestAdminAuditRecordsPanic(t *testing.T) {
 	const adminKey = "panic-test-admin-key-0123456789"
 	logger := zap.NewNop()
 	svc := service.New(gormDB, engine, "test-pepper", 2*time.Second, service.NewVerifyCache(0), logger, service.WithAdminAPIKey(adminKey))
+	sum := sha256.Sum256([]byte(adminKey + ":test-pepper"))
+	if err := gormDB.Create(&model.AdminKey{
+		Name:    "panic-test-admin",
+		Tier:    model.AdminTierAdmin,
+		KeyHash: hex.EncodeToString(sum[:]),
+	}).Error; err != nil {
+		t.Fatalf("seed admin key: %v", err)
+	}
 
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()

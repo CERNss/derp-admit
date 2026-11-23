@@ -60,7 +60,26 @@ func TestAdminLifecycleEndToEnd(t *testing.T) {
 	if status != http.StatusCreated {
 		t.Fatalf("create user status=%d want=%d", status, http.StatusCreated)
 	}
-	userID := body["user"].(map[string]any)["id"].(string)
+	createdUser := body["user"].(map[string]any)
+	userID := createdUser["id"].(string)
+	createdRoles, ok := createdUser["roles"].([]any)
+	if !ok || len(createdRoles) != 1 || createdRoles[0] != "standard" {
+		t.Fatalf("create user roles=%v want=[standard]", createdUser["roles"])
+	}
+
+	// List users includes roles.
+	status, listBody := doAdminRequest(t, router, http.MethodGet, "/admin/users", testAdminKey, nil)
+	if status != http.StatusOK {
+		t.Fatalf("list users status=%d want=%d", status, http.StatusOK)
+	}
+	listedUsers := listBody["users"].([]any)
+	if len(listedUsers) != 1 {
+		t.Fatalf("listed user count=%d want=1", len(listedUsers))
+	}
+	listedRoles, ok := listedUsers[0].(map[string]any)["roles"].([]any)
+	if !ok || len(listedRoles) != 1 || listedRoles[0] != "standard" {
+		t.Fatalf("list user roles=%v want=[standard]", listedUsers[0].(map[string]any)["roles"])
+	}
 
 	// Mint an enroll token; plaintext is returned exactly once.
 	status, body = doAdminRequest(t, router, http.MethodPost, "/admin/tokens", testAdminKey, map[string]any{

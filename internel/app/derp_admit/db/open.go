@@ -2,7 +2,10 @@ package db
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"strings"
+	"time"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
@@ -10,7 +13,20 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+// NewLogger constructs a gorm logger that suppresses ErrRecordNotFound noise
+// and keeps SQL parameterized so bound secrets/hashes are never printed.
+func NewLogger(w logger.Writer, level logger.LogLevel) logger.Interface {
+	return logger.New(w, logger.Config{
+		SlowThreshold:             200 * time.Millisecond,
+		LogLevel:                  level,
+		IgnoreRecordNotFoundError: true,
+		ParameterizedQueries:      true,
+		Colorful:                  false,
+	})
+}
+
 func OpenDatabase(databaseURL string) (*gorm.DB, error) {
+	stdWriter := log.New(os.Stdout, "\r\n", log.LstdFlags)
 	switch {
 	case strings.HasPrefix(databaseURL, "sqlite://"):
 		path := strings.TrimPrefix(databaseURL, "sqlite://")
@@ -24,12 +40,12 @@ func OpenDatabase(databaseURL string) (*gorm.DB, error) {
 			sep = "&"
 		}
 		return gorm.Open(sqlite.Open(path+sep+"_txlock=immediate&_busy_timeout=5000"), &gorm.Config{
-			Logger:         logger.Default.LogMode(logger.Silent),
+			Logger:         NewLogger(stdWriter, logger.Silent),
 			TranslateError: true,
 		})
 	case strings.HasPrefix(databaseURL, "postgres://"), strings.HasPrefix(databaseURL, "postgresql://"):
 		return gorm.Open(postgres.Open(databaseURL), &gorm.Config{
-			Logger:         logger.Default.LogMode(logger.Warn),
+			Logger:         NewLogger(stdWriter, logger.Warn),
 			TranslateError: true,
 		})
 	default:

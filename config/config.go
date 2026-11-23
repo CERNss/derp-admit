@@ -15,18 +15,15 @@ import (
 const (
 	defaultConfigFilePath = "config/config.yaml"
 	defaultEnvFilePath    = ".env"
+	minPolicySyncInterval = 100 * time.Millisecond
 )
 
 type Config struct {
-	Addr        string
-	DatabaseURL string
-	TokenPepper string
-	AdminAPIKey string
-	LogLevel    string
-	// EnableCasbin is unused and retained temporarily only so read-only
-	// server/postgres_e2e_test.go compiles until the integrator removes its
-	// struct literal field. Policy is always enforced.
-	EnableCasbin         bool
+	Addr                 string
+	DatabaseURL          string
+	TokenPepper          string
+	AdminAPIKey          string
+	LogLevel             string
 	LegacyCasbinDisabled bool
 	Warnings             []string
 	OTELEnabled          bool
@@ -251,17 +248,12 @@ func parseYAMLBoolNode(node *yaml.Node) (bool, bool) {
 	if node == nil || node.Kind != yaml.ScalarNode {
 		return false, false
 	}
-	if node.Tag == "!!bool" {
-		var b bool
-		if err := node.Decode(&b); err == nil {
-			return b, true
-		}
-	}
-	if node.Tag == "!!str" {
-		b, err := strconv.ParseBool(strings.TrimSpace(node.Value))
-		if err == nil {
-			return b, true
-		}
+	// Decode into *bool with yaml.v3 exactly as the previous fileConfig struct
+	// did, so YAML 1.1 booleans (off, no, n, N, NO, Off, OFF, false, ...) are
+	// recognised while null and non-bool values count as not false.
+	var b *bool
+	if err := node.Decode(&b); err == nil && b != nil {
+		return *b, true
 	}
 	return false, false
 }
@@ -461,8 +453,8 @@ func validate(cfg Config) error {
 	if cfg.DBTimeout <= 0 {
 		return fmt.Errorf("DB_TIMEOUT must be > 0")
 	}
-	if cfg.PolicySyncInterval <= 0 {
-		return fmt.Errorf("POLICY_SYNC_INTERVAL must be > 0")
+	if cfg.PolicySyncInterval < minPolicySyncInterval {
+		return fmt.Errorf("POLICY_SYNC_INTERVAL must be >= %s", minPolicySyncInterval)
 	}
 	if cfg.OTELSampleRatio < 0 || cfg.OTELSampleRatio > 1 {
 		return fmt.Errorf("OTEL_TRACE_SAMPLE_RATIO must be between 0 and 1")

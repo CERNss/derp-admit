@@ -16,18 +16,20 @@ package service
 //     need to mark the instance stale without knowing a version (MarkStale()).
 //     Only a Reload that STARTS after the MarkStale() call and completes
 //     successfully can advance satisfiedGen to cover that mark.
-//   - Time-based staleness: lastSuccessNano tracks the timestamp of the last
-//     successful version check (including any reload it triggered). Once the
-//     poller is active (intervalNano > 0), Stale() also returns true when
-//     now - lastSuccess > 3 * interval, until a check (and reload) succeeds.
+//   - Time-based staleness: lastSuccess tracks the monotonic instant of the
+//     last successful version check (including any reload it triggered). Once
+//     the poller is active (intervalNano > 0), Stale() also returns true when
+//     elapsed time since lastSuccess exceeds 3 * interval, until a check (and
+//     reload) succeeds.
 //   - Stale(publishedVersion): returns true when publishedVersion < required
-//     OR satisfiedGen < markGen OR now - lastSuccess > 3 * interval. While
-//     stale, /verify fails closed with DenyReasonInternal (audited) and /readyz
-//     returns 503.
+//     OR satisfiedGen < markGen OR elapsed since lastSuccess > 3 * interval.
+//     While stale, /verify fails closed with DenyReasonInternal (audited) and
+//     /readyz returns 503.
 
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,15 +38,22 @@ import (
 	"go.uber.org/zap"
 )
 
+type syncClock struct {
+	now   func() time.Time
+	since func(time.Time) time.Duration
+	sub   func(a, b time.Time) time.Duration
+}
+
 type syncer struct {
-	required        atomic.Int64
-	markGen         atomic.Uint64
-	satisfiedGen    atomic.Uint64
-	started         atomic.Bool
-	intervalNano    atomic.Int64
-	lastSuccessNano atomic.Int64
-	clock           atomic.Pointer[func() time.Time]
-	versionReader   atomic.Pointer[func(context.Context) (int64, error)]
+	required      atomic.Int64
+	markGen       atomic.Uint64
+	satisfiedGen  atomic.Uint64
+	started       atomic.Bool
+	intervalNano  atomic.Int64
+	lastMu        sync.Mutex
+	lastSuccess   time.Time
+	clock         atomic.Pointer[syncClock]
+	versionReader atomic.Pointer[func(context.Context) (int64, error)]
 }
 
 func newSyncer() *syncer {
@@ -52,14 +61,44 @@ func newSyncer() *syncer {
 }
 
 func (s *syncer) now() time.Time {
-	if fn := s.clock.Load(); fn != nil && *fn != nil {
-		return (*fn)()
+	if c := s.clock.Load(); c != nil && c.now != nil {
+		return c.now()
 	}
-	return time.Now().UTC()
+	return time.Now()
+}
+
+func (s *syncer) since(t time.Time) time.Duration {
+	if c := s.clock.Load(); c != nil && c.since != nil {
+		return c.since(t)
+	}
+	return time.Since(t)
+}
+
+func (s *syncer) sub(a, b time.Time) time.Duration {
+	if c := s.clock.Load(); c != nil && c.sub != nil {
+		return c.sub(a, b)
+	}
+	return a.Sub(b)
 }
 
 func (s *syncer) setClock(fn func() time.Time) {
-	s.clock.Store(&fn)
+	if fn == nil {
+		s.clock.Store(nil)
+		return
+	}
+	s.clock.Store(&syncClock{
+		now:   fn,
+		since: func(t time.Time) time.Duration { return fn().Sub(t) },
+		sub:   func(a, b time.Time) time.Duration { return a.Sub(b) },
+	})
+}
+
+func (s *syncer) setMonoClock(now func() time.Time, since func(time.Time) time.Duration, sub func(a, b time.Time) time.Duration) {
+	s.clock.Store(&syncClock{
+		now:   now,
+		since: since,
+		sub:   sub,
+	})
 }
 
 func (s *syncer) setVersionReader(fn func(context.Context) (int64, error)) {
@@ -74,24 +113,20 @@ func (s *syncer) ensureInterval(interval time.Duration) {
 }
 
 func (s *syncer) recordSuccess(t time.Time) {
-	ns := t.UTC().UnixNano()
-	for {
-		cur := s.lastSuccessNano.Load()
-		if cur >= ns {
-			return
-		}
-		if s.lastSuccessNano.CompareAndSwap(cur, ns) {
-			return
-		}
+	s.lastMu.Lock()
+	defer s.lastMu.Unlock()
+	if s.lastSuccess.IsZero() || s.sub(t, s.lastSuccess) >= 0 {
+		s.lastSuccess = t
 	}
 }
 
 func (s *syncer) lastSuccessTime() time.Time {
-	ns := s.lastSuccessNano.Load()
-	if ns <= 0 {
+	s.lastMu.Lock()
+	defer s.lastMu.Unlock()
+	if s.lastSuccess.IsZero() {
 		return time.Time{}
 	}
-	return time.Unix(0, ns).UTC()
+	return s.lastSuccess.UTC()
 }
 
 // Require records that the published policy snapshot must cover at least v.
@@ -146,10 +181,11 @@ func (s *syncer) Stale(publishedVersion int64) bool {
 		return true
 	}
 	if interval := time.Duration(s.intervalNano.Load()); interval > 0 {
-		if last := s.lastSuccessNano.Load(); last > 0 {
-			if s.now().Sub(time.Unix(0, last)) > 3*interval {
-				return true
-			}
+		s.lastMu.Lock()
+		last := s.lastSuccess
+		s.lastMu.Unlock()
+		if !last.IsZero() && s.since(last) > 3*interval {
+			return true
 		}
 	}
 	return false
@@ -215,17 +251,18 @@ func (s *Service) syncOnce(ctx context.Context) error {
 
 	published := s.publishedVersion()
 	if stored > published || s.sync.needsReload(published) {
+		reloadErr := s.ReloadPolicy(checkCtx)
 		s.sync.Require(stored)
-		if err := s.ReloadPolicy(checkCtx); err != nil {
+		if reloadErr != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			s.metrics.PolicySync(false, s.publishedVersion(), s.sync.lastSuccessTime())
 			s.logger.Warn("policy sync reload failed",
-				zap.Error(err),
+				zap.Error(reloadErr),
 				zap.Int64("stored_version", stored),
 			)
-			return err
+			return reloadErr
 		}
 		published = s.publishedVersion()
 		if published < stored || s.sync.needsReload(published) {
@@ -236,7 +273,7 @@ func (s *Service) syncOnce(ctx context.Context) error {
 
 	now := s.sync.now()
 	s.sync.recordSuccess(now)
-	s.metrics.PolicySync(true, published, now)
+	s.metrics.PolicySync(true, published, now.UTC())
 	return nil
 }
 

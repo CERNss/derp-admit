@@ -2,6 +2,8 @@ package startup
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"os"
@@ -72,11 +74,17 @@ func withPostgresLock(ctx context.Context, gormDB *gorm.DB, fn func() error) (re
 	if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", AdvisoryLockKey); err != nil {
 		// Guard against the narrow race where ctx cancels right as
 		// pg_advisory_lock completes on the server: issue a best-effort
-		// unlock on this session before returning the connection to the pool.
+		// unlock on this session, and if unlock cannot be confirmed discard
+		// the connection so a locked session never returns to the pool.
 		if ctx.Err() != nil {
 			unlockCtx, cancel := context.WithTimeout(context.Background(), unlockTimeout)
-			_, _ = conn.ExecContext(unlockCtx, "SELECT pg_advisory_unlock($1)", AdvisoryLockKey)
+			_, unlockErr := conn.ExecContext(unlockCtx, "SELECT pg_advisory_unlock($1)", AdvisoryLockKey)
 			cancel()
+			if unlockErr != nil {
+				discardConn(conn)
+			}
+		} else {
+			discardConn(conn)
 		}
 		_ = conn.Close()
 		return fmt.Errorf("acquire startup advisory lock: %w", err)
@@ -87,8 +95,11 @@ func withPostgresLock(ctx context.Context, gormDB *gorm.DB, fn func() error) (re
 		defer cancel()
 
 		var unlocked bool
-		if err := conn.QueryRowContext(unlockCtx, "SELECT pg_advisory_unlock($1)", AdvisoryLockKey).Scan(&unlocked); err != nil {
-			if retErr == nil {
+		if err := conn.QueryRowContext(unlockCtx, "SELECT pg_advisory_unlock($1)", AdvisoryLockKey).Scan(&unlocked); err != nil || !unlocked {
+			// Drop the session rather than returning a potentially still-locked
+			// connection to the pool.
+			discardConn(conn)
+			if err != nil && retErr == nil {
 				retErr = fmt.Errorf("release startup advisory lock: %w", err)
 			}
 		}
@@ -96,6 +107,12 @@ func withPostgresLock(ctx context.Context, gormDB *gorm.DB, fn func() error) (re
 	}()
 
 	return fn()
+}
+
+func discardConn(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error {
+		return driver.ErrBadConn
+	})
 }
 
 type sqliteDBInfo struct {

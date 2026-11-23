@@ -46,6 +46,8 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger, opts
 
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
+	router.RedirectTrailingSlash = false
+	router.RedirectFixedPath = false
 	// Trust no proxy headers: ClientIP is the TCP peer address, so the per-IP
 	// register and admin limiters cannot be reset with a spoofed X-Forwarded-For.
 	_ = router.SetTrustedProxies(nil)
@@ -117,9 +119,8 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger, opts
 		c.JSON(status, gin.H{"ok": false})
 	})
 
-	vh := verifyHandler(svc, verifyLimiter, logger, rec)
-	router.POST("/verify", vh)
-	router.POST("/verify/:relay", vh)
+	router.POST("/verify", verifyHandler(svc, verifyLimiter, logger, rec, true))
+	router.POST("/verify/*relay", verifyHandler(svc, verifyLimiter, logger, rec, false))
 
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{

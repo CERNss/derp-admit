@@ -55,12 +55,18 @@ func (s *Service) CreateRelay(ctx context.Context, in CreateRelayInput) (model.R
 			return fmt.Errorf("%w: relay already exists", ErrAdminConflict)
 		}
 
+		purged, err := policy.PurgeRelayRules(tx, relay.Name)
+		if err != nil {
+			return fmt.Errorf("purge stale relay rules: %w", err)
+		}
+
 		created = relay
 		ch.Changed = true
 		ch.TargetID = relay.Name
 		ch.Summary = map[string]any{
-			"relay":       relay.Name,
-			"description": relay.Description,
+			"relay":            relay.Name,
+			"description":      relay.Description,
+			"purgedStaleRules": purged,
 		}
 		return nil
 	})
@@ -99,7 +105,11 @@ func (s *Service) DeleteRelay(ctx context.Context, name string) error {
 		}
 
 		var relay model.Relay
-		if err := tx.First(&relay, "name = ?", name).Error; err != nil {
+		q := tx
+		if tx.Dialector.Name() == "postgres" {
+			q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := q.First(&relay, "name = ?", name).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrAdminNotFound
 			}
@@ -150,6 +160,11 @@ func (s *Service) CreateRole(ctx context.Context, in CreateRoleInput) (RoleWithG
 			return fmt.Errorf("%w: role already exists", ErrAdminConflict)
 		}
 
+		purged, err := policy.PurgeRoleRules(tx, role.Name)
+		if err != nil {
+			return fmt.Errorf("purge stale role rules: %w", err)
+		}
+
 		if err := policy.SetRoleGrants(tx, role.Name, normalizedRelays); err != nil {
 			if errors.Is(err, policy.ErrUnknownRelay) || errors.Is(err, policy.ErrInvalidGrant) {
 				return fmt.Errorf("%w: %w", ErrAdminInvalid, err)
@@ -167,9 +182,10 @@ func (s *Service) CreateRole(ctx context.Context, in CreateRoleInput) (RoleWithG
 		ch.Changed = true
 		ch.TargetID = role.Name
 		ch.Summary = map[string]any{
-			"role":        role.Name,
-			"description": role.Description,
-			"relays":      normalizedRelays,
+			"role":             role.Name,
+			"description":      role.Description,
+			"relays":           normalizedRelays,
+			"purgedStaleRules": purged,
 		}
 		return nil
 	})
@@ -227,7 +243,11 @@ func (s *Service) SetRoleRelays(ctx context.Context, roleName string, relays []s
 			return ErrAdminNotFound
 		}
 		var role model.Role
-		if err := tx.First(&role, "name = ?", roleName).Error; err != nil {
+		q := tx
+		if tx.Dialector.Name() == "postgres" {
+			q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := q.First(&role, "name = ?", roleName).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrAdminNotFound
 			}
@@ -285,7 +305,11 @@ func (s *Service) DeleteRole(ctx context.Context, name string) (int64, error) {
 		}
 
 		var role model.Role
-		if err := tx.First(&role, "name = ?", name).Error; err != nil {
+		q := tx
+		if tx.Dialector.Name() == "postgres" {
+			q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := q.First(&role, "name = ?", name).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrAdminNotFound
 			}
@@ -372,20 +396,13 @@ func (s *Service) SetUserRoles(ctx context.Context, userID uuid.UUID, roles []st
 }
 
 func normalizeRelaysInput(relays []string) ([]string, error) {
-	hasWildcard := false
-	for _, r := range relays {
-		if r == "*" {
-			hasWildcard = true
-			break
-		}
-	}
-	if hasWildcard {
-		if len(relays) > 1 {
+	normalized := dedupeSortedStrings(relays)
+	if slices.Contains(normalized, "*") {
+		if len(normalized) > 1 {
 			return nil, fmt.Errorf("%w: wildcard '*' must be the only relay entry", policy.ErrInvalidGrant)
 		}
 		return []string{"*"}, nil
 	}
-	normalized := dedupeSortedStrings(relays)
 	for _, r := range normalized {
 		if !policy.NamePattern.MatchString(r) {
 			return nil, fmt.Errorf("%w: %s", policy.ErrUnknownRelay, r)

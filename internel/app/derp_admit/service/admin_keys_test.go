@@ -46,7 +46,7 @@ func cNewTestService(t *testing.T, gormDB *gorm.DB, logger *zap.Logger, opts ...
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	engine, err := policy.NewEngine(gormDB, true)
+	engine, err := policy.NewEngine(gormDB)
 	if err != nil {
 		t.Fatalf("new policy engine: %v", err)
 	}
@@ -74,7 +74,7 @@ func cAdminCtx(action, targetType, targetID string) context.Context {
 func TestAdminAuthRejectsStaticKeyWithoutStoredRow(t *testing.T) {
 	const staticKey = "static-env-key-0123456789abcdef"
 	gormDB := cOpenTestDB(t, "no-fallback.db")
-	svc := cNewTestService(t, gormDB, nil, WithAdminAPIKey(staticKey))
+	svc := cNewTestService(t, gormDB, nil)
 
 	// Static fallback must be gone: without a stored row, ADMIN_API_KEY is rejected.
 	a, ok, err := svc.AuthenticateAdminKey(context.Background(), staticKey)

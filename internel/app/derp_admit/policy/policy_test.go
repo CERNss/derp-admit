@@ -120,7 +120,7 @@ func TestEnforceRoleGrantOnRelay(t *testing.T) {
 	}
 
 	// Verify NewEngine ignores enabled=false and always enforces.
-	engine, err := policy.NewEngine(dbConn, false)
+	engine, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestEnforceWildcardGrant(t *testing.T) {
 		t.Fatalf("set wildcard grant: %v", err)
 	}
 
-	engine, err := policy.NewEngine(dbConn, true)
+	engine, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestEnforceUserWithoutRoleDenied(t *testing.T) {
 	dbConn := openPolicyTestDB(t)
 	seedBuiltins(t, dbConn)
 
-	engine, err := policy.NewEngine(dbConn, true)
+	engine, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestEnforceIgnoresDirectAndDeviceRules(t *testing.T) {
 		t.Fatalf("insert unmanaged rules: %v", err)
 	}
 
-	engine, err := policy.NewEngine(dbConn, true)
+	engine, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestEnforceIgnoresStoredWildcardRule(t *testing.T) {
 		t.Fatalf("bind user: %v", err)
 	}
 
-	engine, err := policy.NewEngine(dbConn, true)
+	engine, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestEnforceIgnoresNonCanonicalUserBinding(t *testing.T) {
 				t.Fatalf("insert non-canonical g row: %v", err)
 			}
 
-			engine, err := policy.NewEngine(dbConn, true)
+			engine, err := policy.NewEngine(dbConn)
 			if err != nil {
 				t.Fatalf("NewEngine: %v", err)
 			}
@@ -400,7 +400,7 @@ func TestReloadSeesOneConsistentSnapshot(t *testing.T) {
 		t.Fatalf("seed old state: %v", err)
 	}
 
-	engine, err := policy.NewEngine(conn1, true)
+	engine, err := policy.NewEngine(conn1)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -507,7 +507,7 @@ func TestEngineVersionPublishedWithSnapshot(t *testing.T) {
 		t.Fatalf("setup initial ops role: %v", err)
 	}
 
-	engine, err := policy.NewEngine(dbConn, true)
+	engine, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}

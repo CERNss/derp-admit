@@ -38,7 +38,6 @@ func dNewApp(t *testing.T, opts ...func(*config.Config)) *app.App {
 	cfg := config.Config{
 		DatabaseURL:          dbURL,
 		TokenPepper:          "test-pepper",
-		EnableCasbin:         true,
 		MetricsEnabled:       true,
 		DBTimeout:            2 * time.Second,
 		PolicySyncInterval:   2 * time.Second,
@@ -379,7 +378,7 @@ func TestAccessRoleCRUDAndGrants(t *testing.T) {
 	mixedCases := [][]string{
 		{"*", "default"},
 		{"default", "*"},
-		{"*", "*"},
+		{"*", "*", "default"},
 	}
 	for _, mixed := range mixedCases {
 		status, _ = doAdminRequest(t, a.Router, http.MethodPost, "/admin/roles", testAdminKey, map[string]any{
@@ -1059,8 +1058,16 @@ func TestAccessAuditRowsAndSummaries(t *testing.T) {
 			t.Fatalf("GET %s status=%d want=%d", path, status, http.StatusOK)
 		}
 	}
+	var sysCount int64
+	if err := gormDB.Model(&model.AdminAuditLog{}).Where("actor_key_id IS NULL AND actor_name = ?", actor.System.Name).Count(&sysCount).Error; err != nil {
+		t.Fatalf("count startup system audits: %v", err)
+	}
+	if sysCount != 1 {
+		t.Fatalf("startup system audit count=%d want=1", sysCount)
+	}
+
 	var count int64
-	if err := gormDB.Model(&model.AdminAuditLog{}).Count(&count).Error; err != nil {
+	if err := gormDB.Model(&model.AdminAuditLog{}).Where("NOT (actor_key_id IS NULL AND actor_name = ?)", actor.System.Name).Count(&count).Error; err != nil {
 		t.Fatalf("count audits after GET: %v", err)
 	}
 	if count != 0 {
@@ -1093,7 +1100,7 @@ func TestAccessAuditRowsAndSummaries(t *testing.T) {
 	}
 
 	var rows []model.AdminAuditLog
-	if err := gormDB.Order("id asc").Find(&rows).Error; err != nil {
+	if err := gormDB.Where("NOT (actor_key_id IS NULL AND actor_name = ?)", actor.System.Name).Order("id asc").Find(&rows).Error; err != nil {
 		t.Fatalf("load admin_audit_logs: %v", err)
 	}
 	if len(rows) != len(steps) {
@@ -1121,5 +1128,151 @@ func TestAccessAuditRowsAndSummaries(t *testing.T) {
 		if len(summary) == 0 {
 			t.Fatalf("row %d empty summary", i)
 		}
+	}
+}
+
+func TestCreateRoleStartsCleanOfStaleRules(t *testing.T) {
+	a := dNewApp(t, adminKeyOpt)
+	user := createUser(t, a.DB, "stale-role-user")
+	nk := newNodeKey(t)
+	createDevice(t, a.DB, user.ID, nk, "laptop", nil)
+
+	// Insert stale rules naming role:ops before ops exists in the roles registry.
+	staleRules := []model.CasbinRule{
+		{Ptype: "g", V0: policy.UserSubject(user.ID), V1: "role:ops"},
+		{Ptype: "p", V0: "role:ops", V1: "derp:default", V2: "connect"},
+		{Ptype: "p", V0: "role:ops", V1: "derp:ghost", V2: "admin"},
+	}
+	if err := a.DB.Create(&staleRules).Error; err != nil {
+		t.Fatalf("seed stale rules: %v", err)
+	}
+
+	// Create role:ops via admin API with no grants -> stale bindings & grants must be purged.
+	status, body := doAdminRequest(t, a.Router, http.MethodPost, "/admin/roles", testAdminKey, map[string]any{
+		"name":   "ops",
+		"relays": []string{},
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("POST /admin/roles status=%d want=201 body=%v", status, body)
+	}
+
+	// User must NOT silently be bound to ops, and ops must have no grants.
+	rolesByUser, err := policy.UserRoles(context.Background(), a.DB, []uuid.UUID{user.ID})
+	if err != nil {
+		t.Fatalf("UserRoles: %v", err)
+	}
+	if len(rolesByUser[user.ID]) != 0 {
+		t.Fatalf("stale user binding survived role creation: %v", rolesByUser[user.ID])
+	}
+	var remaining int64
+	if err := a.DB.Model(&model.CasbinRule{}).Where("(ptype = 'g' AND v1 = 'role:ops') OR (ptype = 'p' AND v0 = 'role:ops')").Count(&remaining).Error; err != nil {
+		t.Fatalf("count remaining ops rules: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("stale casbin_rule rows remaining=%d want=0", remaining)
+	}
+
+	if allow, reason := a.Service.Verify(context.Background(), "default", buildVerifyBody(t, nk)); allow || reason != service.DenyReasonPolicyDenied {
+		t.Fatalf("verify=(%v, %q) want=(false, %q)", allow, reason, service.DenyReasonPolicyDenied)
+	}
+
+	// Audit summary must record purgedStaleRules == 3.
+	var auditRow model.AdminAuditLog
+	if err := a.DB.Where("action = ? AND target_id = ?", "role.create", "ops").Order("id desc").First(&auditRow).Error; err != nil {
+		t.Fatalf("load role.create audit: %v", err)
+	}
+	var summary map[string]any
+	if err := json.Unmarshal([]byte(auditRow.Summary), &summary); err != nil {
+		t.Fatalf("unmarshal audit summary: %v", err)
+	}
+	if summary["purgedStaleRules"] != float64(3) {
+		t.Fatalf("audit summary purgedStaleRules=%v want=3 (summary=%v)", summary["purgedStaleRules"], summary)
+	}
+}
+
+func TestCreateRelayStartsCleanOfStaleRules(t *testing.T) {
+	a := dNewApp(t, adminKeyOpt)
+	user := createUser(t, a.DB, "stale-relay-user")
+	bindStandardRole(t, a.DB, user.ID)
+	nk := newNodeKey(t)
+	createDevice(t, a.DB, user.ID, nk, "laptop", nil)
+
+	// Insert stale grant rows naming derp:eu-1 before eu-1 exists in the relays registry.
+	staleRules := []model.CasbinRule{
+		{Ptype: "p", V0: "role:standard", V1: "derp:eu-1", V2: "connect"},
+		{Ptype: "p", V0: "role:ghost", V1: "derp:eu-1", V2: "connect"},
+	}
+	if err := a.DB.Create(&staleRules).Error; err != nil {
+		t.Fatalf("seed stale relay rules: %v", err)
+	}
+
+	status, body := doAdminRequest(t, a.Router, http.MethodPost, "/admin/relays", testAdminKey, map[string]any{
+		"name": "eu-1",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("POST /admin/relays status=%d want=201 body=%v", status, body)
+	}
+
+	var remaining int64
+	if err := a.DB.Model(&model.CasbinRule{}).Where("ptype = 'p' AND v1 = 'derp:eu-1'").Count(&remaining).Error; err != nil {
+		t.Fatalf("count remaining eu-1 rules: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("stale eu-1 casbin_rule rows remaining=%d want=0", remaining)
+	}
+
+	// Standard user must NOT silently gain access to eu-1 from the stale rule.
+	if allow, reason := a.Service.Verify(context.Background(), "eu-1", buildVerifyBody(t, nk)); allow || reason != service.DenyReasonPolicyDenied {
+		t.Fatalf("verify on eu-1=(%v, %q) want=(false, %q)", allow, reason, service.DenyReasonPolicyDenied)
+	}
+
+	// Audit summary must record purgedStaleRules == 2.
+	var auditRow model.AdminAuditLog
+	if err := a.DB.Where("action = ? AND target_id = ?", "relay.create", "eu-1").Order("id desc").First(&auditRow).Error; err != nil {
+		t.Fatalf("load relay.create audit: %v", err)
+	}
+	var summary map[string]any
+	if err := json.Unmarshal([]byte(auditRow.Summary), &summary); err != nil {
+		t.Fatalf("unmarshal audit summary: %v", err)
+	}
+	if summary["purgedStaleRules"] != float64(2) {
+		t.Fatalf("audit summary purgedStaleRules=%v want=2 (summary=%v)", summary["purgedStaleRules"], summary)
+	}
+}
+
+func TestAccessRoleDuplicateWildcardAccepted(t *testing.T) {
+	router, _ := newTestRouter(t, adminKeyOpt)
+
+	// POST /admin/roles with ["*", "*"] is deduplicated and accepted as ["*"].
+	status, body := doAdminRequest(t, router, http.MethodPost, "/admin/roles", testAdminKey, map[string]any{
+		"name":   "dup-wild-role",
+		"relays": []string{"*", "*"},
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("POST /admin/roles with [*, *] status=%d want=201 body=%v", status, body)
+	}
+	roleObj := body["role"].(map[string]any)
+	relays := roleObj["relays"].([]any)
+	if len(relays) != 1 || relays[0] != "*" {
+		t.Fatalf("created role relays=%v want=[*]", relays)
+	}
+
+	// PUT /admin/roles/:name/relays with ["*", "*"] is also accepted as ["*"].
+	status, body = doAdminRequest(t, router, http.MethodPut, "/admin/roles/standard/relays", testAdminKey, map[string]any{
+		"relays": []string{"*", "*"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("PUT /admin/roles/standard/relays with [*, *] status=%d want=200 body=%v", status, body)
+	}
+	putRelays := body["relays"].([]any)
+	if len(putRelays) != 1 || putRelays[0] != "*" {
+		t.Fatalf("updated role relays=%v want=[*]", putRelays)
+	}
+
+	// Mixing "*" with another entry (even when duplicated) is still 400.
+	if status, _ := doAdminRequest(t, router, http.MethodPut, "/admin/roles/standard/relays", testAdminKey, map[string]any{
+		"relays": []string{"*", "*", "default"},
+	}); status != http.StatusBadRequest {
+		t.Fatalf("PUT mixed [*, *, default] status=%d want=400", status)
 	}
 }

@@ -72,9 +72,25 @@ func SeedBuiltins(tx *gorm.DB) (created bool, err error) {
 	return created, nil
 }
 
+func lockShare(tx *gorm.DB) *gorm.DB {
+	if tx.Dialector.Name() == "postgres" {
+		return tx.Clauses(clause.Locking{Strength: "SHARE"})
+	}
+	return tx
+}
+
+func lockUpdate(tx *gorm.DB) *gorm.DB {
+	if tx.Dialector.Name() == "postgres" {
+		return tx.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	return tx
+}
+
 // SetUserRoles replaces a user's managed role bindings inside tx. Every role
 // in roles must match NamePattern and exist in the roles registry or
-// ErrUnknownRole is returned.
+// ErrUnknownRole is returned. On PostgreSQL each referenced role row is locked
+// FOR SHARE in sorted name order so concurrent role deletion cannot leave an
+// orphaned binding behind.
 func SetUserRoles(tx *gorm.DB, userID uuid.UUID, roles []string) error {
 	unique := dedupeSorted(roles)
 	for _, name := range unique {
@@ -82,21 +98,13 @@ func SetUserRoles(tx *gorm.DB, userID uuid.UUID, roles []string) error {
 			return fmt.Errorf("%w: %s", ErrUnknownRole, name)
 		}
 	}
-	if len(unique) > 0 {
-		var existing []string
-		if err := tx.Model(&model.Role{}).Where("name IN ?", unique).Pluck("name", &existing).Error; err != nil {
-			return fmt.Errorf("lookup roles: %w", err)
-		}
-		found := make(map[string]struct{}, len(existing))
-		for _, name := range existing {
-			if NamePattern.MatchString(name) {
-				found[name] = struct{}{}
-			}
-		}
-		for _, name := range unique {
-			if _, ok := found[name]; !ok {
+	for _, name := range unique {
+		var roleRow model.Role
+		if err := lockShare(tx).First(&roleRow, "name = ?", name).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return fmt.Errorf("%w: %s", ErrUnknownRole, name)
 			}
+			return fmt.Errorf("lookup role %s: %w", name, err)
 		}
 	}
 
@@ -183,31 +191,33 @@ func UserRoles(ctx context.Context, db *gorm.DB, ids []uuid.UUID) (map[uuid.UUID
 }
 
 // SetRoleGrants replaces a role's relay grants inside tx (AM2).
-// Passing []string{"*"} sets roles.all_relays = true and clears named grants.
-// Passing "*" alongside any other entry returns ErrInvalidGrant.
-// Otherwise roles.all_relays is set to false and named grants are replaced
-// after verifying every relay is registered.
+// Passing []string{"*"} (or duplicates of "*") sets roles.all_relays = true
+// and clears named grants. Passing "*" alongside any other entry returns
+// ErrInvalidGrant. Otherwise roles.all_relays is set to false and named grants
+// are replaced after locking and verifying every referenced relay in sorted
+// name order.
 func SetRoleGrants(tx *gorm.DB, role string, relays []string) error {
 	if !NamePattern.MatchString(role) {
 		return fmt.Errorf("%w: %s", ErrUnknownRole, role)
 	}
 	var roleRow model.Role
-	if err := tx.First(&roleRow, "name = ?", role).Error; err != nil {
+	if err := lockUpdate(tx).First(&roleRow, "name = ?", role).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return fmt.Errorf("%w: %s", ErrUnknownRole, role)
 		}
 		return fmt.Errorf("lookup role %s: %w", role, err)
 	}
 
+	unique := dedupeSorted(relays)
 	hasWildcard := false
-	for _, r := range relays {
+	for _, r := range unique {
 		if r == "*" {
 			hasWildcard = true
 			break
 		}
 	}
 	if hasWildcard {
-		if len(relays) > 1 {
+		if len(unique) > 1 {
 			return fmt.Errorf("%w: wildcard '*' must be the only relay entry", ErrInvalidGrant)
 		}
 		if err := tx.Model(&model.Role{}).Where("name = ?", role).Update("all_relays", true).Error; err != nil {
@@ -220,27 +230,18 @@ func SetRoleGrants(tx *gorm.DB, role string, relays []string) error {
 		return nil
 	}
 
-	unique := dedupeSorted(relays)
 	for _, name := range unique {
 		if !NamePattern.MatchString(name) {
 			return fmt.Errorf("%w: %s", ErrUnknownRelay, name)
 		}
 	}
-	if len(unique) > 0 {
-		var existing []string
-		if err := tx.Model(&model.Relay{}).Where("name IN ?", unique).Pluck("name", &existing).Error; err != nil {
-			return fmt.Errorf("lookup relays: %w", err)
-		}
-		found := make(map[string]struct{}, len(existing))
-		for _, name := range existing {
-			if NamePattern.MatchString(name) {
-				found[name] = struct{}{}
-			}
-		}
-		for _, name := range unique {
-			if _, ok := found[name]; !ok {
+	for _, name := range unique {
+		var relayRow model.Relay
+		if err := lockShare(tx).First(&relayRow, "name = ?", name).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return fmt.Errorf("%w: %s", ErrUnknownRelay, name)
 			}
+			return fmt.Errorf("lookup relay %s: %w", name, err)
 		}
 	}
 
@@ -351,11 +352,16 @@ func RoleGrants(ctx context.Context, db *gorm.DB, roles []string) (map[string][]
 	return result, nil
 }
 
-// DeleteRoleRules removes all grants of role and all user bindings to role,
-// returning the number of user bindings removed.
+// DeleteRoleRules locks the role row FOR UPDATE on PostgreSQL (when present)
+// and removes all grants of role and all user bindings to role, returning the
+// number of user bindings removed.
 func DeleteRoleRules(tx *gorm.DB, role string) (bindings int64, err error) {
 	if role == BuiltinRole {
 		return 0, ErrBuiltin
+	}
+	var roleRows []model.Role
+	if err := lockUpdate(tx).Where("name = ?", role).Limit(1).Find(&roleRows).Error; err != nil {
+		return 0, fmt.Errorf("lock role %s: %w", role, err)
 	}
 	sub := roleSubject(role)
 	if err := tx.Where("ptype = ? AND v0 = ?", "p", sub).Delete(&model.CasbinRule{}).Error; err != nil {
@@ -368,16 +374,47 @@ func DeleteRoleRules(tx *gorm.DB, role string) (bindings int64, err error) {
 	return res.RowsAffected, nil
 }
 
-// DeleteRelayGrants removes all managed connect grants naming relay.
+// DeleteRelayGrants locks the relay row FOR UPDATE on PostgreSQL (when present)
+// and removes all managed connect grants naming relay.
 func DeleteRelayGrants(tx *gorm.DB, relay string) error {
 	if relay == BuiltinRelay {
 		return ErrBuiltin
+	}
+	var relayRows []model.Relay
+	if err := lockUpdate(tx).Where("name = ?", relay).Limit(1).Find(&relayRows).Error; err != nil {
+		return fmt.Errorf("lock relay %s: %w", relay, err)
 	}
 	if err := tx.Where("ptype = ? AND v1 = ? AND v2 = ?", "p", relayObject(relay), connectAct).
 		Delete(&model.CasbinRule{}).Error; err != nil {
 		return fmt.Errorf("delete relay grants for %s: %w", relay, err)
 	}
 	return nil
+}
+
+// PurgeRoleRules removes every casbin_rule row naming role as a grouping target
+// (g, *, role:<name>) or policy subject (p, role:<name>, *, *), returning the
+// total number of rows deleted.
+func PurgeRoleRules(tx *gorm.DB, role string) (int64, error) {
+	sub := roleSubject(role)
+	resG := tx.Where("ptype = ? AND v1 = ?", "g", sub).Delete(&model.CasbinRule{})
+	if resG.Error != nil {
+		return 0, fmt.Errorf("purge stale role bindings for %s: %w", role, resG.Error)
+	}
+	resP := tx.Where("ptype = ? AND v0 = ?", "p", sub).Delete(&model.CasbinRule{})
+	if resP.Error != nil {
+		return 0, fmt.Errorf("purge stale role grants for %s: %w", role, resP.Error)
+	}
+	return resG.RowsAffected + resP.RowsAffected, nil
+}
+
+// PurgeRelayRules removes every casbin_rule row naming relay as a policy object
+// (p, *, derp:<name>, *), returning the number of rows deleted.
+func PurgeRelayRules(tx *gorm.DB, relay string) (int64, error) {
+	res := tx.Where("ptype = ? AND v1 = ?", "p", relayObject(relay)).Delete(&model.CasbinRule{})
+	if res.Error != nil {
+		return 0, fmt.Errorf("purge stale relay grants for %s: %w", relay, res.Error)
+	}
+	return res.RowsAffected, nil
 }
 
 // DeleteUserRules removes all role bindings for userID and all legacy

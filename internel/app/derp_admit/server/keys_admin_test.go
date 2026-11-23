@@ -46,7 +46,6 @@ func cBuildApp(t *testing.T, dbURL string, gormDB *gorm.DB, adminKey string, log
 		DatabaseURL:          dbURL,
 		TokenPepper:          "test-pepper",
 		AdminAPIKey:          adminKey,
-		EnableCasbin:         true,
 		MetricsEnabled:       true,
 		DBTimeout:            5 * time.Second,
 		PolicySyncInterval:   2 * time.Second,
@@ -419,7 +418,6 @@ func TestBootstrapConcurrentStartup(t *testing.T) {
 		DatabaseURL:          dbURL,
 		TokenPepper:          "test-pepper",
 		AdminAPIKey:          testAdminKey,
-		EnableCasbin:         true,
 		MetricsEnabled:       true,
 		DBTimeout:            5 * time.Second,
 		PolicySyncInterval:   2 * time.Second,
@@ -593,7 +591,16 @@ func TestAdminKeyNameConflict(t *testing.T) {
 func TestAdminKeyBootstrapNameReserved(t *testing.T) {
 	router, _ := newTestRouter(t, adminKeyOpt)
 
-	for _, name := range []string{"bootstrap", "  bootstrap  "} {
+	for _, name := range []string{
+		"bootstrap",
+		"  bootstrap  ",
+		"Bootstrap",
+		"BOOTSTRAP",
+		"system",
+		"  system  ",
+		"System",
+		"SYSTEM",
+	} {
 		status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/keys", testAdminKey, map[string]any{
 			"name": name,
 			"tier": "admin",
@@ -938,5 +945,175 @@ func TestAdminKeyAuditHasNoSecrets(t *testing.T) {
 	}
 	if !foundCreateSummary {
 		t.Fatalf("expected admin_key.create audit summary to contain key name and tier")
+	}
+}
+
+func assertBootstrapCollisionLogged(t *testing.T, logs *observer.ObservedLogs, wantName, wantTier, secret string) {
+	t.Helper()
+	errLogs := logs.FilterLevelExact(zapcore.ErrorLevel).All()
+	if len(errLogs) != 1 {
+		t.Fatalf("error log count=%d want=1 (logs=%v)", len(errLogs), errLogs)
+	}
+	entry := errLogs[0]
+	if !strings.Contains(entry.Message, "bootstrap") {
+		t.Fatalf("collision error message=%q should mention bootstrap", entry.Message)
+	}
+	fields := entry.ContextMap()
+	if fields["key_name"] != wantName || fields["key_tier"] != wantTier {
+		t.Fatalf("collision log fields=%v want key_name=%q key_tier=%q", fields, wantName, wantTier)
+	}
+	hash := hashToken(secret, "test-pepper")
+	for _, e := range logs.All() {
+		if strings.Contains(e.Message, secret) || strings.Contains(e.Message, hash) {
+			t.Fatalf("log message leaked secret or hash: %q", e.Message)
+		}
+		for _, v := range e.ContextMap() {
+			s := fmt.Sprint(v)
+			if strings.Contains(s, secret) || strings.Contains(s, hash) {
+				t.Fatalf("log field leaked secret or hash: %q", s)
+			}
+		}
+	}
+}
+
+func TestBootstrapCollidesWithExistingAdminKey(t *testing.T) {
+	dbURL, gormDB := cOpenTempDB(t, "bootstrap-collide-admin.db")
+	app1 := cBuildApp(t, dbURL, gormDB, testAdminKey, nil)
+	_, namedAdminPlain := cCreateKey(t, app1.Router, testAdminKey, "promoted-admin", model.AdminTierAdmin, nil)
+
+	var keysBefore []model.AdminKey
+	if err := gormDB.Order("id asc").Find(&keysBefore).Error; err != nil {
+		t.Fatalf("load keys before: %v", err)
+	}
+	var auditBefore int64
+	if err := gormDB.Model(&model.AdminAuditLog{}).Count(&auditBefore).Error; err != nil {
+		t.Fatalf("count audits before: %v", err)
+	}
+
+	// Restart with ADMIN_API_KEY equal to the existing named admin key's plaintext.
+	core, logs := observer.New(zapcore.WarnLevel)
+	app2 := cBuildApp(t, dbURL, gormDB, namedAdminPlain, zap.New(core))
+
+	assertBootstrapCollisionLogged(t, logs, "promoted-admin", model.AdminTierAdmin, namedAdminPlain)
+
+	var keysAfter []model.AdminKey
+	if err := gormDB.Order("id asc").Find(&keysAfter).Error; err != nil {
+		t.Fatalf("load keys after: %v", err)
+	}
+	if len(keysAfter) != len(keysBefore) {
+		t.Fatalf("key count changed: before=%d after=%d", len(keysBefore), len(keysAfter))
+	}
+	for i := range keysBefore {
+		if keysAfter[i].ID != keysBefore[i].ID || keysAfter[i].Name != keysBefore[i].Name ||
+			keysAfter[i].Tier != keysBefore[i].Tier || keysAfter[i].KeyHash != keysBefore[i].KeyHash {
+			t.Fatalf("key row %d changed: before=%+v after=%+v", i, keysBefore[i], keysAfter[i])
+		}
+	}
+
+	var auditAfter int64
+	if err := gormDB.Model(&model.AdminAuditLog{}).Count(&auditAfter).Error; err != nil {
+		t.Fatalf("count audits after: %v", err)
+	}
+	if auditAfter != auditBefore {
+		t.Fatalf("audit count changed on collision: before=%d after=%d", auditBefore, auditAfter)
+	}
+
+	// Configured value still authenticates as the existing admin key.
+	if status, _ := doAdminRequest(t, app2.Router, http.MethodGet, "/admin/keys", namedAdminPlain, nil); status != http.StatusOK {
+		t.Fatalf("promoted-admin GET /admin/keys status=%d want=%d", status, http.StatusOK)
+	}
+}
+
+func TestBootstrapCollidesWithExistingViewerKeyAndActiveBootstrap(t *testing.T) {
+	dbURL, gormDB := cOpenTempDB(t, "bootstrap-collide-viewer-active.db")
+	app1 := cBuildApp(t, dbURL, gormDB, testAdminKey, nil)
+	_, viewerPlain := cCreateKey(t, app1.Router, testAdminKey, "existing-viewer", model.AdminTierViewer, nil)
+
+	var bootBefore model.AdminKey
+	if err := gormDB.Where("name = ?", service.BootstrapKeyName).First(&bootBefore).Error; err != nil {
+		t.Fatalf("load bootstrap before: %v", err)
+	}
+	var auditBefore int64
+	if err := gormDB.Model(&model.AdminAuditLog{}).Count(&auditBefore).Error; err != nil {
+		t.Fatalf("count audits before: %v", err)
+	}
+
+	core, logs := observer.New(zapcore.WarnLevel)
+	app2 := cBuildApp(t, dbURL, gormDB, viewerPlain, zap.New(core))
+
+	assertBootstrapCollisionLogged(t, logs, "existing-viewer", model.AdminTierViewer, viewerPlain)
+
+	var bootAfter model.AdminKey
+	if err := gormDB.Where("name = ?", service.BootstrapKeyName).First(&bootAfter).Error; err != nil {
+		t.Fatalf("load bootstrap after: %v", err)
+	}
+	if bootAfter.KeyHash != bootBefore.KeyHash || bootAfter.RevokedAt != nil {
+		t.Fatalf("bootstrap row was unexpectedly modified: before=%+v after=%+v", bootBefore, bootAfter)
+	}
+
+	var auditAfter int64
+	if err := gormDB.Model(&model.AdminAuditLog{}).Count(&auditAfter).Error; err != nil {
+		t.Fatalf("count audits after: %v", err)
+	}
+	if auditAfter != auditBefore {
+		t.Fatalf("audit count changed on collision: before=%d after=%d", auditBefore, auditAfter)
+	}
+
+	// Configured value authenticates as viewer (200 on viewer route, 403 on admin route).
+	if status, _ := doAdminRequest(t, app2.Router, http.MethodGet, "/admin/users", viewerPlain, nil); status != http.StatusOK {
+		t.Fatalf("viewer key GET /admin/users status=%d want=%d", status, http.StatusOK)
+	}
+	if status, _ := doAdminRequest(t, app2.Router, http.MethodGet, "/admin/keys", viewerPlain, nil); status != http.StatusForbidden {
+		t.Fatalf("viewer key GET /admin/keys status=%d want=%d", status, http.StatusForbidden)
+	}
+	// Existing bootstrap key was untouched and still works.
+	if status, _ := doAdminRequest(t, app2.Router, http.MethodGet, "/admin/keys", testAdminKey, nil); status != http.StatusOK {
+		t.Fatalf("existing bootstrap key GET /admin/keys status=%d want=%d", status, http.StatusOK)
+	}
+}
+
+func TestBootstrapCollidesWithExistingViewerKeyAndNoBootstrap(t *testing.T) {
+	dbURL, gormDB := cOpenTempDB(t, "bootstrap-collide-viewer-noboot.db")
+	if err := db.ApplyMigrations(context.Background(), gormDB, dbURL); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	const viewerPlain = "dak_existing_viewer_plaintext_0123456789"
+	viewerRow := model.AdminKey{
+		ID:      uuid.New(),
+		Name:    "sole-viewer",
+		Tier:    model.AdminTierViewer,
+		KeyHash: hashToken(viewerPlain, "test-pepper"),
+	}
+	if err := gormDB.Create(&viewerRow).Error; err != nil {
+		t.Fatalf("seed viewer key: %v", err)
+	}
+
+	core, logs := observer.New(zapcore.WarnLevel)
+	app2 := cBuildApp(t, dbURL, gormDB, viewerPlain, zap.New(core))
+
+	assertBootstrapCollisionLogged(t, logs, "sole-viewer", model.AdminTierViewer, viewerPlain)
+
+	var bootCount int64
+	if err := gormDB.Model(&model.AdminKey{}).Where("name = ?", service.BootstrapKeyName).Count(&bootCount).Error; err != nil {
+		t.Fatalf("count bootstrap: %v", err)
+	}
+	if bootCount != 0 {
+		t.Fatalf("bootstrap row count=%d want=0", bootCount)
+	}
+	var auditCount int64
+	if err := gormDB.Model(&model.AdminAuditLog{}).Count(&auditCount).Error; err != nil {
+		t.Fatalf("count audits: %v", err)
+	}
+	if auditCount != 0 {
+		t.Fatalf("audit count=%d want=0", auditCount)
+	}
+
+	// Configured value authenticates as the viewer key it already is.
+	if status, _ := doAdminRequest(t, app2.Router, http.MethodGet, "/admin/users", viewerPlain, nil); status != http.StatusOK {
+		t.Fatalf("viewer key GET /admin/users status=%d want=%d", status, http.StatusOK)
+	}
+	if status, _ := doAdminRequest(t, app2.Router, http.MethodGet, "/admin/keys", viewerPlain, nil); status != http.StatusForbidden {
+		t.Fatalf("viewer key GET /admin/keys status=%d want=%d", status, http.StatusForbidden)
 	}
 }

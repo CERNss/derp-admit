@@ -41,8 +41,8 @@ func (s *Service) CreateAdminKey(ctx context.Context, in CreateAdminKeyInput) (C
 	if _, ok := actor.ParseTier(in.Tier); !ok {
 		return CreateAdminKeyResult{}, fmt.Errorf("%w: tier must be viewer, operator, or admin", ErrAdminInvalid)
 	}
-	if name == BootstrapKeyName {
-		return CreateAdminKeyResult{}, fmt.Errorf("%w: name %q is reserved", ErrAdminConflict, BootstrapKeyName)
+	if strings.EqualFold(name, BootstrapKeyName) || strings.EqualFold(name, actor.System.Name) {
+		return CreateAdminKeyResult{}, fmt.Errorf("%w: name %q is reserved", ErrAdminConflict, name)
 	}
 
 	var expiresAt *time.Time

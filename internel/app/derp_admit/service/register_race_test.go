@@ -29,7 +29,7 @@ func TestRegisterConcurrentSameUser(t *testing.T) {
 	if err := db.ApplyMigrations(context.Background(), gormDB, dbURL); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-	engine, err := policy.NewEngine(gormDB, false)
+	engine, err := policy.NewEngine(gormDB)
 	if err != nil {
 		t.Fatalf("new policy: %v", err)
 	}

@@ -45,7 +45,7 @@ func dNewAccessTestService(t *testing.T) (*Service, *gorm.DB) {
 	}); err != nil {
 		t.Fatalf("seed builtins: %v", err)
 	}
-	engine, err := policy.NewEngine(gormDB, true)
+	engine, err := policy.NewEngine(gormDB)
 	if err != nil {
 		t.Fatalf("new policy engine: %v", err)
 	}

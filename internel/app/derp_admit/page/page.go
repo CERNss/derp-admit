@@ -1,10 +1,13 @@
 package page
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -123,4 +126,27 @@ func cursorKeyValue(raw string, k KeyKind) (any, error) {
 		return v, nil
 	}
 	return raw, nil
+}
+
+// ListKey builds a stable cursor list identity binding base to the normalized
+// filter values. Empty values are ignored; when no filters are active it
+// returns base unchanged.
+func ListKey(base string, filters map[string]string) string {
+	keys := make([]string, 0, len(filters))
+	for k, v := range filters {
+		if v != "" {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return base
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		v := filters[k]
+		_, _ = fmt.Fprintf(h, "%d:%s=%d:%s;", len(k), k, len(v), v)
+	}
+	sum := h.Sum(nil)
+	return base + ":" + hex.EncodeToString(sum[:16])
 }

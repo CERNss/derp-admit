@@ -2,10 +2,12 @@ package server
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"derp-admit/internel/app/derp_admit/actor"
+	"derp-admit/internel/app/derp_admit/page"
 	"derp-admit/internel/app/derp_admit/service"
 
 	"github.com/gin-gonic/gin"
@@ -20,11 +22,11 @@ func auditRoutes() []adminRoute {
 			MinTier: actor.TierAdmin,
 			Handle: func(d adminDeps) gin.HandlerFunc {
 				return func(c *gin.Context) {
-					pg, ok := pageParams(c, "admin_audit")
+					filter, ok := parseAdminAuditFilter(c)
 					if !ok {
 						return
 					}
-					filter, ok := parseAdminAuditFilter(c)
+					pg, ok := pageParams(c, adminAuditListKey(filter))
 					if !ok {
 						return
 					}
@@ -47,11 +49,11 @@ func auditRoutes() []adminRoute {
 			MinTier: actor.TierViewer,
 			Handle: func(d adminDeps) gin.HandlerFunc {
 				return func(c *gin.Context) {
-					pg, ok := pageParams(c, "verify_audit")
+					filter, ok := parseVerifyAuditFilter(c)
 					if !ok {
 						return
 					}
-					filter, ok := parseVerifyAuditFilter(c)
+					pg, ok := pageParams(c, verifyAuditListKey(filter))
 					if !ok {
 						return
 					}
@@ -69,6 +71,44 @@ func auditRoutes() []adminRoute {
 			},
 		},
 	}
+}
+
+func adminAuditListKey(f service.AdminAuditFilter) string {
+	filters := map[string]string{
+		"action":     f.Action,
+		"targetType": f.TargetType,
+		"targetId":   f.TargetID,
+	}
+	if f.ActorKeyID != nil {
+		filters["actorKeyId"] = f.ActorKeyID.String()
+	}
+	if f.Since != nil {
+		filters["since"] = f.Since.UTC().Format(time.RFC3339Nano)
+	}
+	if f.Until != nil {
+		filters["until"] = f.Until.UTC().Format(time.RFC3339Nano)
+	}
+	return page.ListKey("admin_audit", filters)
+}
+
+func verifyAuditListKey(f service.VerifyAuditFilter) string {
+	filters := map[string]string{
+		"nodeKey": f.NodeKey,
+		"relay":   f.Relay,
+	}
+	if f.DeviceID != nil {
+		filters["deviceId"] = f.DeviceID.String()
+	}
+	if f.Allowed != nil {
+		filters["allowed"] = strconv.FormatBool(*f.Allowed)
+	}
+	if f.Since != nil {
+		filters["since"] = f.Since.UTC().Format(time.RFC3339Nano)
+	}
+	if f.Until != nil {
+		filters["until"] = f.Until.UTC().Format(time.RFC3339Nano)
+	}
+	return page.ListKey("verify_audit", filters)
 }
 
 func parseAdminAuditFilter(c *gin.Context) (service.AdminAuditFilter, bool) {

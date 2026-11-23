@@ -81,6 +81,7 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 		userManagedRoles := make(map[uuid.UUID]map[string]struct{})
 		userHasAnyGRule := make(map[uuid.UUID]bool)
 		roleGrantsDefault := make(map[string]bool)
+		roleGrantsAny := make(map[string]bool)
 		legacyDeviceRules := make(map[[2]string]struct{})
 		unmanagedCount := 0
 
@@ -114,6 +115,7 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 				if roleName, relayName, ok := parseManagedGrantRule(rule); ok {
 					importRoles[roleName] = struct{}{}
 					importRelays[relayName] = struct{}{}
+					roleGrantsAny[roleName] = true
 					if relayName == BuiltinRelay {
 						roleGrantsDefault[roleName] = true
 					}
@@ -166,6 +168,7 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 		}
 
 		_, hasDefaultRelay := knownRelays[BuiltinRelay]
+		hasAnyRelay := len(knownRelays) > 0
 		roleCoversDefault := func(roleName string) bool {
 			if !hasDefaultRelay {
 				return false
@@ -176,6 +179,16 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 			}
 			return r.AllRelays || roleGrantsDefault[roleName]
 		}
+		roleCoversAnyRelay := func(roleName string) bool {
+			r, exists := knownRoles[roleName]
+			if !exists {
+				return false
+			}
+			if r.AllRelays && hasAnyRelay {
+				return true
+			}
+			return roleGrantsAny[roleName]
+		}
 
 		devicesByUser := make(map[uuid.UUID][]model.Device, len(users))
 		for _, d := range devices {
@@ -185,15 +198,18 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 		now := time.Now().UTC()
 
 		for _, u := range users {
-			covered := false
+			coveredDefault := false
+			coveredAny := false
 			for roleName := range userManagedRoles[u.ID] {
 				if roleCoversDefault(roleName) {
-					covered = true
-					break
+					coveredDefault = true
+				}
+				if roleCoversAnyRelay(roleName) {
+					coveredAny = true
 				}
 			}
 
-			if !covered {
+			if !coveredDefault {
 				if casbinWasDisabled || len(devicesByUser[u.ID]) == 0 {
 					bound, err := bindUserToStandardWithoutDeleting(tx, u.ID, userManagedRoles[u.ID], userHasAnyGRule[u.ID], knownRoles)
 					if err != nil {
@@ -205,10 +221,9 @@ func RunUpgrade(ctx context.Context, db *gorm.DB, casbinWasDisabled bool, logger
 				} else {
 					uncoveredUserIDs = append(uncoveredUserIDs, u.ID.String())
 				}
-				continue
 			}
 
-			if casbinWasDisabled {
+			if casbinWasDisabled || !coveredAny {
 				continue
 			}
 

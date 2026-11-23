@@ -34,6 +34,16 @@ func eExtractInt64IDs(t *testing.T, body map[string]any) []int64 {
 func TestAdminAuditQueryFilters(t *testing.T) {
 	router, gormDB := newTestRouter(t, adminKeyOpt)
 
+	// Startup creates the bootstrap key and writes exactly one system audit row.
+	var startupRows []model.AdminAuditLog
+	if err := gormDB.Where("actor_key_id IS NULL AND actor_name = ?", actor.System.Name).Find(&startupRows).Error; err != nil {
+		t.Fatalf("query startup system audit: %v", err)
+	}
+	if len(startupRows) != 1 || startupRows[0].Action != "bootstrap.create" {
+		t.Fatalf("startup system audits=%+v want 1 bootstrap.create row", startupRows)
+	}
+	startupRow := startupRows[0]
+
 	actor1 := uuid.New()
 	actor2 := uuid.New()
 	status200 := http.StatusOK
@@ -105,21 +115,57 @@ func TestAdminAuditQueryFilters(t *testing.T) {
 		}
 	}
 
-	// Verify entry JSON shape on unfiltered query (newest first).
+	// Verify entry JSON shape on unfiltered query (newest first), accounting for the startup bootstrap row.
+	allRows := append([]model.AdminAuditLog{startupRow}, seed...)
+	sort.Slice(allRows, func(i, j int) bool {
+		if !allRows[i].TS.Equal(allRows[j].TS) {
+			return allRows[i].TS.After(allRows[j].TS)
+		}
+		return allRows[i].ID > allRows[j].ID
+	})
+	wantUnfiltered := make([]int64, len(allRows))
+	for i, r := range allRows {
+		wantUnfiltered[i] = r.ID
+	}
+
 	status, body := doAdminRequest(t, router, http.MethodGet, "/admin/audit/admin", testAdminKey, nil)
 	if status != http.StatusOK {
 		t.Fatalf("unfiltered status=%d want=%d", status, http.StatusOK)
 	}
-	if got := eExtractInt64IDs(t, body); !reflect.DeepEqual(got, []int64{seed[3].ID, seed[2].ID, seed[1].ID, seed[0].ID}) {
-		t.Fatalf("unfiltered order=%v want=[%d %d %d %d]", got, seed[3].ID, seed[2].ID, seed[1].ID, seed[0].ID)
+	if got := eExtractInt64IDs(t, body); !reflect.DeepEqual(got, wantUnfiltered) {
+		t.Fatalf("unfiltered order=%v want=%v", got, wantUnfiltered)
 	}
-	first := body["entries"].([]any)[0].(map[string]any)
-	if first["actorName"] != "system" || first["actorKeyId"] != nil || first["httpStatus"] != nil {
-		t.Fatalf("unexpected system entry shape: %+v", first)
+	var seededSystemEntry map[string]any
+	for _, raw := range body["entries"].([]any) {
+		m := raw.(map[string]any)
+		if int64(m["id"].(float64)) == seed[3].ID {
+			seededSystemEntry = m
+			break
+		}
 	}
-	summaryObj, ok := first["summary"].(map[string]any)
+	if seededSystemEntry == nil {
+		t.Fatalf("seeded system entry id=%d not found in unfiltered response", seed[3].ID)
+	}
+	if seededSystemEntry["actorName"] != "system" || seededSystemEntry["actorKeyId"] != nil || seededSystemEntry["httpStatus"] != nil {
+		t.Fatalf("unexpected system entry shape: %+v", seededSystemEntry)
+	}
+	summaryObj, ok := seededSystemEntry["summary"].(map[string]any)
 	if !ok || summaryObj["reason"] != "upgrade" {
-		t.Fatalf("expected parsed JSON summary object, got %#v", first["summary"])
+		t.Fatalf("expected parsed JSON summary object, got %#v", seededSystemEntry["summary"])
+	}
+
+	filterRangeIDs := func(since, until *time.Time) []int64 {
+		var out []int64
+		for _, r := range allRows {
+			if since != nil && r.TS.Before(*since) {
+				continue
+			}
+			if until != nil && r.TS.After(*until) {
+				continue
+			}
+			out = append(out, r.ID)
+		}
+		return out
 	}
 
 	// Individual filters and combined AND filters.
@@ -132,12 +178,12 @@ func TestAdminAuditQueryFilters(t *testing.T) {
 		{"action", "action=user.create", []int64{seed[0].ID}},
 		{"targetType", "targetType=device", []int64{seed[3].ID, seed[2].ID, seed[1].ID}},
 		{"targetId", "targetId=d-1", []int64{seed[3].ID, seed[1].ID}},
-		{"since", "since=" + url.QueryEscape(t3.Format(time.RFC3339)), []int64{seed[3].ID, seed[2].ID}},
-		{"until", "until=" + url.QueryEscape(t2.Format(time.RFC3339)), []int64{seed[1].ID, seed[0].ID}},
+		{"since", "since=" + url.QueryEscape(t3.Format(time.RFC3339)), filterRangeIDs(&t3, nil)},
+		{"until", "until=" + url.QueryEscape(t2.Format(time.RFC3339)), filterRangeIDs(nil, &t2)},
 		{
 			"since_and_until_with_tz_offset",
 			"since=" + url.QueryEscape("2026-11-20T19:00:00+08:00") + "&until=" + url.QueryEscape("2026-11-20T20:00:00+08:00"),
-			[]int64{seed[2].ID, seed[1].ID},
+			filterRangeIDs(&t2, &t3),
 		},
 		{
 			"combined_and",
@@ -300,8 +346,18 @@ func TestAuditQueriesPaginateNewestFirst(t *testing.T) {
 		id int64
 		ts time.Time
 	}
-	adminMetas := make([]auditMeta, 0, total)
+	adminMetas := make([]auditMeta, 0, total+1)
 	verifyMetas := make([]auditMeta, 0, total)
+
+	// Account for the single startup system audit row created for bootstrap.
+	var startupRows []model.AdminAuditLog
+	if err := gormDB.Where("actor_key_id IS NULL AND actor_name = ?", actor.System.Name).Find(&startupRows).Error; err != nil {
+		t.Fatalf("query startup system audit: %v", err)
+	}
+	if len(startupRows) != 1 || startupRows[0].Action != "bootstrap.create" {
+		t.Fatalf("startup system audits=%+v want 1 bootstrap.create row", startupRows)
+	}
+	adminMetas = append(adminMetas, auditMeta{id: startupRows[0].ID, ts: startupRows[0].TS})
 
 	statusOK := http.StatusOK
 	relay := "default"
@@ -466,12 +522,135 @@ func TestAuditQueryTiers(t *testing.T) {
 		t.Fatalf("admin GET /admin/audit/verify status=%d want=%d", status, http.StatusOK)
 	}
 
-	// GET requests (even 403 GETs) must never write admin audit rows.
+	// GET requests (even 403 GETs) must never write admin audit rows; only the
+	// startup bootstrap creation system row should exist.
+	var sysCount int64
+	if err := gormDB.Model(&model.AdminAuditLog{}).Where("actor_key_id IS NULL AND actor_name = ?", actor.System.Name).Count(&sysCount).Error; err != nil {
+		t.Fatalf("count startup system audit rows: %v", err)
+	}
+	if sysCount != 1 {
+		t.Fatalf("startup system audit count=%d want=1", sysCount)
+	}
 	var auditCount int64
-	if err := gormDB.Model(&model.AdminAuditLog{}).Count(&auditCount).Error; err != nil {
+	if err := gormDB.Model(&model.AdminAuditLog{}).Where("NOT (actor_key_id IS NULL AND actor_name = ?)", actor.System.Name).Count(&auditCount).Error; err != nil {
 		t.Fatalf("count admin audit rows: %v", err)
 	}
 	if auditCount != 0 {
 		t.Fatalf("admin audit count=%d want=0 after GET requests", auditCount)
+	}
+}
+
+func TestCursorRejectedUnderDifferentFilters(t *testing.T) {
+	router, gormDB := newTestRouter(t, adminKeyOpt)
+
+	// 1. GET /admin/devices?userId=A cursor rejected for userId=B and for unfiltered.
+	uA := createUser(t, gormDB, "cursor-filter-a")
+	uB := createUser(t, gormDB, "cursor-filter-b")
+	for i := 0; i < 3; i++ {
+		createDevice(t, gormDB, uA.ID, newNodeKey(t), fmt.Sprintf("a-%d", i), nil)
+		createDevice(t, gormDB, uB.ID, newNodeKey(t), fmt.Sprintf("b-%d", i), nil)
+	}
+
+	status, body := doAdminRequest(t, router, http.MethodGet, "/admin/devices?limit=1&userId="+uA.ID.String(), testAdminKey, nil)
+	if status != http.StatusOK {
+		t.Fatalf("GET /admin/devices?userId=A status=%d want=200", status)
+	}
+	devCurA, ok := body["nextCursor"].(string)
+	if !ok || devCurA == "" {
+		t.Fatalf("expected non-empty nextCursor for userId=A, got %#v", body["nextCursor"])
+	}
+
+	// Same filter works.
+	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/devices?limit=1&userId="+uA.ID.String()+"&cursor="+url.QueryEscape(devCurA), testAdminKey, nil); status != http.StatusOK {
+		t.Fatalf("same userId cursor status=%d want=200", status)
+	}
+	// Different userId rejected with 400.
+	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/devices?limit=1&userId="+uB.ID.String()+"&cursor="+url.QueryEscape(devCurA), testAdminKey, nil); status != http.StatusBadRequest {
+		t.Fatalf("different userId cursor status=%d want=400", status)
+	}
+	// Unfiltered rejected with 400.
+	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/devices?limit=1&cursor="+url.QueryEscape(devCurA), testAdminKey, nil); status != http.StatusBadRequest {
+		t.Fatalf("filtered cursor on unfiltered /admin/devices status=%d want=400", status)
+	}
+	// Unfiltered cursor rejected when userId is added.
+	status, body = doAdminRequest(t, router, http.MethodGet, "/admin/devices?limit=1", testAdminKey, nil)
+	if status != http.StatusOK {
+		t.Fatalf("unfiltered /admin/devices status=%d want=200", status)
+	}
+	devCurAll := body["nextCursor"].(string)
+	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/devices?limit=1&userId="+uA.ID.String()+"&cursor="+url.QueryEscape(devCurAll), testAdminKey, nil); status != http.StatusBadRequest {
+		t.Fatalf("unfiltered cursor on filtered /admin/devices status=%d want=400", status)
+	}
+
+	// 2. GET /admin/audit/admin cursor bound to filters.
+	base := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	statusOK := http.StatusOK
+	for i := 0; i < 3; i++ {
+		if err := gormDB.Create(&model.AdminAuditLog{
+			TS:         base.Add(time.Duration(i) * time.Minute),
+			ActorName:  "op",
+			ActorTier:  model.AdminTierOperator,
+			Action:     "user.create",
+			TargetType: "user",
+			TargetID:   fmt.Sprintf("u-%d", i),
+			Outcome:    service.AuditOutcomeSuccess,
+			HTTPStatus: &statusOK,
+			Summary:    "{}",
+		}).Error; err != nil {
+			t.Fatalf("seed admin audit: %v", err)
+		}
+	}
+
+	status, body = doAdminRequest(t, router, http.MethodGet, "/admin/audit/admin?limit=1&action=user.create", testAdminKey, nil)
+	if status != http.StatusOK {
+		t.Fatalf("GET /admin/audit/admin?action=user.create status=%d want=200", status)
+	}
+	adminCur := body["nextCursor"].(string)
+	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/audit/admin?limit=1&action=user.create&cursor="+url.QueryEscape(adminCur), testAdminKey, nil); status != http.StatusOK {
+		t.Fatalf("same admin audit filter status=%d want=200", status)
+	}
+	for _, mismatched := range []string{
+		"/admin/audit/admin?limit=1&action=device.revoke&cursor=" + url.QueryEscape(adminCur),
+		"/admin/audit/admin?limit=1&cursor=" + url.QueryEscape(adminCur),
+		"/admin/audit/admin?limit=1&action=user.create&targetType=user&cursor=" + url.QueryEscape(adminCur),
+	} {
+		if status, _ := doAdminRequest(t, router, http.MethodGet, mismatched, testAdminKey, nil); status != http.StatusBadRequest {
+			t.Fatalf("mismatched admin audit filter %s status=%d want=400", mismatched, status)
+		}
+	}
+
+	// 3. GET /admin/audit/verify cursor bound to filters (and normalizes equivalent timestamps).
+	relayDefault := "default"
+	for i := 0; i < 3; i++ {
+		if err := gormDB.Create(&model.AuditLog{
+			NodeKey: fmt.Sprintf("nodekey:%064d", i),
+			Relay:   &relayDefault,
+			Allowed: true,
+			TS:      base.Add(time.Duration(i) * time.Minute),
+		}).Error; err != nil {
+			t.Fatalf("seed verify audit: %v", err)
+		}
+	}
+
+	sinceUTC := base.Format(time.RFC3339)
+	sincePlus8 := base.In(time.FixedZone("+08", 8*3600)).Format(time.RFC3339)
+	status, body = doAdminRequest(t, router, http.MethodGet, "/admin/audit/verify?limit=1&relay=default&allowed=true&since="+url.QueryEscape(sinceUTC), testAdminKey, nil)
+	if status != http.StatusOK {
+		t.Fatalf("GET /admin/audit/verify filtered status=%d want=200", status)
+	}
+	verifyCur := body["nextCursor"].(string)
+	// Equivalent timestamp in a different timezone offset normalizes to the same fingerprint -> 200.
+	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/audit/verify?limit=1&relay=default&allowed=true&since="+url.QueryEscape(sincePlus8)+"&cursor="+url.QueryEscape(verifyCur), testAdminKey, nil); status != http.StatusOK {
+		t.Fatalf("equivalent timezone verify audit filter status=%d want=200", status)
+	}
+	for _, mismatched := range []string{
+		"/admin/audit/verify?limit=1&relay=eu-1&allowed=true&since=" + url.QueryEscape(sinceUTC) + "&cursor=" + url.QueryEscape(verifyCur),
+		"/admin/audit/verify?limit=1&relay=default&allowed=false&since=" + url.QueryEscape(sinceUTC) + "&cursor=" + url.QueryEscape(verifyCur),
+		"/admin/audit/verify?limit=1&relay=default&cursor=" + url.QueryEscape(verifyCur),
+		"/admin/audit/verify?limit=1&cursor=" + url.QueryEscape(verifyCur),
+	} {
+		if status, _ := doAdminRequest(t, router, http.MethodGet, mismatched, testAdminKey, nil); status != http.StatusBadRequest {
+			t.Fatalf("mismatched verify audit filter %s status=%d want=400", mismatched, status)
+		}
 	}
 }

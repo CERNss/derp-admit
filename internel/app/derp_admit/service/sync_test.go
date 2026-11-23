@@ -349,3 +349,102 @@ func TestSyncDoesNotReloadWhenVersionUnchanged(t *testing.T) {
 			hitsBefore, rec.cacheHits, missesBefore, rec.cacheMisses)
 	}
 }
+
+type bMonoFakeClock struct {
+	mu      sync.Mutex
+	wall    time.Time
+	elapsed time.Duration
+	stamps  map[int64]time.Duration
+}
+
+func bNewMonoFakeClock(start time.Time) *bMonoFakeClock {
+	return &bMonoFakeClock{
+		wall:   start.UTC(),
+		stamps: make(map[int64]time.Duration),
+	}
+}
+
+func (c *bMonoFakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := c.wall
+	c.stamps[t.UnixNano()] = c.elapsed
+	return t
+}
+
+func (c *bMonoFakeClock) Since(t time.Time) time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.stamps[t.UnixNano()]
+	if !ok {
+		return c.wall.Sub(t)
+	}
+	return c.elapsed - e
+}
+
+func (c *bMonoFakeClock) Sub(a, b time.Time) time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ea, okA := c.stamps[a.UnixNano()]
+	eb, okB := c.stamps[b.UnixNano()]
+	if okA && okB {
+		return ea - eb
+	}
+	return a.Sub(b)
+}
+
+func (c *bMonoFakeClock) StepWallAndElapsed(wallDelta, elapsedDelta time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.wall = c.wall.Add(wallDelta)
+	c.elapsed += elapsedDelta
+}
+
+func TestSyncStaleUsesElapsedTimeNotWallClock(t *testing.T) {
+	interval := 2 * time.Second
+	svc, _, gormDB := bSetupService(t, time.Minute, interval)
+
+	clock := bNewMonoFakeClock(time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC))
+	svc.sync.setMonoClock(clock.Now, clock.Since, clock.Sub)
+
+	_, _, body := bSeedAllowedDevice(t, svc, gormDB, "mono-clock-user")
+
+	if err := svc.syncOnce(context.Background()); err != nil {
+		t.Fatalf("initial syncOnce: %v", err)
+	}
+	if svc.SyncStale() {
+		t.Fatalf("expected fresh instance immediately after initial sync")
+	}
+
+	// Simulate version reads failing while the wall clock steps BACKWARD by 1 hour
+	// and monotonic elapsed time advances past 3 * interval.
+	svc.sync.setVersionReader(func(context.Context) (int64, error) {
+		return 0, errors.New("db unreachable")
+	})
+	clock.StepWallAndElapsed(-time.Hour, 3*interval+time.Millisecond)
+	if err := svc.syncOnce(context.Background()); err == nil {
+		t.Fatalf("expected syncOnce error while version reader fails")
+	}
+
+	// Wall clock moved backward, but elapsed time exceeded 3*interval -> MUST be stale.
+	if !svc.SyncStale() {
+		t.Fatalf("SyncStale()=false want=true when elapsed > 3*interval despite backward wall clock")
+	}
+	if allow, reason := svc.Verify(context.Background(), policy.BuiltinRelay, body); allow || reason != DenyReasonInternal {
+		t.Fatalf("stale verify=(%v, %q) want=(false, %q)", allow, reason, DenyReasonInternal)
+	}
+
+	// While wall clock is STILL behind the initial timestamp, restore version reads.
+	// recordSuccess MUST accept the monotonically newer timestamp so the instance recovers.
+	svc.sync.setVersionReader(nil)
+	clock.StepWallAndElapsed(interval, interval)
+	if err := svc.syncOnce(context.Background()); err != nil {
+		t.Fatalf("recovery syncOnce: %v", err)
+	}
+	if svc.SyncStale() {
+		t.Fatalf("SyncStale()=true want=false after successful sync while wall clock is still behind initial time")
+	}
+	if allow, reason := svc.Verify(context.Background(), policy.BuiltinRelay, body); !allow || reason != "" {
+		t.Fatalf("recovered verify=(%v, %q) want allow", allow, reason)
+	}
+}

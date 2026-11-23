@@ -207,6 +207,55 @@ func TestLoadFromEnv_EnableCasbinIgnored(t *testing.T) {
 			t.Fatalf("Warnings=%v want 1 deduplicated warning", cfg.Warnings)
 		}
 	})
+
+	for _, val := range []string{"0", "f", "F", "false", "FALSE", "False"} {
+		t.Run("env_false_spelling_"+val, func(t *testing.T) {
+			aBaseEnv(t, "", "")
+			t.Setenv("ENABLE_CASBIN", val)
+			cfg, err := LoadFromEnv()
+			if err != nil {
+				t.Fatalf("LoadFromEnv: %v", err)
+			}
+			if !cfg.LegacyCasbinDisabled {
+				t.Fatalf("ENABLE_CASBIN=%q: LegacyCasbinDisabled=false want=true", val)
+			}
+			if len(cfg.Warnings) != 1 {
+				t.Fatalf("ENABLE_CASBIN=%q: Warnings=%v want 1 warning", val, cfg.Warnings)
+			}
+		})
+	}
+
+	for _, val := range []string{"false", "False", "FALSE", "off", "Off", "OFF", "no", "No", "NO", "n", "N"} {
+		t.Run("yaml_false_spelling_"+val, func(t *testing.T) {
+			aBaseEnv(t, "enable_casbin: "+val+"\n", "")
+			cfg, err := LoadFromEnv()
+			if err != nil {
+				t.Fatalf("LoadFromEnv: %v", err)
+			}
+			if !cfg.LegacyCasbinDisabled {
+				t.Fatalf("enable_casbin: %s: LegacyCasbinDisabled=false want=true", val)
+			}
+			if len(cfg.Warnings) != 1 {
+				t.Fatalf("enable_casbin: %s: Warnings=%v want 1 warning", val, cfg.Warnings)
+			}
+		})
+	}
+
+	for _, val := range []string{"true", "True", "TRUE", "on", "On", "ON", "yes", "Yes", "YES", "y", "Y"} {
+		t.Run("yaml_true_spelling_"+val, func(t *testing.T) {
+			aBaseEnv(t, "enable_casbin: "+val+"\n", "")
+			cfg, err := LoadFromEnv()
+			if err != nil {
+				t.Fatalf("LoadFromEnv: %v", err)
+			}
+			if cfg.LegacyCasbinDisabled {
+				t.Fatalf("enable_casbin: %s: LegacyCasbinDisabled=true want=false", val)
+			}
+			if len(cfg.Warnings) != 1 {
+				t.Fatalf("enable_casbin: %s: Warnings=%v want 1 warning", val, cfg.Warnings)
+			}
+		})
+	}
 }
 
 func TestLoadFromEnv_RequiresDatabaseURLAndTokenPepper(t *testing.T) {
@@ -266,7 +315,19 @@ func TestLoadFromEnv_PolicySyncInterval(t *testing.T) {
 		}
 	})
 
-	for _, bad := range []string{"0s", "-1s", "soon"} {
+	t.Run("floor_100ms_accepted", func(t *testing.T) {
+		baseEnv(t)
+		t.Setenv("POLICY_SYNC_INTERVAL", "100ms")
+		cfg, err := LoadFromEnv()
+		if err != nil {
+			t.Fatalf("LoadFromEnv(100ms): %v", err)
+		}
+		if cfg.PolicySyncInterval.String() != "100ms" {
+			t.Fatalf("PolicySyncInterval=%s want=100ms", cfg.PolicySyncInterval)
+		}
+	})
+
+	for _, bad := range []string{"0s", "-1s", "1ms", "50ms", "99ms", "soon"} {
 		t.Run("invalid_"+bad, func(t *testing.T) {
 			baseEnv(t)
 			t.Setenv("POLICY_SYNC_INTERVAL", bad)

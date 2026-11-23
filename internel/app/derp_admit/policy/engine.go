@@ -68,9 +68,8 @@ type Engine struct {
 }
 
 // NewEngine builds an always-enforcing Casbin policy engine backed by db and
-// loads the initial snapshot. The second parameter is retained for signature
-// compatibility until Track A removes ENABLE_CASBIN and is ignored.
-func NewEngine(db *gorm.DB, _ bool) (*Engine, error) {
+// loads the initial snapshot.
+func NewEngine(db *gorm.DB) (*Engine, error) {
 	e := &Engine{db: db}
 	if err := e.Reload(context.Background()); err != nil {
 		return nil, err

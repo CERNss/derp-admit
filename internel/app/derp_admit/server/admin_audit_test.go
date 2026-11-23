@@ -326,7 +326,7 @@ func (c *controlledPolicyEngine) Reload(ctx context.Context) error {
 	case 1:
 		// Mutation B's reload reads the DB now (capturing vB), signals bReadDone,
 		// and pauses before publishing until releaseB is closed.
-		snapB, err := policy.NewEngine(c.db, true)
+		snapB, err := policy.NewEngine(c.db)
 		if err != nil {
 			return err
 		}
@@ -337,7 +337,7 @@ func (c *controlledPolicyEngine) Reload(ctx context.Context) error {
 	case 2:
 		return errors.New("forced A reload failure")
 	default:
-		snap, err := policy.NewEngine(c.db, true)
+		snap, err := policy.NewEngine(c.db)
 		if err != nil {
 			return err
 		}
@@ -362,7 +362,7 @@ func TestStaleNotClearedByOlderReload(t *testing.T) {
 		t.Fatalf("seed builtins: %v", err)
 	}
 
-	initialEngine, err := policy.NewEngine(gormDB, true)
+	initialEngine, err := policy.NewEngine(gormDB)
 	if err != nil {
 		t.Fatalf("new initial policy engine: %v", err)
 	}
@@ -393,7 +393,6 @@ func TestStaleNotClearedByOlderReload(t *testing.T) {
 		cfg.DBTimeout,
 		service.NewVerifyCache(cfg.VerifyCacheTTL),
 		logger,
-		service.WithAdminAPIKey(testAdminKey),
 	)
 	if err := gormDB.Create(&model.AdminKey{
 		Name:    "test-admin",
@@ -492,7 +491,7 @@ func TestMutateReloadFailureFailsClosed(t *testing.T) {
 		t.Fatalf("seed builtins: %v", err)
 	}
 
-	realEngine, err := policy.NewEngine(gormDB, true)
+	realEngine, err := policy.NewEngine(gormDB)
 	if err != nil {
 		t.Fatalf("new policy engine: %v", err)
 	}
@@ -518,7 +517,6 @@ func TestMutateReloadFailureFailsClosed(t *testing.T) {
 		cfg.DBTimeout,
 		service.NewVerifyCache(cfg.VerifyCacheTTL),
 		logger,
-		service.WithAdminAPIKey(testAdminKey),
 	)
 	if err := gormDB.Create(&model.AdminKey{
 		Name:    "test-admin",

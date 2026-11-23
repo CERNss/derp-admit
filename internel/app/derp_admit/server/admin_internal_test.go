@@ -100,14 +100,14 @@ func TestAdminAuditRecordsPanic(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed builtins: %v", err)
 	}
-	engine, err := policy.NewEngine(gormDB, true)
+	engine, err := policy.NewEngine(gormDB)
 	if err != nil {
 		t.Fatalf("new policy engine: %v", err)
 	}
 
 	const adminKey = "panic-test-admin-key-0123456789"
 	logger := zap.NewNop()
-	svc := service.New(gormDB, engine, "test-pepper", 2*time.Second, service.NewVerifyCache(0), logger, service.WithAdminAPIKey(adminKey))
+	svc := service.New(gormDB, engine, "test-pepper", 2*time.Second, service.NewVerifyCache(0), logger)
 	sum := sha256.Sum256([]byte(adminKey + ":test-pepper"))
 	if err := gormDB.Create(&model.AdminKey{
 		Name:    "panic-test-admin",

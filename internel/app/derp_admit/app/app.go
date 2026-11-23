@@ -50,6 +50,13 @@ func (a *App) Close() {
 // startup.WithLock(migrate -> policy.SeedBuiltins -> policy.RunUpgrade ->
 // svc.SyncBootstrapKey) -> engine.Reload -> svc.StartSync -> router.
 func Build(ctx context.Context, gormDB *gorm.DB, cfg config.Config, logger *zap.Logger, opts ...Option) (*App, error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	for _, w := range cfg.Warnings {
+		logger.Warn(w)
+	}
+
 	var defaultMetrics metrics.Recorder = metrics.Nop
 	if cfg.MetricsEnabled {
 		defaultMetrics = metrics.NewPrometheus()
@@ -82,7 +89,7 @@ func Build(ctx context.Context, gormDB *gorm.DB, cfg config.Config, logger *zap.
 		}
 
 		var err error
-		policyEngine, err = policy.NewEngine(gormDB, true)
+		policyEngine, err = policy.NewEngine(gormDB)
 		if err != nil {
 			return fmt.Errorf("init policy: %w", err)
 		}
@@ -94,7 +101,6 @@ func Build(ctx context.Context, gormDB *gorm.DB, cfg config.Config, logger *zap.
 			cfg.DBTimeout,
 			verifyCache,
 			logger,
-			service.WithAdminAPIKey(cfg.AdminAPIKey),
 			service.WithMetrics(bo.metrics),
 			service.WithPolicySyncInterval(cfg.PolicySyncInterval),
 		)

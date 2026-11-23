@@ -3,12 +3,16 @@ package startup_test
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +21,7 @@ import (
 	"derp-admit/internel/app/derp_admit/db"
 	"derp-admit/internel/app/derp_admit/startup"
 
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -293,5 +298,116 @@ func TestWithLockPostgresAdvisoryLock(t *testing.T) {
 	defer cancelNext()
 	if err := startup.WithLock(nextCtx, conn2, func() error { return nil }); err != nil {
 		t.Fatalf("re-acquire postgres advisory lock after cancel+error failed: %v", err)
+	}
+}
+
+type fakePGConnector struct {
+	failUnlock atomic.Bool
+	opened     atomic.Int64
+	closed     atomic.Int64
+}
+
+func (c *fakePGConnector) Connect(context.Context) (driver.Conn, error) {
+	c.opened.Add(1)
+	return &fakePGConn{parent: c}, nil
+}
+
+func (c *fakePGConnector) Driver() driver.Driver { return fakePGDriver{} }
+
+type fakePGDriver struct{}
+
+func (fakePGDriver) Open(string) (driver.Conn, error) { return nil, errors.New("unused") }
+
+type fakePGConn struct {
+	parent *fakePGConnector
+	closed atomic.Bool
+}
+
+func (c *fakePGConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("unused") }
+func (c *fakePGConn) Begin() (driver.Tx, error)           { return nil, errors.New("unused") }
+func (c *fakePGConn) Close() error {
+	if c.closed.CompareAndSwap(false, true) {
+		c.parent.closed.Add(1)
+	}
+	return nil
+}
+
+func (c *fakePGConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	if strings.Contains(query, "pg_advisory_lock") {
+		return driver.RowsAffected(0), nil
+	}
+	if strings.Contains(query, "pg_advisory_unlock") {
+		if c.parent.failUnlock.Load() {
+			return nil, errors.New("simulated unlock failure")
+		}
+		return driver.RowsAffected(0), nil
+	}
+	return driver.RowsAffected(0), nil
+}
+
+func (c *fakePGConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	if strings.Contains(query, "pg_advisory_unlock") {
+		if c.parent.failUnlock.Load() {
+			return nil, errors.New("simulated unlock failure")
+		}
+		return &fakeBoolRows{val: true}, nil
+	}
+	return &fakeBoolRows{val: true}, nil
+}
+
+type fakeBoolRows struct {
+	val  bool
+	done bool
+}
+
+func (r *fakeBoolRows) Columns() []string { return []string{"pg_advisory_unlock"} }
+func (r *fakeBoolRows) Close() error      { return nil }
+func (r *fakeBoolRows) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	r.done = true
+	dest[0] = r.val
+	return nil
+}
+
+func TestWithLockPostgresDiscardsConnOnUnlockFailure(t *testing.T) {
+	connector := &fakePGConnector{}
+	sqlDB := sql.OpenDB(connector)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	gormDB, err := gorm.Open(postgres.New(postgres.Config{
+		Conn:                 sqlDB,
+		PreferSimpleProtocol: true,
+	}), &gorm.Config{SkipDefaultTransaction: true})
+	if err != nil {
+		t.Fatalf("open gorm with fake postgres conn: %v", err)
+	}
+
+	// Normal unlock succeeds: connection is returned to the pool (not closed).
+	if err := startup.WithLock(context.Background(), gormDB, func() error { return nil }); err != nil {
+		t.Fatalf("WithLock healthy unlock: %v", err)
+	}
+	if gotOpened, gotClosed := connector.opened.Load(), connector.closed.Load(); gotOpened != 1 || gotClosed != 0 {
+		t.Fatalf("healthy unlock: opened=%d closed=%d want opened=1 closed=0", gotOpened, gotClosed)
+	}
+
+	// Failed unlock: error is returned and the connection is discarded (closed)
+	// rather than returned to the pool still holding the session advisory lock.
+	connector.failUnlock.Store(true)
+	if err := startup.WithLock(context.Background(), gormDB, func() error { return nil }); err == nil {
+		t.Fatalf("expected error when pg_advisory_unlock fails")
+	}
+	if gotClosed := connector.closed.Load(); gotClosed != 1 {
+		t.Fatalf("failed unlock must discard connection: closed=%d want=1", gotClosed)
+	}
+
+	// Next WithLock must open a fresh connection rather than reusing the discarded one.
+	connector.failUnlock.Store(false)
+	if err := startup.WithLock(context.Background(), gormDB, func() error { return nil }); err != nil {
+		t.Fatalf("WithLock after discard: %v", err)
+	}
+	if gotOpened := connector.opened.Load(); gotOpened != 2 {
+		t.Fatalf("after discard opened=%d want=2", gotOpened)
 	}
 }

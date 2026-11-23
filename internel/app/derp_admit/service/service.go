@@ -17,12 +17,6 @@ import (
 
 type Option func(*Service)
 
-func WithAdminAPIKey(key string) Option {
-	return func(s *Service) {
-		s.adminAPIKey = key
-	}
-}
-
 func WithMetrics(r metrics.Recorder) Option {
 	return func(s *Service) {
 		if r != nil {
@@ -43,7 +37,6 @@ type Service struct {
 	db                 *gorm.DB
 	policy             policy.PolicyEngine
 	tokenPepper        string
-	adminAPIKey        string
 	dbTimeout          time.Duration
 	policySyncInterval time.Duration
 	cache              *VerifyCache

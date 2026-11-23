@@ -15,6 +15,7 @@ import (
 	"derp-admit/internel/app/derp_admit/db"
 	"derp-admit/internel/app/derp_admit/model"
 	"derp-admit/internel/app/derp_admit/policy"
+	"derp-admit/internel/app/derp_admit/server"
 	"derp-admit/internel/app/derp_admit/service"
 
 	"github.com/google/uuid"
@@ -33,7 +34,6 @@ func bBuildAppOnDB(t *testing.T, dbURL string, opts ...func(*config.Config)) *ap
 		DatabaseURL:          dbURL,
 		TokenPepper:          "test-pepper",
 		AdminAPIKey:          testAdminKey,
-		EnableCasbin:         true,
 		MetricsEnabled:       true,
 		DBTimeout:            2 * time.Second,
 		PolicySyncInterval:   2 * time.Second,
@@ -475,6 +475,33 @@ func TestSyncRevokeAcrossInstances(t *testing.T) {
 	// Instance B must reflect the revocation within two sync intervals.
 	elapsed := bWaitVerify(t, appB.Router, "/verify", nk, false, service.DenyReasonRevoked, 2*syncInterval)
 	t.Logf("TestSyncRevokeAcrossInstances: observed propagation delay=%v (bound 2*interval=%v)", elapsed, 2*syncInterval)
+
+	// Device-delete case: register a second device, cache allow on B, delete on A,
+	// and verify B returns "not registered" within two sync intervals.
+	userID2, token2 := provisionUserAndToken(t, appA.Router, "sync-delete-user")
+	nk2 := newNodeKey(t)
+	if status, _ := doJSONRequest(t, appA.Router, "/register", map[string]any{
+		"token":   token2,
+		"nodeKey": nk2,
+	}); status != http.StatusOK {
+		t.Fatalf("register nk2 status=%d want=200", status)
+	}
+	bWaitVerify(t, appB.Router, "/verify", nk2, true, "", 5*syncInterval)
+	if _, payload := doRawRequest(t, appB.Router, "/verify", buildVerifyBody(t, nk2)); payload["Allow"] != true {
+		t.Fatalf("instance B cached verify nk2 expected allow, got %+v", payload)
+	}
+
+	status, body = doAdminRequest(t, appA.Router, http.MethodGet, "/admin/devices?userId="+userID2, testAdminKey, nil)
+	if status != http.StatusOK {
+		t.Fatalf("list nk2 devices status=%d want=200", status)
+	}
+	deviceID2 := body["devices"].([]any)[0].(map[string]any)["id"].(string)
+	if status, _ := doAdminRequest(t, appA.Router, http.MethodDelete, "/admin/devices/"+deviceID2, testAdminKey, nil); status != http.StatusOK {
+		t.Fatalf("delete device on instance A status=%d want=200", status)
+	}
+
+	elapsedDel := bWaitVerify(t, appB.Router, "/verify", nk2, false, service.DenyReasonNotRegistered, 2*syncInterval)
+	t.Logf("TestSyncRevokeAcrossInstances(delete): observed propagation delay=%v (bound 2*interval=%v)", elapsedDel, 2*syncInterval)
 }
 
 func TestSyncRoleBindingAcrossInstances(t *testing.T) {
@@ -510,9 +537,23 @@ func TestSyncRoleBindingAcrossInstances(t *testing.T) {
 	// Bind user to eu-only via Mutate on instance A.
 	bBindUserRoles(t, appA, userID, []string{policy.BuiltinRole, "eu-only"})
 
-	// Instance B must allow /verify/eu-1 within two sync intervals.
+	// Instance B must allow /verify/eu-1 within two sync intervals (and cache the allow).
 	elapsed := bWaitVerify(t, appB.Router, "/verify/eu-1", nk, true, "", 2*syncInterval)
 	t.Logf("TestSyncRoleBindingAcrossInstances: observed propagation delay=%v (bound 2*interval=%v)", elapsed, 2*syncInterval)
+	if _, payload := doRawRequest(t, appB.Router, "/verify/eu-1", buildVerifyBody(t, nk)); payload["Allow"] != true {
+		t.Fatalf("instance B cached /verify/eu-1 expected allow, got %+v", payload)
+	}
+
+	// Remove the eu-1 grant through PUT /admin/roles/:name/relays on instance A.
+	if status, _ := doAdminRequest(t, appA.Router, http.MethodPut, "/admin/roles/eu-only/relays", testAdminKey, map[string]any{
+		"relays": []string{},
+	}); status != http.StatusOK {
+		t.Fatalf("PUT /admin/roles/eu-only/relays status=%d want=200", status)
+	}
+
+	// Instance B must reflect the grant removal on /verify/eu-1 within two sync intervals.
+	elapsedRem := bWaitVerify(t, appB.Router, "/verify/eu-1", nk, false, service.DenyReasonPolicyDenied, 2*syncInterval)
+	t.Logf("TestSyncRoleBindingAcrossInstances(grant removal): observed propagation delay=%v (bound 2*interval=%v)", elapsedRem, 2*syncInterval)
 }
 
 func TestSyncStaleReadyzFailsClosedAndRecovers(t *testing.T) {
@@ -539,7 +580,6 @@ func TestSyncStaleReadyzFailsClosedAndRecovers(t *testing.T) {
 		DatabaseURL:          dbURL,
 		TokenPepper:          "test-pepper",
 		AdminAPIKey:          testAdminKey,
-		EnableCasbin:         true,
 		MetricsEnabled:       true,
 		DBTimeout:            2 * time.Second,
 		VerifyCacheTTL:       time.Minute,
@@ -636,3 +676,327 @@ func bWaitVerify(t *testing.T, handler http.Handler, path, nodeKey string, wantA
 }
 
 func bStrPtr(s string) *string { return &s }
+
+func TestVerifyTrailingSlashIsMalformedRelay(t *testing.T) {
+	application := bBuildSingleApp(t)
+	user := createUser(t, application.DB, "trailing-slash-user")
+	bBindUserRoles(t, application, user.ID, []string{policy.BuiltinRole})
+	nk := newNodeKey(t)
+	createDevice(t, application.DB, user.ID, nk, "laptop", nil)
+
+	code, payload := doRawRequest(t, application.Router, "/verify/", buildVerifyBody(t, nk))
+	if code != http.StatusOK {
+		t.Fatalf("POST /verify/ status=%d want=200 (must not 307 redirect)", code)
+	}
+	if allow, _ := payload["Allow"].(bool); allow {
+		t.Fatalf("POST /verify/ unexpectedly allowed")
+	}
+	if reason := denyReason(payload); reason != service.DenyReasonUnknownRelay {
+		t.Fatalf("POST /verify/ reason=%q want=%q", reason, service.DenyReasonUnknownRelay)
+	}
+	audit := bLastAuditLog(t, application.DB)
+	if audit.Allowed || audit.Reason != service.DenyReasonUnknownRelay || audit.Relay != nil || audit.NodeKey != nk {
+		t.Fatalf("POST /verify/ unexpected audit row: %+v", audit)
+	}
+}
+
+func TestVerifyRelayWithSlashIsMalformedRelay(t *testing.T) {
+	application := bBuildSingleApp(t)
+	nk := newNodeKey(t)
+
+	for _, path := range []string{"/verify/a/b", "/verify/default/extra", "/verify/default/"} {
+		code, payload := doRawRequest(t, application.Router, path, buildVerifyBody(t, nk))
+		if code != http.StatusOK {
+			t.Fatalf("POST %s status=%d want=200", path, code)
+		}
+		if allow, _ := payload["Allow"].(bool); allow {
+			t.Fatalf("POST %s unexpectedly allowed", path)
+		}
+		if reason := denyReason(payload); reason != service.DenyReasonUnknownRelay {
+			t.Fatalf("POST %s reason=%q want=%q", path, reason, service.DenyReasonUnknownRelay)
+		}
+		audit := bLastAuditLog(t, application.DB)
+		if audit.Allowed || audit.Reason != service.DenyReasonUnknownRelay || audit.Relay != nil || audit.NodeKey != nk {
+			t.Fatalf("POST %s unexpected audit row: %+v", path, audit)
+		}
+	}
+}
+
+func TestVerifyEncodedSlashIsMalformedRelay(t *testing.T) {
+	application := bBuildSingleApp(t)
+	nk := newNodeKey(t)
+
+	code, payload := doRawRequest(t, application.Router, "/verify/a%2Fb", buildVerifyBody(t, nk))
+	if code != http.StatusOK {
+		t.Fatalf("POST /verify/a%%2Fb status=%d want=200", code)
+	}
+	if allow, _ := payload["Allow"].(bool); allow {
+		t.Fatalf("POST /verify/a%%2Fb unexpectedly allowed")
+	}
+	if reason := denyReason(payload); reason != service.DenyReasonUnknownRelay {
+		t.Fatalf("POST /verify/a%%2Fb reason=%q want=%q", reason, service.DenyReasonUnknownRelay)
+	}
+	audit := bLastAuditLog(t, application.DB)
+	if audit.Allowed || audit.Reason != service.DenyReasonUnknownRelay || audit.Relay != nil || audit.NodeKey != nk {
+		t.Fatalf("POST /verify/a%%2Fb unexpected audit row: %+v", audit)
+	}
+}
+
+type bHoldingPolicyEngine struct {
+	inner     *policy.Engine
+	holdNext  atomic.Bool
+	failNext  atomic.Bool
+	enteredCh chan struct{}
+	releaseCh chan struct{}
+}
+
+func (e *bHoldingPolicyEngine) Enforce(req policy.Request) (bool, error) {
+	return e.inner.Enforce(req)
+}
+
+func (e *bHoldingPolicyEngine) Version() int64 {
+	return e.inner.Version()
+}
+
+func (e *bHoldingPolicyEngine) HasRelay(name string) bool {
+	return e.inner.HasRelay(name)
+}
+
+func (e *bHoldingPolicyEngine) Reload(ctx context.Context) error {
+	if e.holdNext.CompareAndSwap(true, false) {
+		close(e.enteredCh)
+		<-e.releaseCh
+	}
+	if e.failNext.Load() {
+		return errors.New("forced poller reload failure")
+	}
+	return e.inner.Reload(ctx)
+}
+
+func TestPollerCatchUpDoesNotDenyDuringReload(t *testing.T) {
+	dbURL := "sqlite://" + filepath.Join(t.TempDir(), "poller-catchup.db")
+	gormDB, err := db.OpenDatabase(dbURL)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := gormDB.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	if err := db.ApplyMigrations(context.Background(), gormDB, dbURL); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	if err := gormDB.Transaction(func(tx *gorm.DB) error {
+		_, err := policy.SeedBuiltins(tx)
+		return err
+	}); err != nil {
+		t.Fatalf("seed builtins: %v", err)
+	}
+
+	realEngine, err := policy.NewEngine(gormDB)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	holding := &bHoldingPolicyEngine{
+		inner:     realEngine,
+		enteredCh: make(chan struct{}),
+		releaseCh: make(chan struct{}),
+	}
+
+	cfg := config.Config{
+		DatabaseURL:          dbURL,
+		TokenPepper:          "test-pepper",
+		AdminAPIKey:          testAdminKey,
+		MetricsEnabled:       true,
+		DBTimeout:            5 * time.Second,
+		VerifyCacheTTL:       time.Minute,
+		PolicySyncInterval:   25 * time.Millisecond,
+		VerifyRateLimitRPS:   1000,
+		VerifyRateBurst:      1000,
+		RegisterRateLimitRPS: 1000,
+		RegisterRateBurst:    1000,
+		AdminRateLimitRPS:    1000,
+		AdminRateBurst:       1000,
+	}
+	logger := zap.NewNop()
+	svc := service.New(
+		gormDB,
+		holding,
+		cfg.TokenPepper,
+		cfg.DBTimeout,
+		service.NewVerifyCache(cfg.VerifyCacheTTL),
+		logger,
+		service.WithPolicySyncInterval(cfg.PolicySyncInterval),
+	)
+	if err := svc.SyncBootstrapKey(context.Background(), cfg.AdminAPIKey); err != nil {
+		t.Fatalf("SyncBootstrapKey: %v", err)
+	}
+	router := server.NewRouter(svc, cfg, logger)
+
+	user := createUser(t, gormDB, "catchup-user")
+	if err := gormDB.Transaction(func(tx *gorm.DB) error {
+		return policy.SetUserRoles(tx, user.ID, []string{policy.BuiltinRole})
+	}); err != nil {
+		t.Fatalf("bind standard: %v", err)
+	}
+	nk := newNodeKey(t)
+	createDevice(t, gormDB, user.ID, nk, "laptop", nil)
+	if err := realEngine.Reload(context.Background()); err != nil {
+		t.Fatalf("initial reload: %v", err)
+	}
+
+	checkReadyz := func() int {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		return rec.Code
+	}
+
+	// Start the poller, then arm holdNext and bump policy_state.version in the DB
+	// to simulate another instance registering a device.
+	syncCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	svc.StartSync(syncCtx)
+
+	holding.holdNext.Store(true)
+	if err := gormDB.Transaction(func(tx *gorm.DB) error {
+		_, err := policy.BumpVersion(tx)
+		return err
+	}); err != nil {
+		t.Fatalf("bump version: %v", err)
+	}
+
+	// Wait until the poller enters Reload and is held open.
+	select {
+	case <-holding.enteredCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for poller to enter Reload")
+	}
+
+	// While the poller reload is in flight, /verify MUST still allow normally and /readyz MUST stay 200.
+	if code := checkReadyz(); code != http.StatusOK {
+		t.Fatalf("/readyz during poller catch-up=%d want=200", code)
+	}
+	if _, payload := doRawRequest(t, router, "/verify", buildVerifyBody(t, nk)); payload["Allow"] != true {
+		t.Fatalf("/verify during poller catch-up expected allow, got %+v", payload)
+	}
+
+	// Now let that reload FAIL -> instance MUST become stale (/readyz 503, /verify internal error).
+	holding.failNext.Store(true)
+	close(holding.releaseCh)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for checkReadyz() != http.StatusServiceUnavailable {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for /readyz=503 after failed poller reload")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, payload := doRawRequest(t, router, "/verify", buildVerifyBody(t, nk))
+	if allow, _ := payload["Allow"].(bool); allow || denyReason(payload) != service.DenyReasonInternal {
+		t.Fatalf("/verify after failed poller reload=%+v want deny internal error", payload)
+	}
+
+	// Allow reload to succeed again -> instance recovers.
+	holding.failNext.Store(false)
+	deadline = time.Now().Add(2 * time.Second)
+	for checkReadyz() != http.StatusOK {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for /readyz=200 after reload recovery")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, payload := doRawRequest(t, router, "/verify", buildVerifyBody(t, nk)); payload["Allow"] != true {
+		t.Fatalf("/verify after recovery expected allow, got %+v", payload)
+	}
+}
+
+func TestVerifyDeletedRelayWithCachedDecision(t *testing.T) {
+	application := bBuildSingleApp(t, func(c *config.Config) {
+		c.VerifyCacheTTL = time.Minute
+	})
+
+	if status, _ := doAdminRequest(t, application.Router, http.MethodPost, "/admin/relays", testAdminKey, map[string]any{
+		"name": "eu-1",
+	}); status != http.StatusCreated {
+		t.Fatalf("create relay eu-1 status=%d want=201", status)
+	}
+	if status, _ := doAdminRequest(t, application.Router, http.MethodPost, "/admin/roles", testAdminKey, map[string]any{
+		"name":   "eu-role",
+		"relays": []string{"eu-1"},
+	}); status != http.StatusCreated {
+		t.Fatalf("create role eu-role status=%d want=201", status)
+	}
+
+	userID, token := provisionUserAndToken(t, application.Router, "cached-del-relay-user")
+	if status, _ := doAdminRequest(t, application.Router, http.MethodPut, "/admin/users/"+userID+"/roles", testAdminKey, map[string]any{
+		"roles": []string{"eu-role"},
+	}); status != http.StatusOK {
+		t.Fatalf("bind eu-role status=%d want=200", status)
+	}
+
+	nk := newNodeKey(t)
+	if status, _ := doJSONRequest(t, application.Router, "/register", map[string]any{
+		"token":   token,
+		"nodeKey": nk,
+	}); status != http.StatusOK {
+		t.Fatalf("register status=%d want=200", status)
+	}
+
+	// Warm live verify cache on eu-1.
+	for i := 0; i < 2; i++ {
+		_, payload := doRawRequest(t, application.Router, "/verify/eu-1", buildVerifyBody(t, nk))
+		if allow, _ := payload["Allow"].(bool); !allow {
+			t.Fatalf("verify %d on eu-1 expected allow, got %+v", i, payload)
+		}
+	}
+
+	// Delete relay eu-1 -> cached allow must be invalidated immediately.
+	if status, _ := doAdminRequest(t, application.Router, http.MethodDelete, "/admin/relays/eu-1", testAdminKey, nil); status != http.StatusOK {
+		t.Fatalf("DELETE /admin/relays/eu-1 status=%d want=200", status)
+	}
+
+	_, payload := doRawRequest(t, application.Router, "/verify/eu-1", buildVerifyBody(t, nk))
+	if allow, _ := payload["Allow"].(bool); allow || denyReason(payload) != service.DenyReasonUnknownRelay {
+		t.Fatalf("verify after relay delete=%+v want deny %q", payload, service.DenyReasonUnknownRelay)
+	}
+}
+
+func TestVerifyDeletedDeviceWithCachedDecision(t *testing.T) {
+	application := bBuildSingleApp(t, func(c *config.Config) {
+		c.VerifyCacheTTL = time.Minute
+	})
+
+	userID, token := provisionUserAndToken(t, application.Router, "cached-del-dev-user")
+	nk := newNodeKey(t)
+	if status, _ := doJSONRequest(t, application.Router, "/register", map[string]any{
+		"token":   token,
+		"nodeKey": nk,
+	}); status != http.StatusOK {
+		t.Fatalf("register status=%d want=200", status)
+	}
+
+	// Warm live verify cache on default.
+	for i := 0; i < 2; i++ {
+		_, payload := doRawRequest(t, application.Router, "/verify", buildVerifyBody(t, nk))
+		if allow, _ := payload["Allow"].(bool); !allow {
+			t.Fatalf("verify %d expected allow, got %+v", i, payload)
+		}
+	}
+
+	status, body := doAdminRequest(t, application.Router, http.MethodGet, "/admin/devices?userId="+userID, testAdminKey, nil)
+	if status != http.StatusOK {
+		t.Fatalf("list devices status=%d want=200", status)
+	}
+	devID := body["devices"].([]any)[0].(map[string]any)["id"].(string)
+
+	// Delete device -> cached allow must be invalidated immediately.
+	if status, _ := doAdminRequest(t, application.Router, http.MethodDelete, "/admin/devices/"+devID, testAdminKey, nil); status != http.StatusOK {
+		t.Fatalf("DELETE /admin/devices/%s status=%d want=200", devID, status)
+	}
+
+	_, payload := doRawRequest(t, application.Router, "/verify", buildVerifyBody(t, nk))
+	if allow, _ := payload["Allow"].(bool); allow || denyReason(payload) != service.DenyReasonNotRegistered {
+		t.Fatalf("verify after device delete=%+v want deny %q", payload, service.DenyReasonNotRegistered)
+	}
+}

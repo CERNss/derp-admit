@@ -24,6 +24,8 @@ import (
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -381,4 +383,47 @@ func TestConcurrentStartupUpgradesOnce(t *testing.T) {
 
 		aAssertConcurrentStartupOutcome(t, seedDB, apps, allowedKey, revokedKey, revokedDevID)
 	})
+}
+
+func TestBuildLogsConfigWarnings(t *testing.T) {
+	dbURL := "sqlite://" + filepath.Join(t.TempDir(), "warnings.db")
+	gormDB, err := db.OpenDatabase(dbURL)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := gormDB.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
+	cfg := aTestConfig(dbURL)
+	cfg.Warnings = []string{
+		"ENABLE_CASBIN / enable_casbin is deprecated and ignored",
+		"second startup config warning",
+	}
+
+	core, logs := observer.New(zapcore.WarnLevel)
+	application, err := app.Build(context.Background(), gormDB, cfg, zap.New(core))
+	if err != nil {
+		t.Fatalf("app.Build: %v", err)
+	}
+	t.Cleanup(application.Close)
+
+	var got []string
+	for _, entry := range logs.FilterLevelExact(zapcore.WarnLevel).All() {
+		got = append(got, entry.Message)
+	}
+	for _, want := range cfg.Warnings {
+		found := false
+		for _, msg := range got {
+			if msg == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected warning %q to be logged at warn level; got %v", want, got)
+		}
+	}
 }

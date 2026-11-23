@@ -3,6 +3,7 @@ package server
 import (
 	"io"
 	"net/http"
+	"strings"
 
 	"derp-admit/internel/app/derp_admit/derp"
 	"derp-admit/internel/app/derp_admit/metrics"
@@ -14,7 +15,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
-func verifyHandler(svc *service.Service, verifyLimiter *rate.Limiter, logger *zap.Logger, rec metrics.Recorder) gin.HandlerFunc {
+func verifyHandler(svc *service.Service, verifyLimiter *rate.Limiter, logger *zap.Logger, rec metrics.Recorder, defaultRelay bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !verifyLimiter.Allow() {
 			logWithTrace(logger, c.Request.Context()).Warn("verify request rate limited")
@@ -24,9 +25,11 @@ func verifyHandler(svc *service.Service, verifyLimiter *rate.Limiter, logger *za
 			return
 		}
 
-		relay := c.Param("relay")
-		if relay == "" {
+		var relay string
+		if defaultRelay {
 			relay = policy.BuiltinRelay
+		} else {
+			relay = strings.TrimPrefix(c.Param("relay"), "/")
 		}
 
 		body, err := io.ReadAll(c.Request.Body)

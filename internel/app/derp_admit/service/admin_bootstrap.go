@@ -8,6 +8,7 @@ import (
 
 	"derp-admit/internel/app/derp_admit/model"
 
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -73,10 +74,29 @@ func (s *Service) SyncBootstrapKey(ctx context.Context, adminAPIKey string) erro
 
 	keyHash := s.hashToken(adminAPIKey)
 	ignored := false
+	type hashCollision struct {
+		name string
+		tier string
+	}
+	var collision *hashCollision
 
 	err := s.db.WithContext(dbCtx).Transaction(func(tx *gorm.DB) error {
 		if err := lockAdminKeyMutation(tx); err != nil {
 			return err
+		}
+
+		var hashOwner model.AdminKey
+		hashLookupErr := lockedAdminKeyQuery(tx).Where("key_hash = ?", keyHash).First(&hashOwner).Error
+		switch {
+		case hashLookupErr == nil:
+			if hashOwner.Name != BootstrapKeyName {
+				collision = &hashCollision{name: hashOwner.Name, tier: hashOwner.Tier}
+				return nil
+			}
+		case errors.Is(hashLookupErr, gorm.ErrRecordNotFound):
+			// No existing key owns this hash.
+		default:
+			return fmt.Errorf("lookup admin key by hash: %w", hashLookupErr)
 		}
 
 		now := time.Now().UTC()
@@ -175,6 +195,15 @@ func (s *Service) SyncBootstrapKey(ctx context.Context, adminAPIKey string) erro
 	}
 	if err != nil {
 		return err
+	}
+
+	if collision != nil {
+		loggerWithTrace(s.logger, ctx).Error(
+			"ADMIN_API_KEY matches an existing admin key and was not installed as bootstrap",
+			zap.String("key_name", collision.name),
+			zap.String("key_tier", collision.tier),
+		)
+		return nil
 	}
 
 	if ignored {

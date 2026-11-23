@@ -24,7 +24,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func openFreshPostgresApp(t *testing.T, cacheTTL time.Duration) (*app.App, *gorm.DB) {
+func createFreshPostgresDB(t *testing.T, prefix string) string {
 	t.Helper()
 
 	baseURL := os.Getenv("TEST_POSTGRES_URL")
@@ -41,7 +41,7 @@ func openFreshPostgresApp(t *testing.T, cacheTTL time.Duration) (*app.App, *gorm
 	if _, err := rand.Read(raw); err != nil {
 		t.Fatalf("random db suffix: %v", err)
 	}
-	dbName := "derp_admit_test_" + hex.EncodeToString(raw)
+	dbName := prefix + hex.EncodeToString(raw)
 
 	adminDB, err := db.OpenDatabase(baseURL)
 	if err != nil {
@@ -55,16 +55,7 @@ func openFreshPostgresApp(t *testing.T, cacheTTL time.Duration) (*app.App, *gorm
 	testURL.Path = "/" + dbName
 	dbURL := testURL.String()
 
-	gormDB, err := db.OpenDatabase(dbURL)
-	if err != nil {
-		_ = adminDB.Exec(fmt.Sprintf(`DROP DATABASE IF EXISTS %s`, dbName)).Error
-		t.Fatalf("open test database %s: %v", dbName, err)
-	}
-
 	t.Cleanup(func() {
-		if sqlDB, err := gormDB.DB(); err == nil {
-			_ = sqlDB.Close()
-		}
 		_ = adminDB.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = ? AND pid <> pg_backend_pid()`, dbName).Error
 		_ = adminDB.Exec(fmt.Sprintf(`DROP DATABASE IF EXISTS %s`, dbName)).Error
 		if sqlAdmin, err := adminDB.DB(); err == nil {
@@ -72,11 +63,28 @@ func openFreshPostgresApp(t *testing.T, cacheTTL time.Duration) (*app.App, *gorm
 		}
 	})
 
+	return dbURL
+}
+
+func openFreshPostgresApp(t *testing.T, cacheTTL time.Duration) (*app.App, *gorm.DB) {
+	t.Helper()
+
+	dbURL := createFreshPostgresDB(t, "derp_admit_test_")
+
+	gormDB, err := db.OpenDatabase(dbURL)
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := gormDB.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+
 	cfg := config.Config{
 		DatabaseURL:          dbURL,
 		TokenPepper:          "pg-e2e-pepper",
 		AdminAPIKey:          testAdminKey,
-		EnableCasbin:         true,
 		MetricsEnabled:       true,
 		DBTimeout:            5 * time.Second,
 		PolicySyncInterval:   2 * time.Second,
@@ -235,24 +243,118 @@ func TestPostgresEndToEnd(t *testing.T) {
 		t.Fatalf("verify disabled user nk1 reason=%q want=%q", reason, service.DenyReasonUserDisabled)
 	}
 
-	// 14. Exactly one admin audit row per mutating request (7 mutations),
-	// one startup system row for bootstrap creation, and policy version > 0.
-	var auditRows []model.AdminAuditLog
-	if err := gormDB.Where("actor_name <> ?", actor.System.Name).Order("id asc").Find(&auditRows).Error; err != nil {
-		t.Fatalf("query admin_audit_logs: %v", err)
+	// 14. Create a relay and a role through the API, bind u2 to it, verify on /verify/eu-1 allowed and default denied.
+	if status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/relays", testAdminKey, map[string]any{
+		"name":        "eu-1",
+		"description": "Frankfurt",
+	}); status != http.StatusCreated {
+		t.Fatalf("create relay eu-1 status=%d want=201", status)
 	}
-	const wantMutations = 7
-	if len(auditRows) != wantMutations {
-		t.Fatalf("admin audit row count=%d want=%d", len(auditRows), wantMutations)
+	if status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/roles", testAdminKey, map[string]any{
+		"name":   "eu-only",
+		"relays": []string{"eu-1"},
+	}); status != http.StatusCreated {
+		t.Fatalf("create role eu-only status=%d want=201", status)
 	}
-	for i, row := range auditRows {
-		if row.Outcome != service.AuditOutcomeSuccess {
-			t.Fatalf("audit row %d outcome=%q want=%q", i, row.Outcome, service.AuditOutcomeSuccess)
+	if status, _ := doAdminRequest(t, router, http.MethodPut, "/admin/users/"+u2ID+"/roles", testAdminKey, map[string]any{
+		"roles": []string{"eu-only"},
+	}); status != http.StatusOK {
+		t.Fatalf("bind u2 to eu-only status=%d want=200", status)
+	}
+	_, payload = doRawRequest(t, router, "/verify/eu-1", buildVerifyBody(t, nk2))
+	if allow, _ := payload["Allow"].(bool); !allow {
+		t.Fatalf("verify nk2 on /verify/eu-1 expected allow, got deny reason=%q", denyReason(payload))
+	}
+	_, payload = doRawRequest(t, router, "/verify", buildVerifyBody(t, nk2))
+	if reason := denyReason(payload); reason != service.DenyReasonPolicyDenied {
+		t.Fatalf("verify nk2 on default reason=%q want=%q", reason, service.DenyReasonPolicyDenied)
+	}
+
+	// 15. Delete dev1 -> verify returns not registered.
+	if status, _ := doAdminRequest(t, router, http.MethodDelete, "/admin/devices/"+dev1ID, testAdminKey, nil); status != http.StatusOK {
+		t.Fatalf("delete dev1 status=%d want=200", status)
+	}
+	_, payload = doRawRequest(t, router, "/verify", buildVerifyBody(t, nk1))
+	if reason := denyReason(payload); reason != service.DenyReasonNotRegistered {
+		t.Fatalf("verify deleted nk1 reason=%q want=%q", reason, service.DenyReasonNotRegistered)
+	}
+
+	// 16. Delete u2 -> verify audit rows keep node_key with null device_id.
+	if status, _ := doAdminRequest(t, router, http.MethodDelete, "/admin/users/"+u2ID, testAdminKey, nil); status != http.StatusOK {
+		t.Fatalf("delete u2 status=%d want=200", status)
+	}
+	_, payload = doRawRequest(t, router, "/verify/eu-1", buildVerifyBody(t, nk2))
+	if reason := denyReason(payload); reason != service.DenyReasonNotRegistered {
+		t.Fatalf("verify deleted user nk2 reason=%q want=%q", reason, service.DenyReasonNotRegistered)
+	}
+	var nk2Audits []model.AuditLog
+	if err := gormDB.Where("node_key = ?", nk2).Find(&nk2Audits).Error; err != nil {
+		t.Fatalf("query nk2 audit_logs: %v", err)
+	}
+	if len(nk2Audits) < 3 {
+		t.Fatalf("expected nk2 verify audit rows preserved, got %d", len(nk2Audits))
+	}
+	for _, row := range nk2Audits {
+		if row.DeviceID != nil {
+			t.Fatalf("expected null device_id on preserved audit row %d after user delete, got %v", row.ID, row.DeviceID)
 		}
 	}
 
+	// 17. Create a named admin key, use it, revoke bootstrap, and verify last-admin guard (409).
+	status, body = doAdminRequest(t, router, http.MethodPost, "/admin/keys", testAdminKey, map[string]any{
+		"name": "pg-named-admin",
+		"tier": "admin",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create named admin key status=%d want=201", status)
+	}
+	namedAdminID := body["meta"].(map[string]any)["id"].(string)
+	namedAdminPlain := body["key"].(string)
+
+	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/keys", namedAdminPlain, nil); status != http.StatusOK {
+		t.Fatalf("GET /admin/keys with named admin status=%d want=200", status)
+	}
+
+	var bootKey model.AdminKey
+	if err := gormDB.Where("name = ?", service.BootstrapKeyName).First(&bootKey).Error; err != nil {
+		t.Fatalf("load bootstrap key: %v", err)
+	}
+	if status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/keys/"+bootKey.ID.String()+"/revoke", namedAdminPlain, nil); status != http.StatusOK {
+		t.Fatalf("revoke bootstrap status=%d want=200", status)
+	}
+	if status, _ := doAdminRequest(t, router, http.MethodGet, "/admin/keys", testAdminKey, nil); status != http.StatusUnauthorized {
+		t.Fatalf("revoked bootstrap status=%d want=401", status)
+	}
+	if status, _ := doAdminRequest(t, router, http.MethodPost, "/admin/keys/"+namedAdminID+"/revoke", namedAdminPlain, nil); status != http.StatusConflict {
+		t.Fatalf("revoke last active admin status=%d want=409", status)
+	}
+
+	// 18. Exactly one admin audit row per mutating request (14 successful + 1 failed 409),
+	// one startup system row for bootstrap creation, and policy version > 0.
+	var auditRows []model.AdminAuditLog
+	if err := gormDB.Where("NOT (actor_key_id IS NULL AND actor_name = ?)", actor.System.Name).Order("id asc").Find(&auditRows).Error; err != nil {
+		t.Fatalf("query admin_audit_logs: %v", err)
+	}
+	const wantSuccessMutations = 14
+	const wantTotalMutations = 15 // 14 successes + 1 failed 409 on last-admin revoke
+	if len(auditRows) != wantTotalMutations {
+		t.Fatalf("admin audit row count=%d want=%d", len(auditRows), wantTotalMutations)
+	}
+	successCount, failCount := 0, 0
+	for _, row := range auditRows {
+		switch row.Outcome {
+		case service.AuditOutcomeSuccess:
+			successCount++
+		case service.AuditOutcomeFailure:
+			failCount++
+		}
+	}
+	if successCount != wantSuccessMutations || failCount != 1 {
+		t.Fatalf("audit outcomes: success=%d failure=%d want success=%d failure=1", successCount, failCount, wantSuccessMutations)
+	}
+
 	var systemRows []model.AdminAuditLog
-	if err := gormDB.Where("actor_name = ?", actor.System.Name).Order("id asc").Find(&systemRows).Error; err != nil {
+	if err := gormDB.Where("actor_key_id IS NULL AND actor_name = ?", actor.System.Name).Order("id asc").Find(&systemRows).Error; err != nil {
 		t.Fatalf("query system admin_audit_logs: %v", err)
 	}
 	if len(systemRows) != 1 || systemRows[0].Action != "bootstrap.create" {
@@ -319,5 +421,320 @@ func TestPostgresConcurrentRegisterRespectsLimit(t *testing.T) {
 	}
 	if devCount != 1 {
 		t.Fatalf("device row count=%d want=1", devCount)
+	}
+}
+
+func TestPostgresRoleDeleteRacesBinding(t *testing.T) {
+	application, gormDB := openFreshPostgresApp(t, 0)
+	router := application.Router
+
+	status, body := doAdminRequest(t, router, http.MethodPost, "/admin/users", testAdminKey, map[string]any{
+		"username": "pg-race-bind-user",
+		"roles":    []string{},
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create user status=%d want=201", status)
+	}
+	userID := body["user"].(map[string]any)["id"].(string)
+
+	const rounds = 25
+	for i := 0; i < rounds; i++ {
+		roleName := fmt.Sprintf("race-role-%d", i)
+		if st, _ := doAdminRequest(t, router, http.MethodPost, "/admin/roles", testAdminKey, map[string]any{
+			"name":   roleName,
+			"relays": []string{"default"},
+		}); st != http.StatusCreated {
+			t.Fatalf("round %d create role status=%d want=201", i, st)
+		}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var bindStatus, delStatus int
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			bindStatus, _ = doAdminRequest(t, router, http.MethodPut, "/admin/users/"+userID+"/roles", testAdminKey, map[string]any{
+				"roles": []string{roleName},
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			delStatus, _ = doAdminRequest(t, router, http.MethodDelete, "/admin/roles/"+roleName, testAdminKey, nil)
+		}()
+		close(start)
+		wg.Wait()
+
+		if delStatus != http.StatusOK {
+			t.Fatalf("round %d delete role status=%d want=200", i, delStatus)
+		}
+		if bindStatus != http.StatusOK && bindStatus != http.StatusBadRequest {
+			t.Fatalf("round %d unexpected bind status=%d (want 200 or 400)", i, bindStatus)
+		}
+
+		// After the delete completes, NO casbin_rule row may reference the deleted role.
+		var orphanCount int64
+		if err := gormDB.Model(&model.CasbinRule{}).
+			Where("(ptype = 'g' AND v1 = ?) OR (ptype = 'p' AND v0 = ?)", "role:"+roleName, "role:"+roleName).
+			Count(&orphanCount).Error; err != nil {
+			t.Fatalf("round %d count orphan role rules: %v", i, err)
+		}
+		if orphanCount != 0 {
+			t.Fatalf("round %d orphan casbin_rule rows for deleted role %s = %d want=0", i, roleName, orphanCount)
+		}
+	}
+}
+
+func TestPostgresRelayDeleteRacesGrant(t *testing.T) {
+	application, gormDB := openFreshPostgresApp(t, 0)
+	router := application.Router
+
+	if st, _ := doAdminRequest(t, router, http.MethodPost, "/admin/roles", testAdminKey, map[string]any{
+		"name":   "pg-race-grant-role",
+		"relays": []string{},
+	}); st != http.StatusCreated {
+		t.Fatalf("create role status=%d want=201", st)
+	}
+
+	const rounds = 25
+	for i := 0; i < rounds; i++ {
+		relayName := fmt.Sprintf("race-relay-%d", i)
+		if st, _ := doAdminRequest(t, router, http.MethodPost, "/admin/relays", testAdminKey, map[string]any{
+			"name": relayName,
+		}); st != http.StatusCreated {
+			t.Fatalf("round %d create relay status=%d want=201", i, st)
+		}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var grantStatus, delStatus int
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			grantStatus, _ = doAdminRequest(t, router, http.MethodPut, "/admin/roles/pg-race-grant-role/relays", testAdminKey, map[string]any{
+				"relays": []string{relayName},
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			delStatus, _ = doAdminRequest(t, router, http.MethodDelete, "/admin/relays/"+relayName, testAdminKey, nil)
+		}()
+		close(start)
+		wg.Wait()
+
+		if delStatus != http.StatusOK {
+			t.Fatalf("round %d delete relay status=%d want=200", i, delStatus)
+		}
+		if grantStatus != http.StatusOK && grantStatus != http.StatusBadRequest {
+			t.Fatalf("round %d unexpected grant status=%d (want 200 or 400)", i, grantStatus)
+		}
+
+		// After the delete completes, NO casbin_rule row may reference the deleted relay.
+		var orphanCount int64
+		if err := gormDB.Model(&model.CasbinRule{}).
+			Where("ptype = 'p' AND v1 = ?", "derp:"+relayName).
+			Count(&orphanCount).Error; err != nil {
+			t.Fatalf("round %d count orphan relay rules: %v", i, err)
+		}
+		if orphanCount != 0 {
+			t.Fatalf("round %d orphan casbin_rule rows for deleted relay %s = %d want=0", i, relayName, orphanCount)
+		}
+	}
+}
+
+func TestPostgresRevokeLastAdminConcurrent(t *testing.T) {
+	application, gormDB := openFreshPostgresApp(t, 0)
+	router := application.Router
+
+	var boot model.AdminKey
+	if err := gormDB.Where("name = ?", service.BootstrapKeyName).First(&boot).Error; err != nil {
+		t.Fatalf("load bootstrap key: %v", err)
+	}
+
+	survivorID := boot.ID.String()
+	survivorPlain := testAdminKey
+
+	const rounds = 20
+	for i := 0; i < rounds; i++ {
+		st, body := doAdminRequest(t, router, http.MethodPost, "/admin/keys", survivorPlain, map[string]any{
+			"name": fmt.Sprintf("pg-concurrent-admin-%d", i),
+			"tier": "admin",
+		})
+		if st != http.StatusCreated {
+			t.Fatalf("round %d create second admin status=%d want=201", i, st)
+		}
+		otherID := body["meta"].(map[string]any)["id"].(string)
+		otherPlain := body["key"].(string)
+
+		// Concurrently revoke each admin key using the other admin key.
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var st1, st2 int
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			st1, _ = doAdminRequest(t, router, http.MethodPost, "/admin/keys/"+otherID+"/revoke", survivorPlain, nil)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			st2, _ = doAdminRequest(t, router, http.MethodPost, "/admin/keys/"+survivorID+"/revoke", otherPlain, nil)
+		}()
+		close(start)
+		wg.Wait()
+
+		// Valid pairs: {200, 409} (both authenticated, one hit last-admin guard)
+		// or {200, 401} (one revoked the other before the other's auth ran).
+		// {200, 200} is a lockout bug and MUST fail.
+		validPair := (st1 == http.StatusOK && (st2 == http.StatusConflict || st2 == http.StatusUnauthorized)) ||
+			(st2 == http.StatusOK && (st1 == http.StatusConflict || st1 == http.StatusUnauthorized))
+		if !validPair {
+			t.Fatalf("round %d invalid concurrent revoke statuses: st1=%d st2=%d", i, st1, st2)
+		}
+
+		var activeAdmins []model.AdminKey
+		if err := gormDB.Where("tier = ? AND revoked_at IS NULL", model.AdminTierAdmin).Find(&activeAdmins).Error; err != nil {
+			t.Fatalf("round %d query active admins: %v", i, err)
+		}
+		if len(activeAdmins) != 1 {
+			t.Fatalf("round %d active admin count=%d want=1", i, len(activeAdmins))
+		}
+		if activeAdmins[0].ID.String() == otherID {
+			survivorID = otherID
+			survivorPlain = otherPlain
+		}
+	}
+
+	// Also verify direct self-revoke race (where 401 cannot preempt auth) always
+	// produces exactly one 200 and one 409.
+	for i := 0; i < 10; i++ {
+		st, body := doAdminRequest(t, router, http.MethodPost, "/admin/keys", survivorPlain, map[string]any{
+			"name": fmt.Sprintf("pg-self-revoke-admin-%d", i),
+			"tier": "admin",
+		})
+		if st != http.StatusCreated {
+			t.Fatalf("self-revoke round %d create admin status=%d want=201", i, st)
+		}
+		otherID := body["meta"].(map[string]any)["id"].(string)
+		otherPlain := body["key"].(string)
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var st1, st2 int
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			st1, _ = doAdminRequest(t, router, http.MethodPost, "/admin/keys/"+survivorID+"/revoke", survivorPlain, nil)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			st2, _ = doAdminRequest(t, router, http.MethodPost, "/admin/keys/"+otherID+"/revoke", otherPlain, nil)
+		}()
+		close(start)
+		wg.Wait()
+
+		if !((st1 == http.StatusOK && st2 == http.StatusConflict) || (st2 == http.StatusOK && st1 == http.StatusConflict)) {
+			t.Fatalf("self-revoke round %d statuses=(%d, %d) want one 200 and one 409", i, st1, st2)
+		}
+
+		var activeAdmins []model.AdminKey
+		if err := gormDB.Where("tier = ? AND revoked_at IS NULL", model.AdminTierAdmin).Find(&activeAdmins).Error; err != nil {
+			t.Fatalf("self-revoke round %d query active admins: %v", i, err)
+		}
+		if len(activeAdmins) != 1 {
+			t.Fatalf("self-revoke round %d active admin count=%d want=1", i, len(activeAdmins))
+		}
+		if activeAdmins[0].ID.String() == otherID {
+			survivorID = otherID
+			survivorPlain = otherPlain
+		}
+	}
+}
+
+func TestPostgresBootstrapConcurrentStartup(t *testing.T) {
+	dbURL := createFreshPostgresDB(t, "derp_admit_boot_")
+
+	const instances = 6
+	conns := make([]*gorm.DB, instances)
+	for i := 0; i < instances; i++ {
+		c, err := db.OpenDatabase(dbURL)
+		if err != nil {
+			t.Fatalf("open postgres conn %d: %v", i, err)
+		}
+		conns[i] = c
+		t.Cleanup(func() {
+			if sqlDB, err := c.DB(); err == nil {
+				_ = sqlDB.Close()
+			}
+		})
+	}
+
+	cfg := config.Config{
+		DatabaseURL:          dbURL,
+		TokenPepper:          "pg-boot-pepper",
+		AdminAPIKey:          testAdminKey,
+		MetricsEnabled:       true,
+		DBTimeout:            5 * time.Second,
+		PolicySyncInterval:   2 * time.Second,
+		VerifyRateLimitRPS:   1000,
+		VerifyRateBurst:      1000,
+		RegisterRateLimitRPS: 1000,
+		RegisterRateBurst:    1000,
+		AdminRateLimitRPS:    1000,
+		AdminRateBurst:       1000,
+	}
+
+	start := make(chan struct{})
+	apps := make([]*app.App, instances)
+	errs := make([]error, instances)
+	var wg sync.WaitGroup
+	for i := 0; i < instances; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			apps[idx], errs[idx] = app.Build(ctx, conns[idx], cfg, zap.NewNop())
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, a := range apps {
+		if a != nil {
+			t.Cleanup(a.Close)
+		}
+		if errs[i] != nil {
+			t.Fatalf("instance %d app.Build failed: %v", i, errs[i])
+		}
+	}
+
+	var bootCount int64
+	if err := conns[0].Model(&model.AdminKey{}).Where("name = ?", service.BootstrapKeyName).Count(&bootCount).Error; err != nil {
+		t.Fatalf("count bootstrap rows: %v", err)
+	}
+	if bootCount != 1 {
+		t.Fatalf("bootstrap row count=%d want=1", bootCount)
+	}
+
+	var sysAudits []model.AdminAuditLog
+	if err := conns[0].Where("actor_key_id IS NULL AND actor_name = ?", actor.System.Name).Find(&sysAudits).Error; err != nil {
+		t.Fatalf("query system audits: %v", err)
+	}
+	if len(sysAudits) != 1 || sysAudits[0].Action != "bootstrap.create" {
+		t.Fatalf("system audits=%+v want exactly 1 bootstrap.create row", sysAudits)
+	}
+
+	for i, a := range apps {
+		if st, _ := doAdminRequest(t, a.Router, http.MethodGet, "/admin/keys", testAdminKey, nil); st != http.StatusOK {
+			t.Fatalf("instance %d GET /admin/keys status=%d want=200", i, st)
+		}
 	}
 }

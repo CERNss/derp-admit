@@ -10,10 +10,14 @@ import (
 	"testing"
 	"time"
 
+	"derp-admit/config"
 	"derp-admit/internel/app/derp_admit/actor"
+	"derp-admit/internel/app/derp_admit/app"
 	"derp-admit/internel/app/derp_admit/db"
+	"derp-admit/internel/app/derp_admit/derp"
 	"derp-admit/internel/app/derp_admit/model"
 	"derp-admit/internel/app/derp_admit/policy"
+	"derp-admit/internel/app/derp_admit/service"
 
 	"github.com/casbin/casbin/v3"
 	casbinmodel "github.com/casbin/casbin/v3/model"
@@ -22,6 +26,8 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 	"gorm.io/gorm"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
 
 const aOldCasbinModelText = `
@@ -117,7 +123,7 @@ func aInsertRules(t *testing.T, dbConn *gorm.DB, rules ...model.CasbinRule) {
 	}
 }
 
-func aBuildOldEnforcer(t *testing.T, dbConn *gorm.DB) *casbin.Enforcer {
+func aBuildOldEnforcer(t *testing.T, dbConn *gorm.DB, casbinWasDisabled bool) *casbin.Enforcer {
 	t.Helper()
 
 	m, err := casbinmodel.NewModelFromString(aOldCasbinModelText)
@@ -129,7 +135,12 @@ func aBuildOldEnforcer(t *testing.T, dbConn *gorm.DB) *casbin.Enforcer {
 	if err := dbConn.Order("id asc").Find(&rows).Error; err != nil {
 		t.Fatalf("read raw casbin_rule rows: %v", err)
 	}
+	hasDefaultStandardGrant := false
 	for _, r := range rows {
+		if r.Ptype == "p" && r.V0 == "role:standard" && r.V1 == "derp:default" && r.V2 == "connect" &&
+			r.V3 == "" && r.V4 == "" && r.V5 == "" {
+			hasDefaultStandardGrant = true
+		}
 		parts := []string{r.Ptype, r.V0, r.V1, r.V2, r.V3, r.V4, r.V5}
 		end := len(parts)
 		for end > 1 && parts[end-1] == "" {
@@ -142,6 +153,16 @@ func aBuildOldEnforcer(t *testing.T, dbConn *gorm.DB) *casbin.Enforcer {
 		}
 	}
 
+	// In enforced mode, the previous version's startup Bootstrap re-added
+	// `p, role:standard, derp:default, connect` on every start, so a database
+	// where that row had been deleted still allowed legacy standard devices
+	// on plain /verify before the upgrade.
+	if !casbinWasDisabled && !hasDefaultStandardGrant {
+		if err := persist.LoadPolicyLine("p, role:standard, derp:default, connect", m); err != nil {
+			t.Fatalf("seed old Bootstrap baseline grant: %v", err)
+		}
+	}
+
 	enforcer, err := casbin.NewEnforcer(m)
 	if err != nil {
 		t.Fatalf("new old casbin enforcer: %v", err)
@@ -151,6 +172,29 @@ func aBuildOldEnforcer(t *testing.T, dbConn *gorm.DB) *casbin.Enforcer {
 		t.Fatalf("build old casbin role links: %v", err)
 	}
 	return enforcer
+}
+
+func aNewRealNodeKey(t *testing.T) string {
+	t.Helper()
+	pub := key.NewNode().Public()
+	raw, err := json.Marshal(tailcfg.DERPAdmitClientRequest{NodePublic: pub})
+	if err != nil {
+		t.Fatalf("marshal node key: %v", err)
+	}
+	_, parsed, err := derp.ParseRequest(raw)
+	if err != nil {
+		t.Fatalf("parse node key: %v", err)
+	}
+	return parsed
+}
+
+func aBuildVerifyBody(t *testing.T, nodeKey string) []byte {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{"NodePublic": nodeKey, "Source": ""})
+	if err != nil {
+		t.Fatalf("marshal verify body: %v", err)
+	}
+	return raw
 }
 
 func aEvalOldVerify(t *testing.T, oldEnf *casbin.Enforcer, casbinWasDisabled bool, u model.User, d model.Device) bool {
@@ -236,7 +280,7 @@ func TestUpgradeKeepsDeviceUserRoleRules(t *testing.T) {
 		t.Fatalf("legacy rule count=%d want=1", legacyCount)
 	}
 
-	eng, err := policy.NewEngine(dbConn, true)
+	eng, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -267,7 +311,7 @@ func TestUpgradeCasbinDisabledBindsAllUnbound(t *testing.T) {
 		}
 	}
 
-	eng, err := policy.NewEngine(dbConn, true)
+	eng, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -300,7 +344,7 @@ func TestUpgradeCasbinDisabledBindsUserWithRoleLackingDefaultGrant(t *testing.T)
 		t.Fatalf("dave roles=%v want=[eu-only standard]", rolesMap[u.ID])
 	}
 
-	eng, err := policy.NewEngine(dbConn, true)
+	eng, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -359,7 +403,7 @@ func TestUpgradeEnforcedLeavesUnboundUserWithDevices(t *testing.T) {
 		t.Fatalf("expected uncovered user's device not to be revoked")
 	}
 
-	eng, err := policy.NewEngine(dbConn, true)
+	eng, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -405,7 +449,7 @@ func TestUpgradeEnforcedLeavesUserWithRoleLackingDefaultGrant(t *testing.T) {
 		t.Fatalf("grace roles=%v want=[eu-only]", rolesMap[u.ID])
 	}
 
-	eng, err := policy.NewEngine(dbConn, true)
+	eng, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -493,7 +537,7 @@ func TestUpgradeEnforcedRevokesDeviceWithoutLegacyRule(t *testing.T) {
 		t.Fatalf("revoked_device_ids=%v want=[%s]", ctxMap["revoked_device_ids"], dMissing.ID)
 	}
 
-	eng, err := policy.NewEngine(dbConn, true)
+	eng, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -558,7 +602,7 @@ func TestUpgradeImportsRolesAndRelays(t *testing.T) {
 		t.Fatalf("ops grants=%v want=[default eu-1]", grants["ops"])
 	}
 
-	eng, err := policy.NewEngine(dbConn, true)
+	eng, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -607,7 +651,7 @@ func TestUpgradeUnmanagedRulesGrantNothing(t *testing.T) {
 	}
 
 	// None of the three devices may be allowed.
-	eng, err := policy.NewEngine(dbConn, true)
+	eng, err := policy.NewEngine(dbConn)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -756,6 +800,109 @@ func TestUpgradeBumpsVersionOnlyWhenChanged(t *testing.T) {
 	})
 }
 
+func TestUpgradeEnforcedRevokesDeviceWithoutLegacyRuleOnOtherRelay(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "upgrade-other-relay.db")
+	dbURL := "sqlite://" + dbPath
+	dbConn, err := db.OpenDatabase(dbURL)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := dbConn.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	if err := db.ApplyMigrations(context.Background(), dbConn, dbURL); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	u := aCreateUser(t, dbConn, "eu-only-owner", false)
+	nkWithLegacy := aNewRealNodeKey(t)
+	nkNoLegacy := aNewRealNodeKey(t)
+	dWithLegacy := aCreateDevice(t, dbConn, u.ID, nkWithLegacy, false)
+	dNoLegacy := aCreateDevice(t, dbConn, u.ID, nkNoLegacy, false)
+
+	// User is NOT covered on default, only bound to role:eu-only granted on eu-1.
+	aInsertRules(t, dbConn,
+		model.CasbinRule{Ptype: "p", V0: "role:eu-only", V1: "derp:eu-1", V2: "connect"},
+		model.CasbinRule{Ptype: "g", V0: policy.UserSubject(u.ID), V1: "role:eu-only"},
+		model.CasbinRule{Ptype: "g", V0: "device:" + nkWithLegacy, V1: policy.UserSubject(u.ID)},
+	)
+
+	logger, logs := aNewObservedLogger()
+	application, err := app.Build(context.Background(), dbConn, config.Config{
+		DatabaseURL:          dbURL,
+		TokenPepper:          "upgrade-pepper",
+		DBTimeout:            5 * time.Second,
+		PolicySyncInterval:   2 * time.Second,
+		VerifyRateLimitRPS:   1000,
+		VerifyRateBurst:      1000,
+		RegisterRateLimitRPS: 1000,
+		RegisterRateBurst:    1000,
+		AdminRateLimitRPS:    1000,
+		AdminRateBurst:       1000,
+	}, logger)
+	if err != nil {
+		t.Fatalf("app.Build: %v", err)
+	}
+	t.Cleanup(application.Close)
+
+	// Device without legacy rule MUST be revoked, audited as system, and denied on eu-1 and default.
+	var reloadedMissing, reloadedLegacy model.Device
+	if err := dbConn.First(&reloadedMissing, "id = ?", dNoLegacy.ID).Error; err != nil {
+		t.Fatalf("reload dNoLegacy: %v", err)
+	}
+	if err := dbConn.First(&reloadedLegacy, "id = ?", dWithLegacy.ID).Error; err != nil {
+		t.Fatalf("reload dWithLegacy: %v", err)
+	}
+	if reloadedMissing.RevokedAt == nil {
+		t.Fatalf("expected device without legacy rule on non-default relay to be revoked")
+	}
+	if reloadedLegacy.RevokedAt != nil {
+		t.Fatalf("device with legacy rule should not be revoked")
+	}
+
+	for _, relay := range []string{"default", "eu-1"} {
+		allow, reason := application.Service.Verify(context.Background(), relay, aBuildVerifyBody(t, nkNoLegacy))
+		if allow || reason != service.DenyReasonRevoked {
+			t.Fatalf("verify missing-legacy device on %s = (%v, %q) want (false, %q)", relay, allow, reason, service.DenyReasonRevoked)
+		}
+	}
+
+	// Device with legacy rule stays allowed on eu-1 and policy-denied on default.
+	if allow, reason := application.Service.Verify(context.Background(), "eu-1", aBuildVerifyBody(t, nkWithLegacy)); !allow {
+		t.Fatalf("verify legacy device on eu-1 = (false, %q) want allow", reason)
+	}
+	if allow, reason := application.Service.Verify(context.Background(), "default", aBuildVerifyBody(t, nkWithLegacy)); allow || reason != service.DenyReasonPolicyDenied {
+		t.Fatalf("verify legacy device on default = (%v, %q) want (false, %q)", allow, reason, service.DenyReasonPolicyDenied)
+	}
+
+	// System audit row recorded the revocation.
+	var audits []model.AdminAuditLog
+	if err := dbConn.Where("actor_key_id IS NULL AND actor_name = ? AND target_id = ?", actor.System.Name, dNoLegacy.ID.String()).Find(&audits).Error; err != nil {
+		t.Fatalf("query system audit: %v", err)
+	}
+	if len(audits) != 1 || audits[0].Action != "device.revoke" {
+		t.Fatalf("expected 1 system device.revoke audit row, got %+v", audits)
+	}
+
+	// Warning log reports both the uncovered user and the revoked device.
+	if logs.Len() < 1 {
+		t.Fatalf("expected upgrade warning log")
+	}
+	foundWarning := false
+	for _, entry := range logs.All() {
+		ctxMap := entry.ContextMap()
+		if ctxMap["revoked_device_count"] == int64(1) && ctxMap["uncovered_user_count"] == int64(1) {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Fatalf("expected warning with revoked_device_count=1 and uncovered_user_count=1, got %v", logs.All())
+	}
+}
+
 func TestUpgradeNeverLoosens(t *testing.T) {
 	type deviceSpec struct {
 		user    string
@@ -767,26 +914,136 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 		disabled bool
 	}
 	type stateCase struct {
-		name  string
-		users []userSpec
-		devs  []deviceSpec
-		// buildRules receives user name -> user.ID so rules can reference exact UUIDs.
-		buildRules func(uIDs map[string]uuid.UUID) []model.CasbinRule
+		name       string
+		users      []userSpec
+		devs       []deviceSpec
+		preRoles   []model.Role
+		preRelays  []model.Relay
+		buildRules func(uIDs map[string]uuid.UUID, devKeys map[string]string) []model.CasbinRule
 	}
 
 	states := []stateCase{
 		{
+			name:  "empty_casbin_rule_empty_db",
+			users: nil,
+			devs:  nil,
+			buildRules: func(map[string]uuid.UUID, map[string]string) []model.CasbinRule {
+				return nil
+			},
+		},
+		{
+			name:  "data_written_while_casbin_disabled_no_rules",
+			users: []userSpec{{name: "u1"}, {name: "u2", disabled: true}},
+			devs: []deviceSpec{
+				{user: "u1", key: "d1"},
+				{user: "u1", key: "d2", revoked: true},
+				{user: "u2", key: "d3"},
+			},
+			buildRules: func(map[string]uuid.UUID, map[string]string) []model.CasbinRule {
+				return nil
+			},
+		},
+		{
+			name:  "standard_default_grant_row_deleted",
+			users: []userSpec{{name: "u-std"}},
+			devs: []deviceSpec{
+				{user: "u-std", key: "std-with-legacy"},
+				{user: "u-std", key: "std-no-legacy"},
+			},
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
+				// Intentionally omit `p, role:standard, derp:default, connect`.
+				return []model.CasbinRule{
+					{Ptype: "g", V0: policy.UserSubject(u["u-std"]), V1: "role:standard"},
+					{Ptype: "g", V0: "device:" + dk["std-with-legacy"], V1: policy.UserSubject(u["u-std"])},
+				}
+			},
+		},
+		{
+			name:  "invalid_role_name_with_default_grant",
+			users: []userSpec{{name: "u-badrole"}},
+			devs: []deviceSpec{
+				{user: "u-badrole", key: "badrole-with-legacy"},
+				{user: "u-badrole", key: "badrole-no-legacy"},
+			},
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
+				return []model.CasbinRule{
+					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
+					{Ptype: "p", V0: "role:Admin", V1: "derp:default", V2: "connect"},
+					{Ptype: "g", V0: policy.UserSubject(u["u-badrole"]), V1: "role:Admin"},
+					{Ptype: "g", V0: "device:" + dk["badrole-with-legacy"], V1: policy.UserSubject(u["u-badrole"])},
+				}
+			},
+		},
+		{
+			name: "preexisting_roles_and_relays_with_all_relays",
+			preRelays: []model.Relay{
+				{Name: "pre-eu"},
+			},
+			preRoles: []model.Role{
+				{Name: "pre-all", AllRelays: true},
+				{Name: "pre-empty", AllRelays: false},
+			},
+			users: []userSpec{{name: "u-all-with-p"}, {name: "u-all-nolegacy"}, {name: "u-pre-empty"}},
+			devs: []deviceSpec{
+				{user: "u-all-with-p", key: "all-ok"},
+				{user: "u-all-with-p", key: "all-missing"},
+				{user: "u-all-nolegacy", key: "all-only-missing"},
+				{user: "u-pre-empty", key: "empty-d1"},
+			},
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
+				return []model.CasbinRule{
+					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
+					{Ptype: "p", V0: "role:pre-all", V1: "derp:default", V2: "connect"},
+					{Ptype: "g", V0: policy.UserSubject(u["u-all-with-p"]), V1: "role:pre-all"},
+					{Ptype: "g", V0: "device:" + dk["all-ok"], V1: policy.UserSubject(u["u-all-with-p"])},
+					{Ptype: "g", V0: policy.UserSubject(u["u-all-nolegacy"]), V1: "role:pre-all"},
+					{Ptype: "g", V0: policy.UserSubject(u["u-pre-empty"]), V1: "role:pre-empty"},
+				}
+			},
+		},
+		{
+			name:  "disabled_user_without_devices",
+			users: []userSpec{{name: "dis-nodev", disabled: true}, {name: "en-withdev"}},
+			devs: []deviceSpec{
+				{user: "en-withdev", key: "en-d1"},
+			},
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
+				return []model.CasbinRule{
+					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
+					{Ptype: "g", V0: policy.UserSubject(u["en-withdev"]), V1: "role:standard"},
+					{Ptype: "g", V0: "device:" + dk["en-d1"], V1: policy.UserSubject(u["en-withdev"])},
+				}
+			},
+		},
+		{
+			name:  "noncanonical_legacy_device_rule_with_canonical_role_binding",
+			users: []userSpec{{name: "u-canon"}},
+			devs: []deviceSpec{
+				{user: "u-canon", key: "canon-upper-legacy"},
+				{user: "u-canon", key: "canon-valid-legacy"},
+			},
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
+				return []model.CasbinRule{
+					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
+					{Ptype: "g", V0: policy.UserSubject(u["u-canon"]), V1: "role:standard"},
+					// Non-canonical uppercase UUID in legacy device rule; canonical role binding above.
+					{Ptype: "g", V0: "device:" + dk["canon-upper-legacy"], V1: "user:" + strings.ToUpper(u["u-canon"].String())},
+					{Ptype: "g", V0: "device:" + dk["canon-valid-legacy"], V1: policy.UserSubject(u["u-canon"])},
+				}
+			},
+		},
+		{
 			name:  "covered_standard_with_and_without_legacy",
 			users: []userSpec{{name: "u1"}},
 			devs: []deviceSpec{
-				{user: "u1", key: "nodekey:c1-with-legacy"},
-				{user: "u1", key: "nodekey:c1-no-legacy"},
+				{user: "u1", key: "c1-with-legacy"},
+				{user: "u1", key: "c1-no-legacy"},
 			},
-			buildRules: func(u map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
 					{Ptype: "g", V0: policy.UserSubject(u["u1"]), V1: "role:standard"},
-					{Ptype: "g", V0: "device:nodekey:c1-with-legacy", V1: policy.UserSubject(u["u1"])},
+					{Ptype: "g", V0: "device:" + dk["c1-with-legacy"], V1: policy.UserSubject(u["u1"])},
 				}
 			},
 		},
@@ -794,18 +1051,16 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			name:  "covered_legacy_points_to_wrong_owner",
 			users: []userSpec{{name: "owner"}, {name: "other"}},
 			devs: []deviceSpec{
-				{user: "owner", key: "nodekey:wrong-owner"},
-				{user: "other", key: "nodekey:other-ok"},
+				{user: "owner", key: "wrong-owner"},
+				{user: "other", key: "other-ok"},
 			},
-			buildRules: func(u map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
 					{Ptype: "g", V0: policy.UserSubject(u["owner"]), V1: "role:standard"},
 					{Ptype: "g", V0: policy.UserSubject(u["other"]), V1: "role:standard"},
-					// Points to "other" instead of "owner" (owner is covered, so if other were uncovered
-					// old Casbin denied it; upgrade MUST revoke owner's device).
-					{Ptype: "g", V0: "device:nodekey:wrong-owner", V1: policy.UserSubject(u["other"])},
-					{Ptype: "g", V0: "device:nodekey:other-ok", V1: policy.UserSubject(u["other"])},
+					{Ptype: "g", V0: "device:" + dk["wrong-owner"], V1: policy.UserSubject(u["other"])},
+					{Ptype: "g", V0: "device:" + dk["other-ok"], V1: policy.UserSubject(u["other"])},
 				}
 			},
 		},
@@ -813,13 +1068,13 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			name:  "covered_legacy_points_to_uncovered_other",
 			users: []userSpec{{name: "covered"}, {name: "uncovered"}},
 			devs: []deviceSpec{
-				{user: "covered", key: "nodekey:wrong-uncovered"},
+				{user: "covered", key: "wrong-uncovered"},
 			},
-			buildRules: func(u map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
 					{Ptype: "g", V0: policy.UserSubject(u["covered"]), V1: "role:standard"},
-					{Ptype: "g", V0: "device:nodekey:wrong-uncovered", V1: policy.UserSubject(u["uncovered"])},
+					{Ptype: "g", V0: "device:" + dk["wrong-uncovered"], V1: policy.UserSubject(u["uncovered"])},
 				}
 			},
 		},
@@ -827,13 +1082,13 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			name:  "unbound_user_with_devices_and_unbound_without_devices",
 			users: []userSpec{{name: "with-dev"}, {name: "no-dev"}},
 			devs: []deviceSpec{
-				{user: "with-dev", key: "nodekey:unbound-1"},
-				{user: "with-dev", key: "nodekey:unbound-2", revoked: true},
+				{user: "with-dev", key: "unbound-1"},
+				{user: "with-dev", key: "unbound-2", revoked: true},
 			},
-			buildRules: func(u map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
-					{Ptype: "g", V0: "device:nodekey:unbound-1", V1: policy.UserSubject(u["with-dev"])},
+					{Ptype: "g", V0: "device:" + dk["unbound-1"], V1: policy.UserSubject(u["with-dev"])},
 				}
 			},
 		},
@@ -841,9 +1096,9 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			name:  "unbound_user_with_only_revoked_device",
 			users: []userSpec{{name: "only-revoked"}},
 			devs: []deviceSpec{
-				{user: "only-revoked", key: "nodekey:revoked-only", revoked: true},
+				{user: "only-revoked", key: "revoked-only", revoked: true},
 			},
-			buildRules: func(_ map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(_ map[string]uuid.UUID, _ map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
 				}
@@ -853,15 +1108,15 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			name:  "role_lacking_default_grant_eu_only",
 			users: []userSpec{{name: "eu-user"}},
 			devs: []deviceSpec{
-				{user: "eu-user", key: "nodekey:eu-1"},
-				{user: "eu-user", key: "nodekey:eu-2"},
+				{user: "eu-user", key: "eu-1"},
+				{user: "eu-user", key: "eu-2"},
 			},
-			buildRules: func(u map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
 					{Ptype: "p", V0: "role:eu-only", V1: "derp:eu-1", V2: "connect"},
 					{Ptype: "g", V0: policy.UserSubject(u["eu-user"]), V1: "role:eu-only"},
-					{Ptype: "g", V0: "device:nodekey:eu-1", V1: policy.UserSubject(u["eu-user"])},
+					{Ptype: "g", V0: "device:" + dk["eu-1"], V1: policy.UserSubject(u["eu-user"])},
 				}
 			},
 		},
@@ -869,13 +1124,13 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			name:  "role_with_no_grants",
 			users: []userSpec{{name: "empty-role-user"}},
 			devs: []deviceSpec{
-				{user: "empty-role-user", key: "nodekey:empty-role-1"},
+				{user: "empty-role-user", key: "empty-role-1"},
 			},
-			buildRules: func(u map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
 					{Ptype: "g", V0: policy.UserSubject(u["empty-role-user"]), V1: "role:empty"},
-					{Ptype: "g", V0: "device:nodekey:empty-role-1", V1: policy.UserSubject(u["empty-role-user"])},
+					{Ptype: "g", V0: "device:" + dk["empty-role-1"], V1: policy.UserSubject(u["empty-role-user"])},
 				}
 			},
 		},
@@ -883,15 +1138,15 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			name:  "custom_role_with_default_grant",
 			users: []userSpec{{name: "ops-user"}},
 			devs: []deviceSpec{
-				{user: "ops-user", key: "nodekey:ops-with-legacy"},
-				{user: "ops-user", key: "nodekey:ops-no-legacy"},
+				{user: "ops-user", key: "ops-with-legacy"},
+				{user: "ops-user", key: "ops-no-legacy"},
 			},
-			buildRules: func(u map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
 					{Ptype: "p", V0: "role:ops", V1: "derp:default", V2: "connect"},
 					{Ptype: "g", V0: policy.UserSubject(u["ops-user"]), V1: "role:ops"},
-					{Ptype: "g", V0: "device:nodekey:ops-with-legacy", V1: policy.UserSubject(u["ops-user"])},
+					{Ptype: "g", V0: "device:" + dk["ops-with-legacy"], V1: policy.UserSubject(u["ops-user"])},
 				}
 			},
 		},
@@ -899,19 +1154,19 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			name:  "disabled_users_and_revoked_devices",
 			users: []userSpec{{name: "dis-cov", disabled: true}, {name: "dis-uncov", disabled: true}, {name: "en-cov"}},
 			devs: []deviceSpec{
-				{user: "dis-cov", key: "nodekey:dis-cov-legacy"},
-				{user: "dis-cov", key: "nodekey:dis-cov-nolegacy"},
-				{user: "dis-uncov", key: "nodekey:dis-uncov-1"},
-				{user: "en-cov", key: "nodekey:en-cov-revoked-legacy", revoked: true},
-				{user: "en-cov", key: "nodekey:en-cov-revoked-nolegacy", revoked: true},
+				{user: "dis-cov", key: "dis-cov-legacy"},
+				{user: "dis-cov", key: "dis-cov-nolegacy"},
+				{user: "dis-uncov", key: "dis-uncov-1"},
+				{user: "en-cov", key: "en-cov-revoked-legacy", revoked: true},
+				{user: "en-cov", key: "en-cov-revoked-nolegacy", revoked: true},
 			},
-			buildRules: func(u map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
 					{Ptype: "g", V0: policy.UserSubject(u["dis-cov"]), V1: "role:standard"},
-					{Ptype: "g", V0: "device:nodekey:dis-cov-legacy", V1: policy.UserSubject(u["dis-cov"])},
+					{Ptype: "g", V0: "device:" + dk["dis-cov-legacy"], V1: policy.UserSubject(u["dis-cov"])},
 					{Ptype: "g", V0: policy.UserSubject(u["en-cov"]), V1: "role:standard"},
-					{Ptype: "g", V0: "device:nodekey:en-cov-revoked-legacy", V1: policy.UserSubject(u["en-cov"])},
+					{Ptype: "g", V0: "device:" + dk["en-cov-revoked-legacy"], V1: policy.UserSubject(u["en-cov"])},
 				}
 			},
 		},
@@ -919,17 +1174,17 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			name:  "direct_device_and_user_rules_and_direct_device_to_role",
 			users: []userSpec{{name: "u-dir-dev"}, {name: "u-dir-user"}, {name: "u-dev-role"}},
 			devs: []deviceSpec{
-				{user: "u-dir-dev", key: "nodekey:dir-dev"},
-				{user: "u-dir-user", key: "nodekey:dir-user"},
-				{user: "u-dev-role", key: "nodekey:dev-role"},
+				{user: "u-dir-dev", key: "dir-dev"},
+				{user: "u-dir-user", key: "dir-user"},
+				{user: "u-dev-role", key: "dev-role"},
 			},
-			buildRules: func(u map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
-					{Ptype: "p", V0: "device:nodekey:dir-dev", V1: "derp:default", V2: "connect"},
-					{Ptype: "g", V0: "device:nodekey:dir-user", V1: policy.UserSubject(u["u-dir-user"])},
+					{Ptype: "p", V0: "device:" + dk["dir-dev"], V1: "derp:default", V2: "connect"},
+					{Ptype: "g", V0: "device:" + dk["dir-user"], V1: policy.UserSubject(u["u-dir-user"])},
 					{Ptype: "p", V0: policy.UserSubject(u["u-dir-user"]), V1: "derp:default", V2: "connect"},
-					{Ptype: "g", V0: "device:nodekey:dev-role", V1: "role:standard"},
+					{Ptype: "g", V0: "device:" + dk["dev-role"], V1: "role:standard"},
 				}
 			},
 		},
@@ -937,28 +1192,28 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			name:  "stored_wildcard_role_inherit_wrong_action_noncanonical_uuid",
 			users: []userSpec{{name: "u-wild"}, {name: "u-inh"}, {name: "u-act"}, {name: "u-upper"}},
 			devs: []deviceSpec{
-				{user: "u-wild", key: "nodekey:wild-d"},
-				{user: "u-inh", key: "nodekey:inh-d"},
-				{user: "u-act", key: "nodekey:act-d"},
-				{user: "u-upper", key: "nodekey:upper-d"},
+				{user: "u-wild", key: "wild-d"},
+				{user: "u-inh", key: "inh-d"},
+				{user: "u-act", key: "act-d"},
+				{user: "u-upper", key: "upper-d"},
 			},
-			buildRules: func(u map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
-					{Ptype: "g", V0: "device:nodekey:wild-d", V1: policy.UserSubject(u["u-wild"])},
+					{Ptype: "g", V0: "device:" + dk["wild-d"], V1: policy.UserSubject(u["u-wild"])},
 					{Ptype: "g", V0: policy.UserSubject(u["u-wild"]), V1: "role:wild"},
 					{Ptype: "p", V0: "role:wild", V1: "derp:*", V2: "connect"},
 
-					{Ptype: "g", V0: "device:nodekey:inh-d", V1: policy.UserSubject(u["u-inh"])},
+					{Ptype: "g", V0: "device:" + dk["inh-d"], V1: policy.UserSubject(u["u-inh"])},
 					{Ptype: "g", V0: policy.UserSubject(u["u-inh"]), V1: "role:a"},
 					{Ptype: "g", V0: "role:a", V1: "role:b"},
 					{Ptype: "p", V0: "role:b", V1: "derp:default", V2: "connect"},
 
-					{Ptype: "g", V0: "device:nodekey:act-d", V1: policy.UserSubject(u["u-act"])},
+					{Ptype: "g", V0: "device:" + dk["act-d"], V1: policy.UserSubject(u["u-act"])},
 					{Ptype: "g", V0: policy.UserSubject(u["u-act"]), V1: "role:otheract"},
 					{Ptype: "p", V0: "role:otheract", V1: "derp:default", V2: "admin"},
 
-					{Ptype: "g", V0: "device:nodekey:upper-d", V1: "user:" + strings.ToUpper(u["u-upper"].String())},
+					{Ptype: "g", V0: "device:" + dk["upper-d"], V1: "user:" + strings.ToUpper(u["u-upper"].String())},
 					{Ptype: "g", V0: "user:" + strings.ToUpper(u["u-upper"].String()), V1: "role:standard"},
 				}
 			},
@@ -967,13 +1222,13 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 			name:  "extra_v2_on_legacy_device_rule_does_not_bypass_revocation",
 			users: []userSpec{{name: "u-extra"}},
 			devs: []deviceSpec{
-				{user: "u-extra", key: "nodekey:extra-v2"},
+				{user: "u-extra", key: "extra-v2"},
 			},
-			buildRules: func(u map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
 					{Ptype: "g", V0: policy.UserSubject(u["u-extra"]), V1: "role:standard"},
-					{Ptype: "g", V0: "device:nodekey:extra-v2", V1: policy.UserSubject(u["u-extra"]), V2: "extra"},
+					{Ptype: "g", V0: "device:" + dk["extra-v2"], V1: policy.UserSubject(u["u-extra"]), V2: "extra"},
 				}
 			},
 		},
@@ -990,20 +1245,21 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 				{name: "wild-unmanaged"},
 			},
 			devs: []deviceSpec{
-				{user: "normal", key: "nodekey:mix-normal-1"},
-				{user: "normal", key: "nodekey:mix-normal-2"},
-				{user: "partial-legacy", key: "nodekey:mix-part-ok"},
-				{user: "partial-legacy", key: "nodekey:mix-part-missing"},
-				{user: "partial-legacy", key: "nodekey:mix-part-revoked", revoked: true},
-				{user: "unbound-with-dev", key: "nodekey:mix-unbound-1"},
-				{user: "eu-only", key: "nodekey:mix-eu-1"},
-				{user: "ops-default", key: "nodekey:mix-ops-ok"},
-				{user: "ops-default", key: "nodekey:mix-ops-missing"},
-				{user: "disabled-covered", key: "nodekey:mix-dis-ok"},
-				{user: "disabled-covered", key: "nodekey:mix-dis-missing"},
-				{user: "wild-unmanaged", key: "nodekey:mix-wild-1"},
+				{user: "normal", key: "mix-normal-1"},
+				{user: "normal", key: "mix-normal-2"},
+				{user: "partial-legacy", key: "mix-part-ok"},
+				{user: "partial-legacy", key: "mix-part-missing"},
+				{user: "partial-legacy", key: "mix-part-revoked", revoked: true},
+				{user: "unbound-with-dev", key: "mix-unbound-1"},
+				{user: "eu-only", key: "mix-eu-1"},
+				{user: "eu-only", key: "mix-eu-missing"},
+				{user: "ops-default", key: "mix-ops-ok"},
+				{user: "ops-default", key: "mix-ops-missing"},
+				{user: "disabled-covered", key: "mix-dis-ok"},
+				{user: "disabled-covered", key: "mix-dis-missing"},
+				{user: "wild-unmanaged", key: "mix-wild-1"},
 			},
-			buildRules: func(u map[string]uuid.UUID) []model.CasbinRule {
+			buildRules: func(u map[string]uuid.UUID, dk map[string]string) []model.CasbinRule {
 				return []model.CasbinRule{
 					{Ptype: "p", V0: "role:standard", V1: "derp:default", V2: "connect"},
 					{Ptype: "p", V0: "role:eu-only", V1: "derp:eu-1", V2: "connect"},
@@ -1011,25 +1267,25 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 					{Ptype: "p", V0: "role:wild", V1: "derp:*", V2: "connect"},
 
 					{Ptype: "g", V0: policy.UserSubject(u["normal"]), V1: "role:standard"},
-					{Ptype: "g", V0: "device:nodekey:mix-normal-1", V1: policy.UserSubject(u["normal"])},
-					{Ptype: "g", V0: "device:nodekey:mix-normal-2", V1: policy.UserSubject(u["normal"])},
+					{Ptype: "g", V0: "device:" + dk["mix-normal-1"], V1: policy.UserSubject(u["normal"])},
+					{Ptype: "g", V0: "device:" + dk["mix-normal-2"], V1: policy.UserSubject(u["normal"])},
 
 					{Ptype: "g", V0: policy.UserSubject(u["partial-legacy"]), V1: "role:standard"},
-					{Ptype: "g", V0: "device:nodekey:mix-part-ok", V1: policy.UserSubject(u["partial-legacy"])},
+					{Ptype: "g", V0: "device:" + dk["mix-part-ok"], V1: policy.UserSubject(u["partial-legacy"])},
 
-					{Ptype: "g", V0: "device:nodekey:mix-unbound-1", V1: policy.UserSubject(u["unbound-with-dev"])},
+					{Ptype: "g", V0: "device:" + dk["mix-unbound-1"], V1: policy.UserSubject(u["unbound-with-dev"])},
 
 					{Ptype: "g", V0: policy.UserSubject(u["eu-only"]), V1: "role:eu-only"},
-					{Ptype: "g", V0: "device:nodekey:mix-eu-1", V1: policy.UserSubject(u["eu-only"])},
+					{Ptype: "g", V0: "device:" + dk["mix-eu-1"], V1: policy.UserSubject(u["eu-only"])},
 
 					{Ptype: "g", V0: policy.UserSubject(u["ops-default"]), V1: "role:ops"},
-					{Ptype: "g", V0: "device:nodekey:mix-ops-ok", V1: policy.UserSubject(u["ops-default"])},
+					{Ptype: "g", V0: "device:" + dk["mix-ops-ok"], V1: policy.UserSubject(u["ops-default"])},
 
 					{Ptype: "g", V0: policy.UserSubject(u["disabled-covered"]), V1: "role:standard"},
-					{Ptype: "g", V0: "device:nodekey:mix-dis-ok", V1: policy.UserSubject(u["disabled-covered"])},
+					{Ptype: "g", V0: "device:" + dk["mix-dis-ok"], V1: policy.UserSubject(u["disabled-covered"])},
 
 					{Ptype: "g", V0: policy.UserSubject(u["wild-unmanaged"]), V1: "role:wild"},
-					{Ptype: "g", V0: "device:nodekey:mix-wild-1", V1: policy.UserSubject(u["wild-unmanaged"])},
+					{Ptype: "g", V0: "device:" + dk["mix-wild-1"], V1: policy.UserSubject(u["wild-unmanaged"])},
 				}
 			},
 		},
@@ -1048,7 +1304,30 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 		beforeDeniedTotal := 0
 		for _, tc := range states {
 			t.Run(mode.name+"/"+tc.name, func(t *testing.T) {
-				dbConn := aOpenDB(t)
+				dbURL := "sqlite://" + filepath.Join(t.TempDir(), "upgrade.db")
+				dbConn, err := db.OpenDatabase(dbURL)
+				if err != nil {
+					t.Fatalf("open db: %v", err)
+				}
+				t.Cleanup(func() {
+					if sqlDB, err := dbConn.DB(); err == nil {
+						_ = sqlDB.Close()
+					}
+				})
+				if err := db.ApplyMigrations(context.Background(), dbConn, dbURL); err != nil {
+					t.Fatalf("apply migrations: %v", err)
+				}
+
+				for _, r := range tc.preRelays {
+					if err := dbConn.Create(&r).Error; err != nil {
+						t.Fatalf("seed pre-relay %s: %v", r.Name, err)
+					}
+				}
+				for _, r := range tc.preRoles {
+					if err := dbConn.Create(&r).Error; err != nil {
+						t.Fatalf("seed pre-role %s: %v", r.Name, err)
+					}
+				}
 
 				usersByName := make(map[string]model.User, len(tc.users))
 				userIDs := make(map[string]uuid.UUID, len(tc.users))
@@ -1058,17 +1337,33 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 					userIDs[us.name] = u.ID
 				}
 
+				devKeys := make(map[string]string, len(tc.devs))
 				devs := make([]model.Device, 0, len(tc.devs))
 				for _, ds := range tc.devs {
-					d := aCreateDevice(t, dbConn, userIDs[ds.user], ds.key, ds.revoked)
+					realNK := aNewRealNodeKey(t)
+					devKeys[ds.key] = realNK
+					d := aCreateDevice(t, dbConn, userIDs[ds.user], realNK, ds.revoked)
 					devs = append(devs, d)
 				}
 
-				rules := tc.buildRules(userIDs)
+				rules := tc.buildRules(userIDs, devKeys)
 				aInsertRules(t, dbConn, rules...)
 
+				hasCanonicalLegacyRule := make(map[uuid.UUID]bool, len(devs))
+				for _, d := range devs {
+					wantV0 := "device:" + d.NodeKey
+					wantV1 := policy.UserSubject(d.UserID)
+					for _, r := range rules {
+						if r.Ptype == "g" && r.V0 == wantV0 && r.V1 == wantV1 &&
+							r.V2 == "" && r.V3 == "" && r.V4 == "" && r.V5 == "" {
+							hasCanonicalLegacyRule[d.ID] = true
+							break
+						}
+					}
+				}
+
 				// Compute BEFORE decisions using the REAL OLD Casbin model over raw casbin_rule rows.
-				oldEnf := aBuildOldEnforcer(t, dbConn)
+				oldEnf := aBuildOldEnforcer(t, dbConn, mode.casbinWasDisabled)
 				before := make(map[uuid.UUID]bool, len(devs))
 				for _, d := range devs {
 					var owner model.User
@@ -1087,25 +1382,51 @@ func TestUpgradeNeverLoosens(t *testing.T) {
 					}
 				}
 
-				// Run startup sequence: SeedBuiltins -> RunUpgrade -> NewEngine/Reload.
-				aSeedBuiltins(t, dbConn)
-				if err := policy.RunUpgrade(context.Background(), dbConn, mode.casbinWasDisabled, zap.NewNop()); err != nil {
-					t.Fatalf("RunUpgrade: %v", err)
-				}
-				eng, err := policy.NewEngine(dbConn, true)
+				// Run the real application startup (migrations -> SeedBuiltins -> RunUpgrade -> Reload)
+				// and evaluate AFTER decisions through real Service.Verify.
+				application, err := app.Build(context.Background(), dbConn, config.Config{
+					DatabaseURL:          dbURL,
+					TokenPepper:          "upgrade-test-pepper",
+					LegacyCasbinDisabled: mode.casbinWasDisabled,
+					DBTimeout:            5 * time.Second,
+					PolicySyncInterval:   2 * time.Second,
+					VerifyRateLimitRPS:   1000,
+					VerifyRateBurst:      1000,
+					RegisterRateLimitRPS: 1000,
+					RegisterRateBurst:    1000,
+					AdminRateLimitRPS:    1000,
+					AdminRateBurst:       1000,
+				}, zap.NewNop())
 				if err != nil {
-					t.Fatalf("NewEngine: %v", err)
+					t.Fatalf("app.Build: %v", err)
+				}
+				t.Cleanup(application.Close)
+
+				var registeredRelays []model.Relay
+				if err := dbConn.Order("name asc").Find(&registeredRelays).Error; err != nil {
+					t.Fatalf("list registered relays: %v", err)
 				}
 
-				// Compare AFTER decision for every device: must NEVER loosen (false -> true).
+				// Compare AFTER decision for every device via Service.Verify: must NEVER loosen (false -> true).
 				for _, d := range devs {
-					after := aEvalNewVerify(t, dbConn, eng, d.ID)
-					if !before[d.ID] && after {
+					body := aBuildVerifyBody(t, d.NodeKey)
+					afterDefault, _ := application.Service.Verify(context.Background(), policy.BuiltinRelay, body)
+					if !before[d.ID] && afterDefault {
 						t.Errorf("upgrade loosened access for device %s (key=%s): before=DENY after=ALLOW", d.ID, d.NodeKey)
 					}
-					// In casbin_disabled mode, every device allowed before must remain allowed after.
-					if mode.casbinWasDisabled && before[d.ID] && !after {
+					// In casbin_disabled mode, every device allowed before must remain allowed after on default.
+					if mode.casbinWasDisabled && before[d.ID] && !afterDefault {
 						t.Errorf("casbin_disabled upgrade unexpectedly denied device %s (key=%s): before=ALLOW after=DENY", d.ID, d.NodeKey)
+					}
+					// A2: in enforced mode, every device denied before because it had no canonical legacy rule
+					// must stay denied on EVERY registered relay after the upgrade.
+					if !mode.casbinWasDisabled && !before[d.ID] && !hasCanonicalLegacyRule[d.ID] {
+						for _, relay := range registeredRelays {
+							afterRelay, _ := application.Service.Verify(context.Background(), relay.Name, body)
+							if afterRelay {
+								t.Errorf("device %s without legacy rule was allowed on relay %q after enforced upgrade", d.ID, relay.Name)
+							}
+						}
 					}
 				}
 			})

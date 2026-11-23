@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"derp-admit/internel/app/derp_admit/actor"
+	"derp-admit/internel/app/derp_admit/page"
 	"derp-admit/internel/app/derp_admit/service"
 
 	"github.com/gin-gonic/gin"
@@ -232,11 +233,8 @@ func lifecycleRoutes() []adminRoute {
 			MinTier: actor.TierViewer,
 			Handle: func(d adminDeps) gin.HandlerFunc {
 				return func(c *gin.Context) {
-					pg, ok := pageParams(c, "devices")
-					if !ok {
-						return
-					}
 					var userID *uuid.UUID
+					filters := map[string]string{}
 					if raw := strings.TrimSpace(c.Query("userId")); raw != "" {
 						parsed, err := uuid.Parse(raw)
 						if err != nil {
@@ -244,6 +242,11 @@ func lifecycleRoutes() []adminRoute {
 							return
 						}
 						userID = &parsed
+						filters["userId"] = parsed.String()
+					}
+					pg, ok := pageParams(c, page.ListKey("devices", filters))
+					if !ok {
+						return
 					}
 					devices, nextCursor, err := d.svc.ListDevices(c.Request.Context(), userID, pg)
 					if err != nil {

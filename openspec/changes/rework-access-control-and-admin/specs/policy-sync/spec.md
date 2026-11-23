@@ -41,15 +41,30 @@ Each instance MUST check the stored policy version every `POLICY_SYNC_INTERVAL` 
 - **WHEN** the stored policy version has not changed since the instance's last check
 - **THEN** the instance keeps its policy snapshot and cached decisions
 
+### Requirement: Catching up does not deny
+While an instance is reloading because it saw a newer stored version, it MUST keep answering `/verify` from its current snapshot, and `/readyz` MUST keep returning HTTP `200`. Catching up MUST NOT by itself make the instance stale. It becomes stale only when the reload fails or when the rule in "An instance that cannot confirm it is current fails closed" applies.
+
+#### Scenario: Verify during catch-up
+- **WHEN** an instance has seen a newer stored version and its reload has not yet completed
+- **THEN** `POST /verify` is answered from the instance's current snapshot rather than denied with `internal error`, and `/readyz` returns HTTP `200`
+
 ### Requirement: Policy sync interval is configurable
-The system MUST read `POLICY_SYNC_INTERVAL` as a duration with default `2s`, and MUST fail configuration loading when it does not parse or is not greater than zero.
+The system MUST read `POLICY_SYNC_INTERVAL` as a duration with default `2s` and a minimum of `100ms`, and MUST fail configuration loading when it does not parse or is below `100ms`, including zero and negative values.
 
 #### Scenario: Interval is not valid
 - **WHEN** configuration is loaded with `POLICY_SYNC_INTERVAL` set to `0s` or to `soon`
 - **THEN** configuration loading fails with an error
 
+#### Scenario: Interval is below the minimum
+- **WHEN** configuration is loaded with `POLICY_SYNC_INTERVAL` set to `99ms`, `1ns` or `-1s`
+- **THEN** configuration loading fails with an error
+
+#### Scenario: Interval at the minimum
+- **WHEN** configuration is loaded with `POLICY_SYNC_INTERVAL` set to `100ms`
+- **THEN** configuration loading succeeds with an interval of `100ms`
+
 ### Requirement: An instance that cannot confirm it is current fails closed
-When an instance has gone longer than three sync intervals without a successful version check, `/readyz` MUST return HTTP `503`. Every `/verify` request that it would otherwise evaluate, including one that would be answered from the cache, MUST be denied with `DenyReason="internal error"` and audited. This MUST last until a check succeeds and any needed reload has completed.
+When an instance has gone longer than three sync intervals without a successful version check, `/readyz` MUST return HTTP `503`. Every `/verify` request that it would otherwise evaluate, including one that would be answered from the cache, MUST be denied with `DenyReason="internal error"` and audited. This MUST last until a check succeeds and any needed reload has completed. The three intervals MUST be measured as elapsed time, unaffected by adjustments of the wall clock.
 
 #### Scenario: Database unreachable for the policy check
 - **WHEN** an instance's version checks have failed for longer than three sync intervals
@@ -58,6 +73,10 @@ When an instance has gone longer than three sync intervals without a successful 
 #### Scenario: Check succeeds again
 - **WHEN** a version check succeeds after such a period and any reload it needs has completed
 - **THEN** `/readyz` returns HTTP `200` again and `/verify` is evaluated normally
+
+#### Scenario: Wall clock is set back or forward
+- **WHEN** the system wall clock is adjusted by more than three sync intervals while version checks keep succeeding
+- **THEN** the instance does not become stale, and `/readyz` keeps returning HTTP `200`
 
 ### Requirement: Policy is provisioned only through the admin API
 The admin API MUST be the only supported way to create or change roles, grants, bindings and relays. Rows changed directly in the database MUST be applied by a running instance no later than its next restart, and are not required to be applied earlier.

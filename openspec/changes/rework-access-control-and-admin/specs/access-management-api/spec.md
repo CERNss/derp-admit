@@ -16,11 +16,15 @@ Role and relay names MUST match `^[a-z0-9][a-z0-9-]{0,62}$`. A create request wi
 - **THEN** the relay is created
 
 ### Requirement: Admin API manages relays
-The system MUST provide `POST /admin/relays` with `name` and optional `description`, `GET /admin/relays`, and `DELETE /admin/relays/:name`. Deleting a relay MUST also remove every grant that names it.
+The system MUST provide `POST /admin/relays` with `name` and optional `description`, `GET /admin/relays`, and `DELETE /admin/relays/:name`. Deleting a relay MUST also remove every grant that names it. How a new relay starts is defined in "A role or relay created through the API starts clean". When a relay is deleted while another request grants a role on it, afterwards no grant MUST name a relay that is not registered.
 
 #### Scenario: Relay is created
 - **WHEN** `POST /admin/relays` is called with a new valid `name`
 - **THEN** the service returns HTTP `201` with the relay's name, description and `createdAt`
+
+#### Scenario: Relay is deleted while a role is granted on it
+- **WHEN** `DELETE /admin/relays/eu-1` and `PUT /admin/roles/ops/relays` with `["eu-1"]` run concurrently
+- **THEN** afterwards either relay `eu-1` is registered or no grant names `derp:eu-1`
 
 #### Scenario: Relay name is taken
 - **WHEN** `POST /admin/relays` is called with the name of an existing relay
@@ -39,7 +43,7 @@ The system MUST provide `POST /admin/relays` with `name` and optional `descripti
 - **THEN** the service returns HTTP `404`
 
 ### Requirement: Admin API manages roles and their grants
-The system MUST provide `POST /admin/roles` with `name`, optional `description` and optional `relays`, `GET /admin/roles`, and `PUT /admin/roles/:name/relays` with `relays`, which replaces the role's grants. A `relays` entry is either the name of an existing relay or `*`, which means all relays and MUST be the only entry when present.
+The system MUST provide `POST /admin/roles` with `name`, optional `description` and optional `relays`, `GET /admin/roles`, and `PUT /admin/roles/:name/relays` with `relays`, which replaces the role's grants. A `relays` entry is either the name of an existing relay or `*`, which means all relays and MUST be the only entry when present. How a new role starts is defined in "A role or relay created through the API starts clean".
 
 #### Scenario: Role is created with grants
 - **WHEN** `POST /admin/roles` is called with a new valid `name` and `relays` set to `["default"]`
@@ -77,12 +81,35 @@ The system MUST provide `POST /admin/roles` with `name`, optional `description` 
 - **WHEN** `PUT /admin/roles/:name/relays` or `DELETE /admin/roles/:name` is called with a name that matches no role
 - **THEN** the service returns HTTP `404`
 
+### Requirement: A role or relay created through the API starts clean
+`POST /admin/roles` MUST remove every leftover rule that names the new role as `role:<name>`, before it writes the requested grants. `POST /admin/relays` MUST remove every leftover grant that names the new relay as `derp:<name>`. Both MUST do so in the same transaction as the creation, and the admin audit row's summary MUST report how many rules were removed. This does not apply to the one-time upgrade's import.
+
+#### Scenario: Role is created over leftover rules
+- **WHEN** `casbin_rule` holds `g, user:<id>, role:ops` and `p, role:ops, derp:default, connect`, role `ops` is not registered, and `POST /admin/roles` is called with the name `ops` and no `relays`
+- **THEN** the role is created with no grants and no bindings, both leftover rules no longer exist, the user is not bound to `ops`, and the admin audit row's summary reports two removed rules
+
+#### Scenario: Relay is created over a leftover grant
+- **WHEN** `casbin_rule` holds `p, role:ops, derp:eu-2, connect`, relay `eu-2` is not registered, and `POST /admin/relays` is called with the name `eu-2`
+- **THEN** the relay is created, the leftover rule no longer exists, users bound to `ops` are denied on `POST /verify/eu-2`, and the admin audit row's summary reports one removed rule
+
+#### Scenario: Upgrade import keeps existing rules
+- **WHEN** the one-time upgrade adds role `ops` and relay `eu-1` to the registries from existing rules
+- **THEN** no rule naming `role:ops` or `derp:eu-1` is removed
+
 ### Requirement: Deleting a role removes its grants and bindings
-`DELETE /admin/roles/:name` MUST remove the role, its grants and every user binding to it, and MUST report how many bindings it removed.
+`DELETE /admin/roles/:name` MUST remove the role, its grants and every user binding to it, and MUST report how many bindings it removed. When a role is deleted while another request binds a user to it, creates a user bound to it or replaces its grants, afterwards no rule MUST name a role that is not registered.
 
 #### Scenario: Role with bound users is deleted
 - **WHEN** `DELETE /admin/roles/:name` is called for a role that is not built in and that three users are bound to
 - **THEN** the service returns HTTP `200` with the count `3`, and none of those users is bound to the role
+
+#### Scenario: Role is deleted while a user is bound to it
+- **WHEN** `DELETE /admin/roles/ops` and `PUT /admin/users/:id/roles` with `["ops"]` run concurrently
+- **THEN** afterwards either role `ops` is registered or no rule names `role:ops`
+
+#### Scenario: Role is deleted while its grants are replaced
+- **WHEN** `DELETE /admin/roles/ops` and `PUT /admin/roles/ops/relays` with `["default"]` run concurrently
+- **THEN** afterwards either role `ops` is registered or no grant names `role:ops`
 
 ### Requirement: Built-in role and relay cannot be deleted
 The relay `default` and the role `standard` MUST NOT be deletable. The grants of `standard` MUST remain editable.

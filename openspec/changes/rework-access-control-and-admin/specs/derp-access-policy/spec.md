@@ -123,6 +123,17 @@ No device that `POST /verify` denied immediately before the one-time upgrade MUS
 - **WHEN** a deployment that ran with `ENABLE_CASBIN=false` removes the setting before the first start of this version
 - **THEN** the upgrade treats policy as enforced before the upgrade and applies the enforced rules
 
+### Requirement: One-time upgrade keeps unregistered devices denied on every relay
+When policy was enforced before the upgrade, the upgrade MUST revoke and report every non-revoked device that has no `g, device:<node_key>, user:<owner id>` rule naming its owner, whenever that owner, after the import, has a managed binding to a role with a grant on any relay, named or all relays. Devices of a user with no such grant MUST be left as they are. A device that was never properly registered therefore stays denied on every relay, not only on `default`.
+
+#### Scenario: Enforced, user covered only on another relay, device without legacy device rule
+- **WHEN** policy was enforced before the upgrade, a user's only binding is `g, user:<id>, role:ops`, the only grant of `ops` is `p, role:ops, derp:eu-1, connect`, and one of the user's non-revoked devices has no `g, device:<node_key>, user:<owner id>` rule naming that user
+- **THEN** the upgrade sets the device's `revoked_at` and reports it, so `POST /verify/eu-1` denies it with `revoked`; the user's bindings are left as they are and the user is reported as not covered on `default`
+
+#### Scenario: Enforced, user without any grant keeps devices without legacy device rule
+- **WHEN** policy was enforced before the upgrade, a user has no managed binding to a role with a grant on any relay, and one of the user's non-revoked devices has no legacy device rule
+- **THEN** the upgrade does not revoke that device
+
 ### Requirement: One-time upgrade imports roles and relays from existing rules
 The upgrade MUST add to the role registry every name that matches the role name format and appears in a `g, user:<uuid>, role:<name>` or `p, role:<name>, derp:<relay>, connect` rule. It MUST add to the relay registry every relay name that matches the name format in such a `p` rule. Those rules then keep working.
 

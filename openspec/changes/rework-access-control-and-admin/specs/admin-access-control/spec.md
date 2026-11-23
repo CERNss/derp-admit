@@ -31,7 +31,7 @@ Every `/admin` request MUST carry `Authorization: Bearer <key>`, where the key b
 - **THEN** the request is processed and the key's `last_used_at` is set to the current time
 
 ### Requirement: Admin keys are generated server-side and stored only as a hash
-The system MUST generate admin keys from 32 random bytes, encoded as base64url and prefixed with `dak_`. It MUST return the plaintext only in the response that creates the key. It MUST store only `hex(sha256(key + ":" + TOKEN_PEPPER))`, and MUST NOT write the plaintext to logs, audit rows or any database field.
+The system MUST generate admin keys from 32 random bytes, encoded as base64url and prefixed with `dak_`. It MUST return the plaintext only in the response that creates the key. It MUST store only `hex(sha256(key + ":" + TOKEN_PEPPER))`, and MUST NOT write the plaintext to logs, audit rows or any database field. Reserved names are defined in "Admin key names bootstrap and system are reserved".
 
 #### Scenario: Key is created
 - **WHEN** an `admin`-tier caller calls `POST /admin/keys` with a unique non-blank `name`, a `tier` of `viewer`, `operator` or `admin`, and an optional `expiresAt`
@@ -60,6 +60,17 @@ The system MUST generate admin keys from 32 random bytes, encoded as base64url a
 #### Scenario: Key id is unknown or malformed
 - **WHEN** `POST /admin/keys/:id/revoke` is called with an id that is not a UUID, or a UUID that matches no key
 - **THEN** the service returns HTTP `400` for a malformed id and HTTP `404` for an unknown one
+
+### Requirement: Admin key names bootstrap and system are reserved
+The names `bootstrap` and `system` MUST be reserved for admin keys, compared case-insensitively after trimming surrounding whitespace. `POST /admin/keys` with either name MUST return HTTP `409` and create no key. `system` is the actor name of startup audit rows.
+
+#### Scenario: Key name system is reserved
+- **WHEN** `POST /admin/keys` is called with `name` set to `system`
+- **THEN** the service returns HTTP `409` and creates no key
+
+#### Scenario: Reserved name in another case or with surrounding whitespace
+- **WHEN** `POST /admin/keys` is called with `name` set to `Bootstrap`, `SYSTEM` or ` system `
+- **THEN** the service returns HTTP `409` and creates no key
 
 ### Requirement: Admin routes require a minimum tier
 Tiers are ordered `viewer` < `operator` < `admin`, and each tier has every permission of the tiers below it. Each `/admin` route MUST require a minimum tier. A request whose key is authenticated but below the route's minimum tier MUST receive HTTP `403`, and the operation MUST NOT run.
@@ -137,6 +148,17 @@ At startup, when the `bootstrap` key is not active and another active key of tie
 #### Scenario: Bootstrap key was revoked deliberately
 - **WHEN** the `bootstrap` key is revoked, another active `admin`-tier key exists, and the service restarts
 - **THEN** the `bootstrap` key stays revoked, requests that carry `ADMIN_API_KEY` return HTTP `401`, and a log entry states that `ADMIN_API_KEY` grants no access
+
+### Requirement: Startup never fails because ADMIN_API_KEY equals another stored key
+At startup, when the hash of `ADMIN_API_KEY` belongs to a stored admin key other than `bootstrap`, the system MUST leave every admin key unchanged, MUST log an error that names that key by name and tier only, MUST NOT write an admin audit row, and MUST continue starting. This takes precedence over the three `bootstrap` cases above. The configured value then authenticates exactly as the key it already is.
+
+#### Scenario: ADMIN_API_KEY is set to a named key while bootstrap is active
+- **WHEN** the `bootstrap` key is active and the service restarts with `ADMIN_API_KEY` set to the plaintext of a stored `operator` key named `ci`
+- **THEN** startup succeeds, the hash of `bootstrap` and of `ci` are unchanged, an error log names `ci` and tier `operator` and contains neither the key nor its hash, no admin audit row is written, and requests that carry `ADMIN_API_KEY` authenticate as `ci` with tier `operator`
+
+#### Scenario: ADMIN_API_KEY is set to a named key and no bootstrap key is active
+- **WHEN** no active key of tier `admin` exists and the service starts with `ADMIN_API_KEY` set to the plaintext of a stored key other than `bootstrap`
+- **THEN** startup succeeds, no `bootstrap` key is created or reactivated, every admin key is unchanged, and the error log names that key by name and tier
 
 ### Requirement: The last active admin key cannot be revoked
 The system MUST refuse to revoke a key of tier `admin` when it is the only active key of tier `admin`.

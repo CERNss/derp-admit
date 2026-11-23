@@ -23,6 +23,13 @@ Every `/admin` endpoint that returns a list MUST accept `limit` and `cursor` que
 - **WHEN** a list endpoint is called with a `cursor` that the service did not issue
 - **THEN** the service returns HTTP `400`
 
+### Requirement: A pagination cursor is bound to its filters
+A `nextCursor` MUST be bound to the list and the filter values it was issued under. Sent with other filter values, it MUST be rejected with HTTP `400`, like a cursor issued by another list.
+
+#### Scenario: Cursor is sent with different filters
+- **WHEN** a list endpoint is called with a `nextCursor` issued under one set of filter values, such as `GET /admin/devices?userId=<a>`, together with different filter values, such as `userId=<b>` or no `userId`
+- **THEN** the service returns HTTP `400`, as for a cursor issued by another list
+
 ### Requirement: Admin API deletes users
 The system MUST provide `DELETE /admin/users/:id`. It removes the user together with the user's enroll tokens, devices, role bindings and the legacy device rules of those devices, in one transaction.
 

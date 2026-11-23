@@ -77,3 +77,14 @@ The system MUST provide `GET /admin/audit/admin`, newest first and paginated as 
 #### Scenario: Filter value is malformed
 - **WHEN** `actorKeyId` is not a UUID, or `since` or `until` is not an RFC 3339 timestamp
 - **THEN** the service returns HTTP `400`
+
+### Requirement: Logs contain no key hashes, token hashes or bound query values
+The service MUST NOT write admin key hashes, enroll token hashes or any other bound query value to its logs. This includes the database driver's log of failed, slow or "record not found" statements, which MAY name the statement but MUST NOT include its bound values.
+
+#### Scenario: Unknown admin key
+- **WHEN** a request to an `/admin` route carries a bearer key whose hash matches no stored admin key and the service returns HTTP `401`
+- **THEN** no log line, including the database driver's log of the lookup, contains the key or its hash
+
+#### Scenario: Unknown enroll token at register
+- **WHEN** `POST /register` carries an enroll token whose hash matches no stored token
+- **THEN** no log line, including the database driver's log of the lookup, contains the token or its hash

@@ -22,6 +22,17 @@ A verify request whose relay name is not in the relay registry, or is not a vali
 - **WHEN** `POST /verify/Bad_Name` is called with a valid admit request
 - **THEN** the service returns HTTP `200` with `Allow=false` and `DenyReason="unknown relay"`
 
+### Requirement: An empty relay or a relay containing a slash is malformed
+An empty relay segment (`POST /verify/`) and a relay segment that contains `/`, whether literal (`POST /verify/a/b`) or encoded (`POST /verify/a%2Fb`), MUST be treated as a malformed relay name: the deny response of "Unknown relay is denied", audited with a null relay. The service MUST NOT redirect `/verify/` to `/verify`. Only `POST /verify` with no relay segment means relay `default`.
+
+#### Scenario: Empty relay segment
+- **WHEN** `POST /verify/` is called with a valid admit request for an active device whose user has role `standard` with its built-in grant
+- **THEN** the service returns HTTP `200` with `Allow=false` and `DenyReason="unknown relay"`, without a redirect, and the audit row's relay is null
+
+#### Scenario: Relay segment contains a slash
+- **WHEN** `POST /verify/a/b` or `POST /verify/a%2Fb` is called with a valid admit request
+- **THEN** the service returns HTTP `200` with `Allow=false` and `DenyReason="unknown relay"`, and the audit row's relay is null
+
 ### Requirement: Verify checks run in a fixed order
 The system MUST evaluate a verify request in this order and MUST return the first failing check's deny reason: parse the request (`invalid request`), relay is known (`unknown relay`), device is registered (`not registered`), device is not revoked (`revoked`), owner user is not disabled (`user disabled`), policy allows (`policy denied`).
 

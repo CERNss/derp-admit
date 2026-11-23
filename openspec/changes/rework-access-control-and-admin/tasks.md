@@ -86,11 +86,11 @@ Execution note (2026-11-23): the owner asked for parallel implementation. The wo
 - [x] 8.15 Enforced mode revokes every device without its registration rule, whoever owns it
 - [x] 8.16 The upgrade writes one upgrade.run audit row and an info log line with its counts
 - [x] 8.17 README and log text: SQL changes to policy rows take effect at the next reload; no SQL provisioning
-- [ ] 8.18 `UPGRADE_POLICY_MODE` decides the upgrade mode explicitly; without it a contradiction between the legacy setting and the data refuses the first start; a leftover `enable_casbin: true` does not confirm (design A7 R1/S4, A8)
-- [ ] 8.19 An unparsable legacy value at a higher layer does not mask a valid lower-layer value (design A8)
-- [ ] 8.20 Only a device's own canonical registration rule counts as a registration rule (design A7 R1/S4)
-- [ ] 8.21 The rule table has the same unique index on fresh and upgraded databases (design A10)
-- [ ] 8.22 Restore the three weakened tests (unmanaged rules, database log, cursor filters)
+- [x] 8.18 `UPGRADE_POLICY_MODE` decides the upgrade mode explicitly; without it a contradiction between the legacy setting and the data refuses the first start; a leftover `enable_casbin: true` does not confirm (design A7 R1/S4, A8)
+- [x] 8.19 An unparsable legacy value at a higher layer does not mask a valid lower-layer value (design A8)
+- [x] 8.20 Only a device's own canonical registration rule counts as a registration rule (design A7 R1/S4)
+- [x] 8.21 The rule table has the same unique index on fresh and upgraded databases (design A10)
+- [x] 8.22 Restore the three weakened tests (unmanaged rules, database log, cursor filters)
 
 ## Workflow follow-up
 

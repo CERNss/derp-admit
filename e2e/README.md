@@ -53,10 +53,11 @@ the client's `tlsdial` verifies against.
 
 Measured on OrbStack 2.2.5: a machine cannot reach a container's IP address
 (timeouts on ICMP and TCP) and cannot resolve `*.orb.local` container names,
-and `docker.orb.internal` only reaches ports published on all interfaces. What
+and `docker.orb.internal` did not reach a port published on `127.0.0.1`. What
 works is a port published on the Docker host's loopback (`127.0.0.1:PORT`),
-reached from the machine through `host.orb.internal` (OrbStack maps it to the
-Mac's localhost; see <https://docs.orbstack.dev/machines/network>). So:
+reached from the machine through `host.orb.internal`, which the OrbStack docs
+describe as the way machines reach servers on the Mac
+(<https://docs.orbstack.dev/machines/network>). So:
 
 - headscale publishes `127.0.0.1:39080` (tcp), derper `127.0.0.1:39443` (tcp,
   DERP over TLS) and `127.0.0.1:39478` (udp, STUN). Each listens on the same
@@ -85,7 +86,7 @@ two `/etc/hosts` entries, replaces the CA and the firewall table, and restarts
 Each machine gets an nftables table `inet derp_e2e` that drops all traffic,
 IPv4 and IPv6, to and from the other two machines' addresses. The only path
 between clients is therefore through derper (precondition P2 checks it with
-plain `ping`). STUN (udp/3478) to our derper is allowed on purpose: it is the
+plain `ping`). STUN (udp/39478) to our derper is allowed on purpose: it is the
 only STUN server in the DERP map and lets each client choose region 900 as its
 home; no public STUN or DERP server is used.
 

@@ -386,8 +386,9 @@ up() { m "$1" tailscale up --login-server="http://$HS_HOST:$HS_PORT" --authkey="
 
 section "P: rig preconditions"
 for n in "${MACHINES[@]}"; do
-  evidence "$n: uname -a / tailscale version" "$(m "$n" uname -a)
-$(m "$n" tailscale version | head -1)"
+  evidence "$n: uname -a / tailscale version / kernel TUN device" "$(m "$n" uname -a)
+tailscale $(m "$n" tailscale version | head -1)
+$(m "$n" ip -br link show tailscale0 2>&1)"
 done
 probe=$(m "$MA" curl -sS -o /dev/null -w 'HTTP %{http_code}, ssl_verify_result=%{ssl_verify_result}, %{remote_ip}:%{remote_port}' "https://$DERP_HOST:$DERP_PORT/derp/probe" 2>&1 || true)
 evidence "$MA: curl https://$DERP_HOST:$DERP_PORT/derp/probe (system trust store, throwaway CA)" "$probe"
@@ -402,13 +403,13 @@ for pair in "$MA $MC" "$MC $MA" "$MA $MB" "$MB $MA" "$MB $MC" "$MC $MB"; do
   read -r f t <<<"$pair"
   t4=$(ip4of "$t") t6=$(ip6of "$t")
   if o=$(m "$f" ping -c 1 -W 2 "$t4" 2>&1); then blocked=0; fi
-  out+="$f -> $t $t4: $(tail -2 <<<"$o" | head -1)"$'\n'
+  out+="$f -> $t $t4: $(grep 'packets transmitted' <<<"$o")"$'\n'
   for a6 in ${t6//,/ }; do
     if o=$(m "$f" ping -6 -c 1 -W 2 "$a6" 2>&1); then blocked=0; fi
-    out+="$f -> $t $a6: $(tail -2 <<<"$o" | head -1)"$'\n'
+    out+="$f -> $t $a6: $(grep 'packets transmitted' <<<"$o")"$'\n'
   done
 done
-ctl=$(m "$MA" ping -c 1 -W 2 "$(ip4of "$MA")" 2>&1 | tail -2 | head -1 || true)
+ctl=$(m "$MA" ping -c 1 -W 2 "$(ip4of "$MA")" 2>&1 | grep 'packets transmitted' || true)
 evidence "plain ping between machine addresses (must fail; last line: own address as control)" "${out}$MA -> itself: $ctl"
 if [ "$blocked" = 1 ]; then
   result P2 PASS "no direct IP path between any two machines (IPv4 and IPv6 dropped by nft table inet derp_e2e)"
@@ -431,7 +432,9 @@ info "$MA $KEY_A $TSIP_A (user alice); $MC $KEY_C $TSIP_C (user carol)"
 # shellcheck disable=SC2016 # Go template, not shell
 evidence "$MA: tailscale debug derp-map (regions, nodes)" "$(m "$MA" tailscale debug derp-map | tmpl '{{range $id, $r := .Regions}}region {{$id}} code={{$r.RegionCode}}{{range $r.Nodes}} node={{.Name}} HostName={{.HostName}} DERPPort={{.DERPPort}} STUNPort={{.STUNPort}} CertName="{{str .CertName}}" InsecureForTests={{str .InsecureForTests}}{{end}}
 {{end}}')"
-evidence "headscale nodes list" "$(hs nodes list 2>&1)"
+evidence "headscale nodes list -o json" "$(hs nodes list -o json | tmpl '{{range .}}id={{.id}} name={{.name}} user={{.user.name}} ip={{join .ip_addresses ","}} online={{.online}}
+{{end}}')"
+evidence "$MA: tailscale netcheck (STUN to our derper only)" "$(m "$MA" tailscale netcheck 2>&1 | grep -E 'UDP|IPv4|Nearest|e2e-derp' || true)"
 
 if wait_until 60 derp_connected_since "$MA" "$MARK_UP" && wait_until 30 audit_newest_is "$KEY_A" "$MARK_UP" true; then ok=1; else ok=0; fi
 c_log=$(derp_connected_since "$MA" "$MARK_UP" | tail -2 || true)

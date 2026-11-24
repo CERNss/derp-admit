@@ -1,0 +1,215 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # Explicit shell: GitHub then runs "bash --noprofile --norc -eo pipefail",
+    # so a failing command on the left of a pipe (go test | tee) fails the step.
+    shell: bash
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.24.0 is the version go.mod pins; stable catches breakage on the
+        # newest release.
+        go: ["1.24.0", "stable"]
+    env:
+      # go.mod has "go 1.24.0" and no toolchain line, so neither entry needs a
+      # newer toolchain and auto-switching would not trigger. "local" makes that
+      # a guarantee: if go.mod ever asks for more than the installed Go, the
+      # build fails instead of silently downloading a newer toolchain.
+      # (setup-go also exports GOTOOLCHAIN=local; this keeps it explicit.)
+      GOTOOLCHAIN: local
+      # The gated tests connect as this role. They run CREATE DATABASE (one
+      # random database per test, dropped in cleanup) and pg_terminate_backend
+      # on their own sessions, so the role needs CREATEDB; the image's
+      # POSTGRES_USER is a superuser, which is more than enough. Packages run
+      # in parallel against this server; that is safe because only the db
+      # package touches the base database, the rest use their own databases.
+      # TestApplyMigrationsPostgres migrates this base database itself, so it
+      # must start empty, which a fresh service container is.
+      TEST_POSTGRES_URL: postgres://verifier:verifier@localhost:5432/verifier?sslmode=disable
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: verifier
+          POSTGRES_PASSWORD: verifier
+          POSTGRES_DB: verifier
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U verifier -d verifier"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: go.sum
+
+      - name: Show and check Go version
+        env:
+          WANT_GO: ${{ matrix.go }}
+        run: |
+          go version
+          go env GOTOOLCHAIN GOVERSION
+          if [ "$WANT_GO" != "stable" ]; then
+            got="$(go env GOVERSION)"
+            if [ "$got" != "go$WANT_GO" ]; then
+              echo "::error::expected go$WANT_GO, got $got"
+              exit 1
+            fi
+          fi
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        # -v so the next step can see every test's result; the log is kept in
+        # RUNNER_TEMP and also shown here.
+        run: go test -race -count=1 -v ./... 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+
+      - name: Check the PostgreSQL-gated tests ran
+        # Every t.Skip in this module is a "TEST_POSTGRES_URL is not set" gate,
+        # so with the URL set no test may report SKIP at all. Checking for any
+        # SKIP (rather than a list of test names) covers gated tests added
+        # later without editing this file. The PASS floor guards against the
+        # check passing vacuously (e.g. the log being empty). If someone adds a
+        # skip for another reason, this step fails and says which test; adjust
+        # the check then.
+        run: |
+          log="$RUNNER_TEMP/go-test.log"
+          # -B1: with -v the skip reason is printed just before "--- SKIP".
+          if grep -E -B1 -- '--- SKIP:' "$log"; then
+            echo "::error::tests were skipped although TEST_POSTGRES_URL is set"
+            exit 1
+          fi
+          passed="$(grep -c -E -- '--- PASS: [^ ]*[Pp]ostgres' "$log" || true)"
+          echo "PostgreSQL tests passed: $passed"
+          if [ "$passed" -lt 1 ]; then
+            echo "::error::no PostgreSQL test reported PASS"
+            exit 1
+          fi
+
+  e2e-tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GOTOOLCHAIN: local
+    defaults:
+      run:
+        working-directory: e2e/tools
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: e2e/tools/go.mod
+          # Standard library only, no go.sum: nothing to cache.
+          cache: false
+
+      - run: go version
+
+      - name: Build and vet
+        run: go build ./... && go vet ./...
+
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: shellcheck
+        # shellcheck is preinstalled on the ubuntu-24.04 runner image.
+        # scripts/ is optional; every *.sh under e2e/ and scripts/ is checked.
+        run: |
+          shellcheck --version
+          dirs=(e2e)
+          if [ -d scripts ]; then dirs+=(scripts); fi
+          # find exits non-zero if shellcheck fails on any file.
+          find "${dirs[@]}" -type f -name '*.sh' -print -exec shellcheck {} +
+
+      - name: docker compose config
+        # deploy/docker-compose.yml is checked when present. Its ${VAR:?}
+        # variables get harmless dummy values here (only the file's syntax and
+        # interpolation are checked); a new required variable there must be
+        # added to this list.
+        env:
+          POSTGRES_PASSWORD: ci-dummy
+          TOKEN_PEPPER: ci-dummy
+          ADMIN_API_KEY: ci-dummy
+          DERP_HOSTNAME: derp.example.invalid
+        run: |
+          docker compose version
+          docker compose -f builder/derp_admit/docker-compose.yml config -q
+          docker compose -f e2e/docker-compose.yml config -q
+          if [ -f deploy/docker-compose.yml ]; then
+            docker compose -f deploy/docker-compose.yml config -q
+          else
+            echo "deploy/docker-compose.yml not present, skipped"
+          fi
+
+      - name: gofmt
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "::error::gofmt would change these files:"
+            echo "$out"
+            exit 1
+          fi
+
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image (linux/amd64, not pushed)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: builder/derp_admit/Dockerfile
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=ci-image
+          cache-to: type=gha,scope=ci-image,mode=max

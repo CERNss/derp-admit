@@ -197,4 +197,4 @@ Found by the last independent review (commit `4e4c315`) and left as they are. No
 - The unique index on `casbin_rule` is created by migration `002` and by the sqlite model. A PostgreSQL database that already recorded `002` from an earlier build of this branch does not get it. Creating it fails startup if the table already holds duplicate rows, which only hand-written SQL can produce.
 - In enforced mode a device whose owner row is missing is counted but not revoked. It can exist only where foreign keys are not enforced (sqlite), and `/verify` denies it because the owner lookup fails.
 - `users_bound_standard` in the `upgrade.run` summary counts a user whose binding already existed.
-- There is no test with a real Tailscale client, and the README's upgrade section was not fact-checked a second time after its last rewrite; the behaviour it describes was replayed on PostgreSQL.
+- (Closed later: `e2e/` now tests with real Tailscale clients.) The README's upgrade section was not fact-checked a second time after its last rewrite; the behaviour it describes was replayed on PostgreSQL.

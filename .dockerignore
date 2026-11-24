@@ -1,0 +1,14 @@
+.git
+.github
+.idea
+.codex
+.worktrees
+.DS_Store
+# Env files at any depth (deploy/.env holds real secrets); the examples are harmless.
+**/.env
+**/.env.*
+!**/.env.example
+build
+e2e/.cache
+openspec
+docs

@@ -1,2 +1,4 @@
 # Template machine export shipped to a test host with a slow network (see README).
 .cache/
+# Left behind by `go build ./...` in e2e/tools.
+tools/tools

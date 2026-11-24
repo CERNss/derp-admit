@@ -21,3 +21,13 @@ register_rate_limit_burst: 10
 verify_cache_ttl: "0s"
 policy_sync_interval: "2s"
 metrics_enabled: true
+
+# Optional caller allowlists: comma-separated CIDRs or single IPs, matched on
+# the TCP peer address only (forwarded headers are ignored), for example
+# "10.0.0.0/8,192.0.2.7"; others get 403. Unset or empty means no restriction.
+# verify_allowed_cidrs: ""
+# metrics_allowed_cidrs: ""
+
+# Audit retention in days (0 keeps rows forever); each instance prunes hourly.
+# verify_audit_retention_days: 0
+# admin_audit_retention_days: 0

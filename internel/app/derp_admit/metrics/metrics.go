@@ -9,6 +9,13 @@ const (
 	EndpointVerify   = "verify"
 	EndpointRegister = "register"
 	EndpointAdmin    = "admin"
+	EndpointMetrics  = "metrics"
+)
+
+// Audit tables, as labelled by AuditPruned.
+const (
+	AuditTableVerify = "verify"
+	AuditTableAdmin  = "admin"
 )
 
 // Recorder records operational metrics across HTTP handlers, verification,
@@ -21,6 +28,12 @@ type Recorder interface {
 	CacheLookup(hit bool)
 	PolicySync(ok bool, version int64, lastSuccess time.Time)
 	PolicyReload(ok bool)
+	// CallerRejected counts a request refused by a caller allowlist
+	// (endpoint EndpointVerify or EndpointMetrics).
+	CallerRejected(endpoint string)
+	// AuditPruned counts audit rows deleted by retention pruning (table
+	// AuditTableVerify or AuditTableAdmin).
+	AuditPruned(table string, n int64)
 	Handler() http.Handler
 }
 
@@ -36,4 +49,6 @@ func (nop) RateLimited(string)                  {}
 func (nop) CacheLookup(bool)                    {}
 func (nop) PolicySync(bool, int64, time.Time)   {}
 func (nop) PolicyReload(bool)                   {}
+func (nop) CallerRejected(string)               {}
+func (nop) AuditPruned(string, int64)           {}
 func (nop) Handler() http.Handler               { return nil }

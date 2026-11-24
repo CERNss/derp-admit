@@ -58,6 +58,26 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger, opts
 	verifyLimiter := rate.NewLimiter(rate.Limit(cfg.VerifyRateLimitRPS), cfg.VerifyRateBurst)
 	registerLimiter := newIPRateLimiter(cfg.RegisterRateLimitRPS, cfg.RegisterRateBurst)
 
+	// Caller allowlists run ahead of the handlers, so a refused /verify caller
+	// never reaches the verify limiter, the service or the audit table.
+	verifyAllow := callerAllowlist(cfg.VerifyAllowedCIDRs, metrics.EndpointVerify, logger, rec)
+	metricsAllow := callerAllowlist(cfg.MetricsAllowedCIDRs, metrics.EndpointMetrics, logger, rec)
+	// Always state the allowlist at startup, so a misspelled key or a missing
+	// config file that leaves an endpoint open is visible in the log. Info,
+	// not warn: an unrestricted endpoint is a valid setup.
+	if n := len(cfg.VerifyAllowedCIDRs); n > 0 {
+		logger.Info("verify caller allowlist set", zap.Int("entries", n))
+	} else {
+		logger.Info("verify caller allowlist not set: any peer may call /verify")
+	}
+	if cfg.MetricsEnabled {
+		if n := len(cfg.MetricsAllowedCIDRs); n > 0 {
+			logger.Info("metrics caller allowlist set", zap.Int("entries", n))
+		} else {
+			logger.Info("metrics caller allowlist not set: any peer may read /metrics")
+		}
+	}
+
 	router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
@@ -78,7 +98,7 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger, opts
 
 	if cfg.MetricsEnabled {
 		if h := rec.Handler(); h != nil {
-			router.GET("/metrics", gin.WrapH(h))
+			router.GET("/metrics", withAllowlist(metricsAllow, gin.WrapH(h))...)
 		}
 	}
 
@@ -117,8 +137,8 @@ func NewRouter(svc *service.Service, cfg config.Config, logger *zap.Logger, opts
 		c.JSON(status, gin.H{"ok": false})
 	})
 
-	router.POST("/verify", verifyHandler(svc, verifyLimiter, logger, rec, true))
-	router.POST("/verify/*relay", verifyHandler(svc, verifyLimiter, logger, rec, false))
+	router.POST("/verify", withAllowlist(verifyAllow, verifyHandler(svc, verifyLimiter, logger, rec, true))...)
+	router.POST("/verify/*relay", withAllowlist(verifyAllow, verifyHandler(svc, verifyLimiter, logger, rec, false))...)
 
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{

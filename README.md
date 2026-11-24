@@ -7,12 +7,12 @@
 | Method & path | Auth | Purpose |
 | --- | --- | --- |
 | `POST /register` | Enroll token in body | Enroll a device's node key for the token's owner |
-| `POST /verify` | None (caller-asserted) | Evaluate `derper` admission for built-in relay `default` |
-| `POST /verify/:relay` | None (caller-asserted) | Evaluate `derper` admission for named relay `:relay` |
+| `POST /verify` | None (caller-asserted); optional peer allowlist `VERIFY_ALLOWED_CIDRS` | Evaluate `derper` admission for built-in relay `default` |
+| `POST /verify/:relay` | None (caller-asserted); optional peer allowlist `VERIFY_ALLOWED_CIDRS` | Evaluate `derper` admission for named relay `:relay` |
 | `/admin/...` | Bearer admin key | Tiered management API (mounted only when `ADMIN_API_KEY` is set) |
 | `GET /healthz` | None | Liveness probe (`200 {"ok":true}`) |
 | `GET /readyz` | None | Readiness probe (`200` when DB ping succeeds and policy sync is current; `503` otherwise) |
-| `GET /metrics` | None | Prometheus metrics (mounted when `METRICS_ENABLED=true`; `404` when `false`) |
+| `GET /metrics` | None; optional peer allowlist `METRICS_ALLOWED_CIDRS` | Prometheus metrics (mounted when `METRICS_ENABLED=true`; `404` when `false`) |
 | `GET /` | None | Service identity and current UTC timestamp |
 
 Quick start:
@@ -22,6 +22,8 @@ cp .env.example .env
 # Edit .env to set DATABASE_URL, TOKEN_PEPPER, and optionally ADMIN_API_KEY.
 go run ./cmd/derp_admit
 ```
+
+To run it for real, with `derper` on 443 and devices enrolling: [`docs/onboarding.md`](docs/onboarding.md) walks through the production stack in [`deploy/`](deploy/) and the enrollment script [`scripts/enroll.sh`](scripts/enroll.sh).
 
 ## Configuration
 
@@ -58,6 +60,10 @@ Configuration is loaded in this order (later overrides earlier):
 | `ADMIN_RATE_LIMIT_RPS` | `admin_rate_limit_rps` | `10` | Must be `> 0`; per client IP before auth (IPv6 grouped by `/64`) |
 | `ADMIN_RATE_LIMIT_BURST` | `admin_rate_limit_burst` | `20` | Integer `> 0` |
 | `METRICS_ENABLED` | `metrics_enabled` | `true` | Boolean; serves `GET /metrics` when `true`, returns `404` when `false` |
+| `VERIFY_ALLOWED_CIDRS` | `verify_allowed_cidrs` | *(unset)* | Optional comma-separated CIDRs or single IPs (a bare IP means `/32` or `/128`; whitespace around items is trimmed). When set, `/verify` and `/verify/:relay` callers whose TCP peer address is outside the list get `403` (see [Restricting callers](#restricting-callers)). Unset or empty: no restriction. An invalid item fails config loading. An empty or blank value does not clear a list set in a lower layer (to lift a restriction, remove it where it is set) |
+| `METRICS_ALLOWED_CIDRS` | `metrics_allowed_cidrs` | *(unset)* | Same format and rules as `VERIFY_ALLOWED_CIDRS`, for `GET /metrics` |
+| `VERIFY_AUDIT_RETENTION_DAYS` | `verify_audit_retention_days` | `0` | Integer `>= 0`; days to keep `audit_logs` rows, `0` keeps them forever (see [Retention](#retention)) |
+| `ADMIN_AUDIT_RETENTION_DAYS` | `admin_audit_retention_days` | `0` | Integer `>= 0`; days to keep `admin_audit_logs` rows, `0` keeps them forever (see [Retention](#retention)) |
 | `OTEL_ENABLED` | `otel_enabled` | `false` | Boolean; enables OpenTelemetry OTLP/HTTP trace export |
 | `OTEL_SERVICE_NAME` | `otel_service_name` | `derp-admit` | Must not be empty |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel_exporter_otlp_endpoint` | *(empty)* | OTLP/HTTP collector host:port (for example `otel-collector:4318`) |
@@ -101,6 +107,7 @@ Admission is role-based and per-relay, enforced by Casbin:
 - Re-registering a **revoked** node key for the same user is refused with `403` without modifying the device; re-enabling goes through `POST /admin/devices/:id/enable`.
 - Registering a node key already bound to another user returns `409` (whether active or revoked).
 - Token `maxDevices` (`> 0`) caps the user's active devices on new registrations (`403` when reached).
+- An unknown token returns `401`. A revoked or expired token, a disabled user, or a token whose user no longer exists returns `403`.
 
 ### Verify flow
 
@@ -117,6 +124,7 @@ Plain `POST /verify` (with no relay segment) evaluates relay `default`, so exist
 
 Checks run in this order, returning the first failure's deny reason:
 
+0. Caller allowlist, when `VERIFY_ALLOWED_CIDRS` is set -> HTTP `403` with `{"ok":false,"error":"forbidden"}`, not an admit response (not audited, not rate limited, not counted as a decision)
 1. Global verify rate limit -> `rate limited` (not audited)
 2. Parse request body and node key -> `invalid request`
 3. Policy sync freshness check -> `internal error` (when stale)
@@ -128,7 +136,16 @@ Checks run in this order, returning the first failure's deny reason:
 
 Database or policy lookup errors also return `internal error`. When `VERIFY_CACHE_TTL > 0`, decisions (after check 4) are cached per `(relay, nodeKey)` and invalidated on lifecycle and policy changes.
 
-**Trust statement and network exposure:** `/verify`, `/verify/:relay`, and `/metrics` require no credentials (`derper` sends no credentials or identifying headers). The relay name in the URL path is asserted by whoever calls `/verify` and is trusted as configured on `derper`; relay separation keeps a role from being admitted on another relay when each `derper` is configured with its own verify URL, but does not prevent an untrusted caller or misconfigured `derper` from naming a more permissive relay. Anyone who can reach the service port can learn whether a node key is registered, revoked, or belongs to a disabled user; can consume the single global verify rate limit, which with `--verify-client-url-fail-open=false` makes every `derper` reject every client; and each `/verify` call writes a verify audit row that nothing prunes. Restrict network access to the service to the `derper` relays and the admin callers.
+#### Restricting callers
+
+Set `VERIFY_ALLOWED_CIDRS` to the addresses of your `derper` relays, for example `VERIFY_ALLOWED_CIDRS=10.20.0.5,10.20.0.6`, and `METRICS_ALLOWED_CIDRS` to your Prometheus scrapers. A caller outside the list gets `403`. For `/verify` the check runs before everything else, so a refused caller writes no audit row, takes no token from the global verify rate limit (an outsider cannot use it up and make every `derper` reject its clients), and is not counted in `derp_admit_verify_decisions_total`. Each refusal is logged at warn level with the peer IP and counted in `derp_admit_caller_rejected_total`. At startup the service always logs one info line per list: how many entries it has when set, or `verify caller allowlist not set: any peer may call /verify` (and the `/metrics` equivalent when metrics are enabled) when it is not. Check this line after deploying: a misspelled key (for example `verify-allowed-cidrs` in YAML) or a `CONFIG_FILE` that does not exist loads without error and leaves the endpoint open.
+
+- Matching uses only the TCP peer address of the connection. `X-Forwarded-For`, `X-Real-IP` and similar headers are never read, so a reverse proxy in front of the service appears as the proxy's own address. IPv4-mapped IPv6 peers (`::ffff:10.0.0.5`) match IPv4 entries.
+- `/healthz`, `/readyz`, `/register`, `/admin` and `/` are not affected.
+- Leaving both lists unset keeps today's behaviour; the development compose file and the `e2e/` rig rely on that.
+- **Docker:** when the verifier's port is published to the host (`ports:`), connections that arrive through the host can appear to come from the Docker bridge gateway address instead of the real client. List the `derper` container's own address (on a user-defined network, or a fixed `ipv4_address`) rather than the whole bridge subnet: allowing the subnet, or its gateway, also allows anything that reaches the published port through the host.
+
+**Trust statement and network exposure:** `/verify`, `/verify/:relay`, and `/metrics` require no credentials (`derper` sends no credentials or identifying headers); the only built-in restriction is the optional peer-address allowlist (`VERIFY_ALLOWED_CIDRS`, `METRICS_ALLOWED_CIDRS`, see [Restricting callers](#restricting-callers)). The relay name in the URL path is asserted by whoever calls `/verify` and is trusted as configured on `derper`; relay separation keeps a role from being admitted on another relay when each `derper` is configured with its own verify URL, but does not prevent an allowed caller or misconfigured `derper` from naming a more permissive relay. Without `VERIFY_ALLOWED_CIDRS`, anyone who can reach the service port can learn whether a node key is registered, revoked, or belongs to a disabled user; can consume the single global verify rate limit, which with `--verify-client-url-fail-open=false` makes every `derper` reject every client; and each such `/verify` call writes a verify audit row (kept until `VERIFY_AUDIT_RETENTION_DAYS` removes it, forever by default). Set `VERIFY_ALLOWED_CIDRS`, or otherwise restrict network access to the service, to the `derper` relays and the admin callers.
 
 ## Admin API
 
@@ -344,7 +361,7 @@ curl -s "$BASE/admin/audit/verify?relay=eu-1&limit=5" \
 ### Verify audit (`audit_logs`)
 
 - **Recorded:** Every `POST /verify` and `POST /verify/:relay` decision after the verify rate limit, including allows, denies, and bodies that are not valid JSON (`nodeKey: ""`, `reason: "invalid request"`).
-- **Not recorded:** Requests rejected by the verify rate limit (`rate limited`).
+- **Not recorded:** Requests rejected by the verify rate limit (`rate limited`), and requests refused with `403` by `VERIFY_ALLOWED_CIDRS`.
 - **Relay column:** Stores valid relay names as requested (including unknown relays), `"default"` for plain `/verify`, and `null` for malformed relay names or pre-upgrade rows (no backfill).
 - **Preserved on delete:** Deleting a device or its owner user keeps existing verify audit rows and sets `deviceId` to `null`.
 - **Query:** `GET /admin/audit/verify` (tier `viewer`), paginated newest first (`ts DESC, id DESC`). Optional filters combined with `AND`:
@@ -358,7 +375,14 @@ curl -s "$BASE/admin/audit/verify?relay=eu-1&limit=5" \
 
 ### Retention
 
-There is no automatic retention or pruning for `admin_audit_logs` or `audit_logs`.
+By default (`0`) both audit tables keep every row forever. Set `VERIFY_AUDIT_RETENTION_DAYS` (table `audit_logs`) and `ADMIN_AUDIT_RETENTION_DAYS` (table `admin_audit_logs`) to a number of days to have old rows deleted automatically:
+
+- Each instance runs a background pruner: a first pass about 30 seconds after startup, then once an hour. It deletes rows whose `ts` is older than now minus the retention, in batches of at most 1000 rows per statement (each statement within `DB_TIMEOUT`), until none older remain. It stops when the instance shuts down.
+- Every replica prunes; running several at once is safe (on PostgreSQL each batch skips rows another replica has locked, so they never wait on each other), and nothing newer than the cutoff is deleted.
+- Pruning does not change `policy_state.version`, does not touch the verify cache, writes no admin audit row, and does not affect `/verify` or `/readyz`. A pass that deletes rows logs one info line (`audit retention pruned rows`, with table, count and cutoff) and adds the count to `derp_admit_audit_pruned_total`. A failed pass is logged at error level and retried at the next hourly tick.
+- Admin audit retention also removes old `system` rows, including the `upgrade.run` and `device.revoke` rows written by the one-time upgrade and the `bootstrap.*` rows. Read them (see [Upgrading from the previous version](#upgrading-from-the-previous-version)) before they age out. The upgrade itself never runs again: its marker is `policy_state.upgraded_at`, not an audit row.
+- Paginated audit queries stay consistent while rows are pruned: following a `nextCursor` after a prune returns the remaining older rows with no repeats, and an empty last page if the rest were pruned.
+- The first pass on a large table that has never been pruned deletes in many batches. Each batch selects old rows through the `ts` index (`idx_audit_logs_ts`, `idx_admin_audit_logs_ts_id`) and deletes them by primary key, so the last, empty statement of a pass does not read the retained rows (on PostgreSQL, when most rows are older than the cutoff, the select may scan the table and stop once the batch is full).
 
 ## Running several instances
 
@@ -373,7 +397,7 @@ There is no automatic retention or pruning for `admin_audit_logs` or `audit_logs
 
 ## Metrics
 
-When `METRICS_ENABLED=true` (the default), `GET /metrics` exposes Prometheus metrics on the main listener without authentication, using a dedicated registry (only `derp_admit_*` metrics are emitted). When `METRICS_ENABLED=false`, `GET /metrics` returns `404`.
+When `METRICS_ENABLED=true` (the default), `GET /metrics` exposes Prometheus metrics on the main listener without authentication, using a dedicated registry (only `derp_admit_*` metrics are emitted). To limit who can scrape it, set `METRICS_ALLOWED_CIDRS`: callers whose TCP peer address is outside the list get `403` (see [Restricting callers](#restricting-callers)). When `METRICS_ENABLED=false`, `GET /metrics` returns `404`.
 
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
@@ -386,6 +410,8 @@ When `METRICS_ENABLED=true` (the default), `GET /metrics` exposes Prometheus met
 | `derp_admit_policy_sync_last_success_timestamp_seconds` | Gauge | *(none)* | Unix timestamp (seconds) of the last successful policy sync check |
 | `derp_admit_policy_sync_failures_total` | Counter | *(none)* | Total failed policy sync checks or sync-triggered reloads |
 | `derp_admit_policy_reloads_total` | Counter | `result` | Total policy snapshot reloads (`ok` or `error`) |
+| `derp_admit_caller_rejected_total` | Counter | `endpoint` | Total requests refused with `403` by a caller allowlist (`verify` for `VERIFY_ALLOWED_CIDRS`, `metrics` for `METRICS_ALLOWED_CIDRS`) |
+| `derp_admit_audit_pruned_total` | Counter | `table` | Total audit rows deleted by retention pruning (`verify` for `audit_logs`, `admin` for `admin_audit_logs`) |
 
 Metric labels never contain node keys, user IDs, device IDs, admin key IDs, or admin key names. Any relay name that is not in the registry or is malformed is labeled `unknown`.
 
@@ -447,6 +473,8 @@ Follow these steps in order:
 
 `go.mod` pins `go 1.24.0`.
 
+Every push to `main` and every pull request runs `.github/workflows/ci.yml`: build, vet and race tests on Go 1.24.0 and the current stable release against PostgreSQL 16 (the run fails if any PostgreSQL test is skipped), shell and compose file checks, and an image build. Pushing a tag `vX.Y.Z` runs `.github/workflows/release.yml`, which publishes the verifier image for `linux/amd64` and `linux/arm64` to `ghcr.io/<owner>/derp-admit`.
+
 Run the SQLite test suite on the local Go toolchain:
 
 ```bash
@@ -492,6 +520,8 @@ docker buildx build \
 
 ## Docker Compose stack and manual smoke test
 
+This is the local development stack. For a deployment that real clients use (TLS on 443, the verifier reachable only by `derper` and from the host's loopback, no default credentials), use `deploy/docker-compose.yml` and follow `docs/onboarding.md`.
+
 `builder/derp_admit/docker-compose.yml` runs three services: `postgres`, `verifier` (built from `builder/derp_admit/Dockerfile`) and `derper`. There is no usable published derper image (`tailscale/derper` and `ghcr.io/tailscale/derper` refuse anonymous pulls), so compose builds derper from `builder/derp_admit/derper.Dockerfile` at the tailscale version pinned in `go.mod` (`v1.84.3`).
 
 derper is started with `--verify-client-url=http://verifier:8080/verify/default` and `--verify-client-url-fail-open=false`, so it rejects every client when the verifier cannot be reached.
@@ -505,7 +535,7 @@ cp .env.example .env
 docker compose -f builder/derp_admit/docker-compose.yml up -d --build
 ```
 
-Host ports: `5432` (postgres), `8080` (verifier), `3340/tcp` (derper HTTP) and `3478/udp` (STUN). Note that `builder/derp_admit/docker-compose.yml` publishes port `8080` (and PostgreSQL's `5432`) on all host interfaces and is meant for local use only.
+Host ports: `5432` (postgres, on `127.0.0.1` only), `8080` (verifier), `3340/tcp` (derper HTTP) and `3478/udp` (STUN). Note that `builder/derp_admit/docker-compose.yml` publishes port `8080` on all host interfaces and uses a fixed database password; it is meant for local use only.
 
 ### TLS choice
 

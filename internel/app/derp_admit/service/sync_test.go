@@ -57,10 +57,12 @@ func (m *bRecordingMetrics) VerifyDecision(string, bool, string) {
 	defer m.mu.Unlock()
 	m.verifyCalls++
 }
-func (m *bRecordingMetrics) RegisterOutcome(int)      {}
-func (m *bRecordingMetrics) AdminRequest(string, int) {}
-func (m *bRecordingMetrics) RateLimited(string)       {}
-func (m *bRecordingMetrics) Handler() http.Handler    { return nil }
+func (m *bRecordingMetrics) RegisterOutcome(int)       {}
+func (m *bRecordingMetrics) AdminRequest(string, int)  {}
+func (m *bRecordingMetrics) RateLimited(string)        {}
+func (m *bRecordingMetrics) Handler() http.Handler     { return nil }
+func (m *bRecordingMetrics) CallerRejected(string)     {}
+func (m *bRecordingMetrics) AuditPruned(string, int64) {}
 func (m *bRecordingMetrics) CacheLookup(hit bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

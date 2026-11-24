@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -42,30 +43,42 @@ type Config struct {
 	VerifyCacheTTL       time.Duration
 	PolicySyncInterval   time.Duration
 	MetricsEnabled       bool
+	// VerifyAllowedCIDRs and MetricsAllowedCIDRs restrict the TCP peers that
+	// may call /verify and /metrics. Empty means no restriction.
+	VerifyAllowedCIDRs  []netip.Prefix
+	MetricsAllowedCIDRs []netip.Prefix
+	// VerifyAuditRetentionDays and AdminAuditRetentionDays bound the age of
+	// audit_logs and admin_audit_logs rows. 0 keeps rows forever.
+	VerifyAuditRetentionDays int
+	AdminAuditRetentionDays  int
 }
 
 type fileConfig struct {
-	Addr                 *string  `yaml:"addr"`
-	DatabaseURL          *string  `yaml:"database_url"`
-	TokenPepper          *string  `yaml:"token_pepper"`
-	AdminAPIKey          *string  `yaml:"admin_api_key"`
-	LogLevel             *string  `yaml:"log_level"`
-	UpgradePolicyMode    *string  `yaml:"upgrade_policy_mode"`
-	OTELEnabled          *bool    `yaml:"otel_enabled"`
-	OTELServiceName      *string  `yaml:"otel_service_name"`
-	OTLPEndpoint         *string  `yaml:"otel_exporter_otlp_endpoint"`
-	OTLPInsecure         *bool    `yaml:"otel_exporter_otlp_insecure"`
-	OTELSampleRatio      *float64 `yaml:"otel_trace_sample_ratio"`
-	DBTimeout            *string  `yaml:"db_timeout"`
-	VerifyRateLimitRPS   *float64 `yaml:"verify_rate_limit_rps"`
-	VerifyRateBurst      *int     `yaml:"verify_rate_limit_burst"`
-	RegisterRateLimitRPS *float64 `yaml:"register_rate_limit_rps"`
-	RegisterRateBurst    *int     `yaml:"register_rate_limit_burst"`
-	AdminRateLimitRPS    *float64 `yaml:"admin_rate_limit_rps"`
-	AdminRateBurst       *int     `yaml:"admin_rate_limit_burst"`
-	VerifyCacheTTL       *string  `yaml:"verify_cache_ttl"`
-	PolicySyncInterval   *string  `yaml:"policy_sync_interval"`
-	MetricsEnabled       *bool    `yaml:"metrics_enabled"`
+	Addr                 *string   `yaml:"addr"`
+	DatabaseURL          *string   `yaml:"database_url"`
+	TokenPepper          *string   `yaml:"token_pepper"`
+	AdminAPIKey          *string   `yaml:"admin_api_key"`
+	LogLevel             *string   `yaml:"log_level"`
+	UpgradePolicyMode    *string   `yaml:"upgrade_policy_mode"`
+	OTELEnabled          *bool     `yaml:"otel_enabled"`
+	OTELServiceName      *string   `yaml:"otel_service_name"`
+	OTLPEndpoint         *string   `yaml:"otel_exporter_otlp_endpoint"`
+	OTLPInsecure         *bool     `yaml:"otel_exporter_otlp_insecure"`
+	OTELSampleRatio      *float64  `yaml:"otel_trace_sample_ratio"`
+	DBTimeout            *string   `yaml:"db_timeout"`
+	VerifyRateLimitRPS   *float64  `yaml:"verify_rate_limit_rps"`
+	VerifyRateBurst      *int      `yaml:"verify_rate_limit_burst"`
+	RegisterRateLimitRPS *float64  `yaml:"register_rate_limit_rps"`
+	RegisterRateBurst    *int      `yaml:"register_rate_limit_burst"`
+	AdminRateLimitRPS    *float64  `yaml:"admin_rate_limit_rps"`
+	AdminRateBurst       *int      `yaml:"admin_rate_limit_burst"`
+	VerifyCacheTTL       *string   `yaml:"verify_cache_ttl"`
+	PolicySyncInterval   *string   `yaml:"policy_sync_interval"`
+	MetricsEnabled       *bool     `yaml:"metrics_enabled"`
+	VerifyAllowedCIDRs   *string   `yaml:"verify_allowed_cidrs"`
+	MetricsAllowedCIDRs  *string   `yaml:"metrics_allowed_cidrs"`
+	VerifyAuditRetention yaml.Node `yaml:"verify_audit_retention_days"`
+	AdminAuditRetention  yaml.Node `yaml:"admin_audit_retention_days"`
 }
 
 const legacyEnableCasbinWarning = "ENABLE_CASBIN / enable_casbin is deprecated and ignored for enforcement; policy is always enforced (its value is read only by the one-time upgrade)"
@@ -228,6 +241,30 @@ func mergeFromYAMLFile(cfg *Config, path string) (bool, error) {
 	if fc.MetricsEnabled != nil {
 		cfg.MetricsEnabled = *fc.MetricsEnabled
 	}
+	if fc.VerifyAllowedCIDRs != nil {
+		if err := mergeCIDRList(&cfg.VerifyAllowedCIDRs, "verify_allowed_cidrs", *fc.VerifyAllowedCIDRs); err != nil {
+			return false, fmt.Errorf("config file: %w", err)
+		}
+	}
+	if fc.MetricsAllowedCIDRs != nil {
+		if err := mergeCIDRList(&cfg.MetricsAllowedCIDRs, "metrics_allowed_cidrs", *fc.MetricsAllowedCIDRs); err != nil {
+			return false, fmt.Errorf("config file: %w", err)
+		}
+	}
+	if yamlNodeSet(&fc.VerifyAuditRetention) {
+		parsed, err := parseYAMLIntNode(&fc.VerifyAuditRetention)
+		if err != nil {
+			return false, fmt.Errorf("invalid verify_audit_retention_days in config file: %w", err)
+		}
+		cfg.VerifyAuditRetentionDays = parsed
+	}
+	if yamlNodeSet(&fc.AdminAuditRetention) {
+		parsed, err := parseYAMLIntNode(&fc.AdminAuditRetention)
+		if err != nil {
+			return false, fmt.Errorf("invalid admin_audit_retention_days in config file: %w", err)
+		}
+		cfg.AdminAuditRetentionDays = parsed
+	}
 
 	return legacyCasbinSeen, nil
 }
@@ -264,6 +301,25 @@ func parseYAMLBoolNode(node *yaml.Node) (bool, bool) {
 		return *b, true
 	}
 	return false, false
+}
+
+// yamlNodeSet reports whether a key was present with a non-null value, the
+// same as a non-nil pointer field for the other settings.
+func yamlNodeSet(node *yaml.Node) bool {
+	return node.Kind != 0 && !(node.Kind == yaml.ScalarNode && node.ShortTag() == "!!null")
+}
+
+// parseYAMLIntNode accepts only a scalar resolved as a YAML integer. Decoding
+// straight into an int would silently truncate a float such as 1.5.
+func parseYAMLIntNode(node *yaml.Node) (int, error) {
+	if node.Kind != yaml.ScalarNode || node.ShortTag() != "!!int" {
+		return 0, fmt.Errorf("%q is not an integer", node.Value)
+	}
+	var v int
+	if err := node.Decode(&v); err != nil {
+		return 0, err
+	}
+	return v, nil
 }
 
 func loadEnvFile(path string) (map[string]string, error) {
@@ -443,6 +499,29 @@ func mergeFromEnv(cfg *Config, fileVars map[string]string) (bool, error) {
 		}
 		cfg.MetricsEnabled = parsed
 	}
+	// An empty or blank value at any layer does not override a lower layer, so
+	// a stray empty line in .env or an environment variable that expands to
+	// nothing cannot silently lift a restriction set lower down.
+	if err := mergeCIDRLayers(&cfg.VerifyAllowedCIDRs, "VERIFY_ALLOWED_CIDRS", fileVars); err != nil {
+		return false, err
+	}
+	if err := mergeCIDRLayers(&cfg.MetricsAllowedCIDRs, "METRICS_ALLOWED_CIDRS", fileVars); err != nil {
+		return false, err
+	}
+	if v, ok := getEnv("VERIFY_AUDIT_RETENTION_DAYS", fileVars); ok {
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return false, fmt.Errorf("invalid VERIFY_AUDIT_RETENTION_DAYS: %w", err)
+		}
+		cfg.VerifyAuditRetentionDays = parsed
+	}
+	if v, ok := getEnv("ADMIN_AUDIT_RETENTION_DAYS", fileVars); ok {
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return false, fmt.Errorf("invalid ADMIN_AUDIT_RETENTION_DAYS: %w", err)
+		}
+		cfg.AdminAuditRetentionDays = parsed
+	}
 
 	return legacyCasbinSeen, nil
 }
@@ -491,6 +570,12 @@ func validate(cfg Config) error {
 	}
 	if cfg.OTELServiceName == "" {
 		return fmt.Errorf("OTEL_SERVICE_NAME must not be empty")
+	}
+	if cfg.VerifyAuditRetentionDays < 0 {
+		return fmt.Errorf("VERIFY_AUDIT_RETENTION_DAYS must be >= 0")
+	}
+	if cfg.AdminAuditRetentionDays < 0 {
+		return fmt.Errorf("ADMIN_AUDIT_RETENTION_DAYS must be >= 0")
 	}
 
 	return nil

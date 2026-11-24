@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"derp-admit/config"
 	"derp-admit/internel/app/derp_admit/db"
@@ -21,6 +22,19 @@ type Option func(*buildOptions)
 
 type buildOptions struct {
 	metrics metrics.Recorder
+	// pruneSchedule shortens the audit pruner's first delay and interval.
+	// Set only by tests, through export_test.go.
+	pruneFirstDelay time.Duration
+	pruneInterval   time.Duration
+}
+
+// withPruneSchedule is unexported on purpose: there is no public setting for
+// the prune schedule. Tests reach it through export_test.go.
+func withPruneSchedule(firstDelay, interval time.Duration) Option {
+	return func(o *buildOptions) {
+		o.pruneFirstDelay = firstDelay
+		o.pruneInterval = interval
+	}
 }
 
 func WithMetrics(r metrics.Recorder) Option {
@@ -37,13 +51,19 @@ type App struct {
 	Service *service.Service
 	Router  *gin.Engine
 	Metrics metrics.Recorder
-	cancel  context.CancelFunc
+	// AuditPruner deletes audit rows past their retention period. It is
+	// running only when a retention setting is greater than zero.
+	AuditPruner *service.AuditPruner
+	cancel      context.CancelFunc
 }
 
+// Close stops the policy syncer and the audit pruner. It waits for the pruner
+// to exit, so no prune statement runs after Close returns.
 func (a *App) Close() {
 	if a.cancel != nil {
 		a.cancel()
 	}
+	a.AuditPruner.Wait()
 }
 
 // Build initializes the application in the standard startup order:
@@ -122,14 +142,25 @@ func Build(ctx context.Context, gormDB *gorm.DB, cfg config.Config, logger *zap.
 	syncCtx, cancel := context.WithCancel(context.Background())
 	svc.StartSync(syncCtx)
 
+	pruner := service.NewAuditPruner(gormDB, cfg.VerifyAuditRetentionDays, cfg.AdminAuditRetentionDays, cfg.DBTimeout, logger, bo.metrics,
+		service.WithPruneSchedule(bo.pruneFirstDelay, bo.pruneInterval))
+	if pruner.Enabled() {
+		logger.Info("audit retention enabled",
+			zap.Int("verify_audit_retention_days", cfg.VerifyAuditRetentionDays),
+			zap.Int("admin_audit_retention_days", cfg.AdminAuditRetentionDays),
+		)
+	}
+	pruner.Start(syncCtx)
+
 	router := server.NewRouter(svc, cfg, logger, server.WithMetrics(bo.metrics))
 
 	return &App{
-		DB:      gormDB,
-		Policy:  policyEngine,
-		Service: svc,
-		Router:  router,
-		Metrics: bo.metrics,
-		cancel:  cancel,
+		DB:          gormDB,
+		Policy:      policyEngine,
+		Service:     svc,
+		Router:      router,
+		Metrics:     bo.metrics,
+		AuditPruner: pruner,
+		cancel:      cancel,
 	}, nil
 }

@@ -25,6 +25,8 @@ type Prometheus struct {
 	policyLastSyncTS   prometheus.Gauge
 	policySyncFailures prometheus.Counter
 	policyReloads      *prometheus.CounterVec
+	callerRejected     *prometheus.CounterVec
+	auditPruned        *prometheus.CounterVec
 }
 
 var _ Recorder = (*Prometheus)(nil)
@@ -81,6 +83,16 @@ func NewPrometheus() *Prometheus {
 			Name:      "policy_reloads_total",
 			Help:      "Total number of policy snapshot reloads by result (ok or error).",
 		}, []string{"result"}),
+		callerRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "derp_admit",
+			Name:      "caller_rejected_total",
+			Help:      "Total number of requests refused by a caller allowlist by endpoint (verify or metrics).",
+		}, []string{"endpoint"}),
+		auditPruned: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "derp_admit",
+			Name:      "audit_pruned_total",
+			Help:      "Total number of audit rows deleted by retention pruning by table (verify or admin).",
+		}, []string{"table"}),
 	}
 
 	reg.MustRegister(
@@ -93,6 +105,8 @@ func NewPrometheus() *Prometheus {
 		p.policyLastSyncTS,
 		p.policySyncFailures,
 		p.policyReloads,
+		p.callerRejected,
+		p.auditPruned,
 	)
 
 	// Pre-initialize bounded static label sets so zero values appear on scrapes.
@@ -103,6 +117,10 @@ func NewPrometheus() *Prometheus {
 	p.verifyCacheLookups.WithLabelValues("miss")
 	p.policyReloads.WithLabelValues("ok")
 	p.policyReloads.WithLabelValues("error")
+	p.callerRejected.WithLabelValues(EndpointVerify)
+	p.callerRejected.WithLabelValues(EndpointMetrics)
+	p.auditPruned.WithLabelValues(AuditTableVerify)
+	p.auditPruned.WithLabelValues(AuditTableAdmin)
 
 	p.handler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 	return p
@@ -158,6 +176,23 @@ func (p *Prometheus) PolicyReload(ok bool) {
 		return
 	}
 	p.policyReloads.WithLabelValues("error").Inc()
+}
+
+func (p *Prometheus) CallerRejected(endpoint string) {
+	if endpoint == "" {
+		endpoint = "unknown"
+	}
+	p.callerRejected.WithLabelValues(endpoint).Inc()
+}
+
+func (p *Prometheus) AuditPruned(table string, n int64) {
+	if n <= 0 {
+		return
+	}
+	if table == "" {
+		table = "unknown"
+	}
+	p.auditPruned.WithLabelValues(table).Add(float64(n))
 }
 
 func (p *Prometheus) Handler() http.Handler {

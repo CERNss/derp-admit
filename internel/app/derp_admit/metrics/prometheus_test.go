@@ -96,3 +96,39 @@ func TestPrometheusRecordsAllSeries(t *testing.T) {
 		}
 	}
 }
+
+func TestPrometheusCallerRejectedAndAuditPruned(t *testing.T) {
+	p := metrics.NewPrometheus()
+
+	// Pre-initialised series are exposed at zero before anything happens.
+	out := bScrape(t, p)
+	for _, want := range []string{
+		`derp_admit_caller_rejected_total{endpoint="verify"} 0`,
+		`derp_admit_caller_rejected_total{endpoint="metrics"} 0`,
+		`derp_admit_audit_pruned_total{table="verify"} 0`,
+		`derp_admit_audit_pruned_total{table="admin"} 0`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("initial scrape missing %q\n%s", want, out)
+		}
+	}
+
+	p.CallerRejected(metrics.EndpointVerify)
+	p.CallerRejected(metrics.EndpointVerify)
+	p.CallerRejected(metrics.EndpointMetrics)
+	p.AuditPruned(metrics.AuditTableVerify, 1500)
+	p.AuditPruned(metrics.AuditTableAdmin, 3)
+	p.AuditPruned(metrics.AuditTableAdmin, 0)
+
+	out = bScrape(t, p)
+	for _, want := range []string{
+		`derp_admit_caller_rejected_total{endpoint="verify"} 2`,
+		`derp_admit_caller_rejected_total{endpoint="metrics"} 1`,
+		`derp_admit_audit_pruned_total{table="verify"} 1500`,
+		`derp_admit_audit_pruned_total{table="admin"} 3`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("scrape missing %q\n%s", want, out)
+		}
+	}
+}
